@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE_NAME: pubky-nexus
+  IMAGE_NAME: marketplace-nexus
 
 jobs:
   publish:
@@ -72,7 +72,6 @@ jobs:
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --tag "$IMAGE:$SOURCE_SHA" \
-            --tag "$IMAGE:latest" \
             --provenance=true \
             --sbom=true \
             --push \
@@ -89,7 +88,7 @@ jobs:
             echo "### Published production image"
             echo "- source SHA: \`$SOURCE_SHA\`"
             echo "- platform: linux/amd64"
-            echo "- tags: \`$IMAGE:$SOURCE_SHA\`, \`$IMAGE:latest\`"
+            echo "- tag: \`$IMAGE:$SOURCE_SHA\`"
             echo "- digest: \`$digest\`"
             echo "- immutable image: \`$IMAGE@$digest\`"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -112,6 +111,6 @@ jobs:
       - name: Upload publish evidence
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
         with:
-          name: pubky-nexus-production-image-publish-${{ env.SOURCE_SHA }}
+          name: marketplace-nexus-production-image-publish-${{ env.SOURCE_SHA }}
           path: ${{ runner.temp }}/production-image/publish-evidence.json
           retention-days: 14

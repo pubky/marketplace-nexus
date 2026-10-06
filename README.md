@@ -1,15 +1,23 @@
 ![Integration Tests](https://github.com/pubky/pubky-nexus/actions/workflows/test.yml/badge.svg?branch=main)
 
-# Pubky Nexus
+# Marketplace Nexus
 
-## This fork: Pubky Marketplace project
+## Pubky Marketplace indexer
 
-This is `BitcoinErrorLog/pubky-nexus` (branch `feat/marketplace-indexing`),
-a fork of the official [`pubky/pubky-nexus`](https://github.com/pubky/pubky-nexus)
-that adds **marketplace indexing** for the Pubky Marketplace project. The
-official/shared Nexus has none of these endpoints; a dedicated instance of
-this fork runs on Railway beside the marketplace's transaction service. No
-upstream PRs are filed while the protocol shape settles.
+`pubky/marketplace-nexus` is the indexer behind the Pubky Shop. It is the
+official [`pubky/pubky-nexus`](https://github.com/pubky/pubky-nexus) plus
+**marketplace indexing**, which the shared Nexus doesn't have. It runs as a
+dedicated instance beside the marketplace's transaction service.
+
+The repo carries the full history of the earlier fork,
+[`BitcoinErrorLog/pubky-nexus`](https://github.com/BitcoinErrorLog/pubky-nexus).
+That fork has been frozen since 6 Oct 2026, and marketplace work happens here.
+Generic fixes go upstream as their own PRs. The marketplace code is being
+reduced to a thin layer on top of upstream Nexus, so this repo stops carrying
+a copy of upstream code.
+
+Images: `ghcr.io/pubky/marketplace-nexus`, tagged by source SHA. Deploy by
+digest.
 
 **Added over upstream:**
 
