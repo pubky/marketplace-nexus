@@ -25,14 +25,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tower-http = { version = "0.6.8", features = [
+tower-http = { version = "0.7.1", features = [
     "fs",
     "cors",
     "compression-full",
 ] }
 tracing = { workspace = true }
-utoipa = "5.4.0"
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+utoipa = "6.0.0"
+utoipa-swagger-ui = { version = "10.0.1", features = ["axum"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }
