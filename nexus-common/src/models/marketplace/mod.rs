@@ -1,5 +1,6 @@
 mod drop;
 mod listing;
+mod moderation;
 mod reputation;
 mod review;
 mod review_response;
@@ -13,6 +14,7 @@ pub use drop::{
     DROP_STARTS_KEY_PARTS,
 };
 pub use listing::{ListingDetails, ListingSaleFormat};
+pub use moderation::ModeratedListing;
 pub use reputation::{
     ReputationSnippet, ReputationSummary, REPUTATION_LISTING_KEY, REPUTATION_SUBJECT_KEY,
 };

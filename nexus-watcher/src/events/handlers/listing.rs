@@ -5,7 +5,7 @@ use nexus_common::db::graph::Query;
 use nexus_common::db::kv::sets;
 use nexus_common::db::reindex::{get_all_listing_ids, get_auction_listings_missing_terms};
 use nexus_common::db::{fetch_all_rows_from_graph, OperationOutcome, PubkyConnector, RedisOps};
-use nexus_common::models::marketplace::ListingDetails;
+use nexus_common::models::marketplace::{ListingDetails, ModeratedListing};
 use nexus_common::types::DynError;
 use pubky_app_specs::{listing_uri_builder, PubkyAppListing, PubkyAppObject, PubkyId, Resource};
 use serde_json::Value;
@@ -56,7 +56,33 @@ pub(crate) async fn sync_put(
     user_id: PubkyId,
     listing_id: String,
 ) -> Result<(), EventProcessorError> {
+    sync_put_with_moderation(listing, user_id, listing_id, true).await
+}
+
+/// Indexes a listing. With `enforce_moderation` set (every ingest path), a
+/// listing hidden by a moderator tag is not indexed, and anything of it still
+/// indexed is removed (the removal is idempotent): the check runs
+/// before the seller-exists precondition, so a moderated listing neither
+/// lands nor waits in the retry queue for its seller. The check runs again
+/// after the writes, which closes the window against a moderator tag handled
+/// by another processor while this listing was being written: the tag writes
+/// its marker before it removes the listing, so either this re-check sees the
+/// marker, or the tag's removal runs after these writes.
+///
+/// Only [`release_moderation`] passes `false`, to index a listing while
+/// the marker it is releasing is still recorded.
+async fn sync_put_with_moderation(
+    listing: PubkyAppListing,
+    user_id: PubkyId,
+    listing_id: String,
+    enforce_moderation: bool,
+) -> Result<(), EventProcessorError> {
     debug!("Indexing new listing: {}/{}", user_id, listing_id);
+
+    if enforce_moderation && ModeratedListing::is_moderated(&user_id, &listing_id).await? {
+        info!("Listing {user_id}/{listing_id} is moderated; not indexing it");
+        return del(user_id, listing_id).await;
+    }
 
     // Create ListingDetails object
     let listing_details = ListingDetails::from_homeserver(listing, &user_id, &listing_id);
@@ -75,6 +101,106 @@ pub(crate) async fn sync_put(
     // keeps its original position in the stream sorted sets
     listing_details.put_to_index(existed).await?;
 
+    if enforce_moderation {
+        remove_if_moderated(&user_id, &listing_id).await?;
+    }
+
+    Ok(())
+}
+
+/// Removes the listing everywhere when a moderator tag hides it.
+async fn remove_if_moderated(
+    user_id: &PubkyId,
+    listing_id: &str,
+) -> Result<(), EventProcessorError> {
+    if ModeratedListing::is_moderated(user_id, listing_id).await? {
+        info!(
+            "Listing {user_id}/{listing_id} was moderated while it was being indexed; removing it"
+        );
+        del(user_id.clone(), listing_id.to_string()).await?;
+    }
+    Ok(())
+}
+
+/// Hides a listing because the configured moderator tagged it with a moderated
+/// label: the marker is recorded first, then the listing is removed from the
+/// graph, the details cache and every stream. The marker is what keeps the
+/// listing out when its own event arrives later or is replayed again (see
+/// [`ModeratedListing`]); the removal is idempotent and a listing that is not
+/// indexed yet is a no-op. A failure after the marker is written is retried
+/// as the tag event and finishes the removal.
+pub async fn moderate(
+    owner_id: PubkyId,
+    listing_id: String,
+    moderator_id: &PubkyId,
+    tag_id: &str,
+    label: &str,
+) -> Result<(), EventProcessorError> {
+    info!("Moderation tag '{label}' on listing {owner_id}/{listing_id}; hiding it");
+    ModeratedListing::put(
+        &owner_id,
+        &listing_id,
+        &listing_uri_builder(owner_id.to_string(), listing_id.clone()),
+        moderator_id,
+        tag_id,
+        label,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    del(owner_id, listing_id).await
+}
+
+/// Handles the moderator deleting one of its moderation tags. Returns whether
+/// the tag was hiding a listing.
+///
+/// A listing no other marker hides is indexed again from its seller's
+/// homeserver; a listing the seller has since deleted stays gone. The marker
+/// is removed only after the listing is back, so a failed fetch leaves the
+/// marker in place and the retried tag deletion starts over.
+pub async fn release_moderation(
+    moderator_id: &PubkyId,
+    tag_id: &str,
+) -> Result<bool, EventProcessorError> {
+    let listings = ModeratedListing::listings_of_tag(moderator_id, tag_id).await?;
+    if listings.is_empty() {
+        return Ok(false);
+    }
+
+    for (owner_id, listing_id) in listings {
+        let hidden_by_another_tag =
+            ModeratedListing::is_moderated_besides(&owner_id, &listing_id, moderator_id, tag_id)
+                .await?;
+        if !hidden_by_another_tag {
+            info!("Moderation tag removed; restoring listing {owner_id}/{listing_id}");
+            reindex_from_homeserver_with_moderation(&owner_id, &listing_id, false).await?;
+        }
+        ModeratedListing::delete(moderator_id, tag_id).await?;
+        settle_after_release(&owner_id, &listing_id, hidden_by_another_tag).await?;
+    }
+    Ok(true)
+}
+
+/// After a marker is gone. A moderator tag that appeared while the listing was
+/// being restored removes it again. When `restore_if_absent` is set, the
+/// release skipped the restore because another marker was still there; if that
+/// marker was released concurrently and skipped its own restore for the same
+/// reason, the listing is restored here.
+async fn settle_after_release(
+    owner_id: &str,
+    listing_id: &str,
+    restore_if_absent: bool,
+) -> Result<(), EventProcessorError> {
+    let user_id = PubkyId::try_from(owner_id).map_err(EventProcessorError::generic)?;
+    if ModeratedListing::is_moderated(owner_id, listing_id).await? {
+        return remove_if_moderated(&user_id, listing_id).await;
+    }
+    if restore_if_absent
+        && ListingDetails::get_from_graph(owner_id, listing_id)
+            .await?
+            .is_none()
+    {
+        reindex_from_homeserver_with_moderation(owner_id, listing_id, true).await?;
+    }
     Ok(())
 }
 
@@ -746,6 +872,14 @@ pub async fn reindex_from_homeserver(
     owner_id: &str,
     listing_id: &str,
 ) -> Result<bool, EventProcessorError> {
+    reindex_from_homeserver_with_moderation(owner_id, listing_id, true).await
+}
+
+async fn reindex_from_homeserver_with_moderation(
+    owner_id: &str,
+    listing_id: &str,
+    enforce_moderation: bool,
+) -> Result<bool, EventProcessorError> {
     let user_id = PubkyId::try_from(owner_id).map_err(EventProcessorError::generic)?;
     let uri = listing_uri_builder(owner_id.to_string(), listing_id.to_string());
 
@@ -767,7 +901,13 @@ pub async fn reindex_from_homeserver(
 
     match pubky_object {
         PubkyAppObject::Listing(listing) => {
-            sync_put(*listing, user_id, listing_id.to_string()).await?;
+            sync_put_with_moderation(
+                *listing,
+                user_id,
+                listing_id.to_string(),
+                enforce_moderation,
+            )
+            .await?;
             Ok(true)
         }
         _ => Err(EventProcessorError::generic(format!(

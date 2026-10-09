@@ -931,12 +931,58 @@ pub fn get_shop_by_owner(owner_id: &str) -> Query {
     .param("owner_id", owner_id)
 }
 
+/// One row (`tag_id`) when any moderator tag hides the listing, no row otherwise.
+pub fn listing_moderation_marker(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "listing_moderation_marker",
+        "MATCH (marker:ModeratedListing {owner_id: $owner_id, listing_id: $listing_id})
+         RETURN marker.tag_id AS tag_id
+         LIMIT 1",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
+/// One row (`tag_id`) when a moderator tag other than the given one hides the listing.
+pub fn listing_moderation_marker_besides(
+    owner_id: &str,
+    listing_id: &str,
+    moderator_id: &str,
+    tag_id: &str,
+) -> Query {
+    Query::new(
+        "listing_moderation_marker_besides",
+        "MATCH (marker:ModeratedListing {owner_id: $owner_id, listing_id: $listing_id})
+         WHERE NOT (marker.moderator_id = $moderator_id AND marker.tag_id = $tag_id)
+         RETURN marker.tag_id AS tag_id
+         LIMIT 1",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+}
+
+/// The listings hidden by one moderator tag record (`owner_id`, `listing_id`).
+pub fn moderated_listings_of_tag(moderator_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "moderated_listings_of_tag",
+        "MATCH (marker:ModeratedListing {moderator_id: $moderator_id, tag_id: $tag_id})
+         RETURN marker.owner_id AS owner_id, marker.listing_id AS listing_id",
+    )
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+}
+
 // Retrieve a listing node by seller id and listing id
 pub fn get_listing_by_id(owner_id: &str, listing_id: &str) -> Query {
     Query::new(
         "get_listing_by_id",
         "
             MATCH (seller:User {id: $owner_id})-[:SELLS]->(listing:Listing {id: $listing_id})
+            WHERE NOT EXISTS {
+                MATCH (:ModeratedListing {owner_id: $owner_id, listing_id: $listing_id})
+            }
             RETURN {
                 id: listing.id,
                 uri: listing.uri,
@@ -1111,6 +1157,12 @@ pub fn listing_stream(
     };
 
     cypher.push_str("MATCH (seller:User)-[:SELLS]->(listing:Listing)\n");
+
+    append_condition(
+        &mut cypher,
+        "NOT EXISTS { MATCH (:ModeratedListing {owner_id: listing.owner_id, listing_id: listing.id}) }",
+        &mut where_clause_applied,
+    );
 
     if sorting == ListingStreamSorting::EndsAt {
         append_condition(
@@ -1507,6 +1559,22 @@ mod listing_stream_state_tests {
         )
         .expect("listing stream query")
         .to_cypher_populated()
+    }
+
+    #[test]
+    fn stream_and_detail_queries_exclude_moderated_listings() {
+        let cypher = stream_cypher(None, 0);
+        assert!(
+            cypher.contains(
+                "WHERE NOT EXISTS { MATCH (:ModeratedListing {owner_id: listing.owner_id, listing_id: listing.id}) }"
+            ),
+            "stream must exclude moderated listings first: {cypher}"
+        );
+        let detail = get_listing_by_id("owner", "listing").to_cypher_populated();
+        assert!(
+            detail.contains("MATCH (:ModeratedListing"),
+            "detail must exclude moderated listings: {detail}"
+        );
     }
 
     #[test]
