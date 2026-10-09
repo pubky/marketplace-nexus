@@ -48,4 +48,21 @@ if ! grep -Fqe 'neo4j-super-secret' "$CFG"; then
 	exit 1
 fi
 
+if ! grep -Fxqe 'moderated_tags = ["moderated"]' "$CFG"; then
+	echo "FAIL: on-disk config does not moderate the default label" >&2
+	exit 1
+fi
+
+NEXUS_MODERATED_TAGS=' spam, "bad label",,illegal_activities ' sh "$ENTRYPOINT" >"$OUT" 2>&1
+if ! grep -Fxqe 'moderated_tags = ["spam", "badlabel", "illegal_activities"]' "$CFG"; then
+	echo "FAIL: NEXUS_MODERATED_TAGS did not produce the sanitized label list" >&2
+	exit 1
+fi
+
+NEXUS_MODERATED_TAGS='' sh "$ENTRYPOINT" >"$OUT" 2>&1
+if ! grep -Fxqe 'moderated_tags = []' "$CFG"; then
+	echo "FAIL: an empty NEXUS_MODERATED_TAGS did not turn moderation off" >&2
+	exit 1
+fi
+
 echo "PASS: entrypoint echo has no URL userinfo; on-disk config keeps credentials"

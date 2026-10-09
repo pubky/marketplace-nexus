@@ -98,6 +98,7 @@ mod tests {
                 "violence",
                 "illegal_activities",
                 "il_adult_nu_sex_act",
+                "moderated",
             ]
         );
 
