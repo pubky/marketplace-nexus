@@ -42,6 +42,8 @@ Variables set on the `nexusd` service:
 | `PORT` | `8080` | API bind port (entrypoint uses it for `public_addr`) |
 | `NEXUS_EVENTS_LIMIT` | default `1000` | Events fetched per watcher poll |
 | `NEXUS_WATCHER_SLEEP` | default `500` (ms) | Sleep between watcher polls |
+| `NEXUS_MODERATION_ID` | default: the upstream moderator key | The key whose moderation tags are trusted. Set it to the marketplace moderator |
+| `NEXUS_MODERATED_TAGS` | default `moderated` | Comma-separated labels that take the tagged post, user, file or listing out of the index when the moderator places them; empty disables moderation. See "Proof listings and reindex" in the README |
 
 ### Homeserver watching: no credentials, full history replay
 

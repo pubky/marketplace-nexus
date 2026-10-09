@@ -290,6 +290,53 @@ Safety rules:
   summary line says how many. A re-run retries only what is still stale or
   pending.
 
+### Proof listings and reindex (listing moderation)
+
+A listing is hidden by the same moderator-tag path Nexus uses for posts, users
+and files. When the moderator key (`moderation_id`, `NEXUS_MODERATION_ID` on
+Railway) tags a listing URI
+(`pubky://<seller>/pub/pubky.app/marketplace/v1/listings/<listing_id>`) with a
+label in `moderated_tags` (`moderated` by default; `NEXUS_MODERATED_TAGS` on
+Railway, comma separated, empty turns moderation off), the listing is removed
+from the graph, the details cache and every stream, and its community tags go
+with it. Tags by anyone else, or with other labels, have no effect.
+
+The moderation tag is itself a record on the moderator's homeserver, so a
+reindex that replays the watched homeservers replays it. Replay order does not
+matter: the tag leaves a marker node (`ModeratedListing`, keyed by the
+moderator's tag record and carrying only the listing's `(owner_id, listing_id)`)
+that does not depend on the listing or its seller being indexed. A listing event
+that arrives after the marker is dropped, even for a seller whose profile is not
+indexed yet, and a marker that appears while the listing is being written
+removes it again. The moderator deleting the tag deletes the marker and
+re-indexes the listing from the seller's homeserver, unless the seller has
+deleted it or another moderator tag still hides it.
+
+Operating steps for proof listings:
+
+1. **Write proof listings to a homeserver the production Nexus does not
+   watch.** Nexus indexes every homeserver it watches (the configured default
+   plus homeservers it discovers through follows, tags, mentions and reviews),
+   so a separate index does not keep proofs out of production; a separate
+   homeserver does. Staging proofs belong on the staging homeserver, with a
+   staging Nexus.
+2. **Tag the leftovers.** For proof listings that already sit on a watched
+   homeserver, publish one tag per listing from the moderator key, with the
+   label `moderated` and `uri` set to the listing URI (a `PubkyAppTag` at
+   `/pub/pubky.app/tags/<id>`). The listing disappears as soon as the watcher
+   processes the tag, and stays gone through any later reindex.
+3. **Delete listings whose seller key is lost on the homeserver, admin side.**
+   Only the key holder can delete a record, so a homeserver operator removes the
+   listing record on the homeserver. It is then gone for every indexer, not
+   only hidden in this one. Once a listing is deleted on the homeserver its tag
+   can be removed.
+
+Before a reindex (clean Neo4j and Redis, full replay), check that the moderator
+tags are on a homeserver the Nexus watches, and that `NEXUS_MODERATION_ID` is the
+key that placed them. After it, a spot check of `/v0/stream/listings` against
+the moderated list confirms none came back. The marker is stored in Neo4j: a
+Redis-only flush keeps it, and a Neo4j wipe is repaired by the replay itself.
+
 ## 🧪 Running Tests
 
 Running tests requires setting up mock data (`docker/test-graph/mocks`) into Neo4j and Redis.
