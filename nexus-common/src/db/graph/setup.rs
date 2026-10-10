@@ -28,6 +28,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE CONSTRAINT uniqueListingId IF NOT EXISTS FOR (l:Listing) REQUIRE (l.owner_id, l.id) IS UNIQUE",
         "CREATE CONSTRAINT uniqueDropId IF NOT EXISTS FOR (d:Drop) REQUIRE (d.owner_id, d.id) IS UNIQUE",
         "CREATE CONSTRAINT uniqueTagCleanupId IF NOT EXISTS FOR (c:TagCleanup) REQUIRE c.id IS UNIQUE",
+        "CREATE CONSTRAINT uniqueModeratedListingTag IF NOT EXISTS FOR (m:ModeratedListing) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
     ];
 
     // Create indexes
@@ -53,6 +54,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE INDEX dropStartsAtIndex IF NOT EXISTS FOR (d:Drop) ON (d.starts_at_ms)",
         "CREATE INDEX dropEndsAtIndex IF NOT EXISTS FOR (d:Drop) ON (d.ends_at_ms)",
         "CREATE INDEX tagCleanupTargetIndex IF NOT EXISTS FOR (c:TagCleanup) ON (c.target)",
+        "CREATE INDEX moderatedListingTargetIndex IF NOT EXISTS FOR (m:ModeratedListing) ON (m.owner_id, m.listing_id)",
     ];
 
     let queries = constraints.iter().chain(indexes.iter());

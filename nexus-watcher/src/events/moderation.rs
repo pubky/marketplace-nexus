@@ -17,8 +17,12 @@ impl Moderation {
         tagger_id == self.id && self.tags.contains(&tag.label)
     }
 
+    /// Applies a moderation tag. `moderator_id` and `tag_id` identify the
+    /// moderator's tag record, which a listing's replay-safe marker is keyed by.
     pub async fn apply_moderation(
         moderator_tag: PubkyAppTag,
+        moderator_id: &PubkyId,
+        tag_id: &str,
         files_path: PathBuf,
     ) -> Result<(), EventProcessorError> {
         // Parse the embeded URI to extract author_id and post_id using parse_tagged_post_uri
@@ -58,6 +62,16 @@ impl Moderation {
                     moderator_tag.label, user_id, file_id
                 );
                 handlers::file::del(&user_id, file_id, files_path).await
+            }
+            Resource::Listing(listing_id) => {
+                handlers::listing::moderate(
+                    user_id,
+                    listing_id,
+                    moderator_id,
+                    tag_id,
+                    &moderator_tag.label,
+                )
+                .await
             }
             _ => Ok(()),
         }

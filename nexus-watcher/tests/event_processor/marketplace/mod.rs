@@ -1,6 +1,7 @@
 mod deliverable;
 mod drop;
 mod listing;
+mod moderation;
 mod review;
 mod shop;
 mod stale_prune;

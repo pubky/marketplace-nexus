@@ -12,8 +12,8 @@ pub use moderation::Moderation;
 
 pub async fn handle(event: &Event, moderation: Arc<Moderation>) -> Result<(), EventProcessorError> {
     match event.event_type {
-        EventType::Put => handle_put_event(event, moderation).await,
-        EventType::Del => handle_del_event(event).await,
+        EventType::Put => Box::pin(handle_put_event(event, moderation)).await,
+        EventType::Del => Box::pin(handle_del_event(event)).await,
     }?;
 
     event.store_event().await?;
@@ -71,7 +71,8 @@ pub async fn handle_put_event(
         }
         (PubkyAppObject::Tag(tag), Resource::Tag(tag_id)) => {
             if moderation.should_delete(&tag, user_id.clone()).await {
-                Moderation::apply_moderation(tag, event.files_path.clone()).await?
+                Moderation::apply_moderation(tag, &user_id, &tag_id, event.files_path.clone())
+                    .await?
             } else {
                 handlers::tag::sync_put(tag, user_id, tag_id).await?
             }
@@ -122,7 +123,15 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
         Resource::Bookmark(bookmark_id) => {
             handlers::bookmark::del(user_id, bookmark_id.clone()).await?
         }
-        Resource::Tag(tag_id) => handlers::tag::del(user_id, tag_id.clone()).await?,
+        Resource::Tag(tag_id) => {
+            // A moderator's tag on a listing is never indexed as a tag: removing
+            // it only lifts the listing's moderation marker.
+            let released = handlers::listing::release_moderation(&user_id, tag_id).await?;
+            match handlers::tag::del(user_id, tag_id.clone()).await {
+                Err(EventProcessorError::SkipIndexing) if released => {}
+                other => other?,
+            }
+        }
         Resource::File(file_id) => {
             handlers::file::del(&user_id, file_id.clone(), event.files_path.clone()).await?
         }

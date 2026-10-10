@@ -432,6 +432,36 @@ pub fn create_shop(shop: &ShopDetails) -> Query {
     .param("revision", shop.revision)
 }
 
+/// Records that a moderator tag hides a listing. The marker is its own node,
+/// keyed by the moderator's tag record, and is not connected to the listing or
+/// the seller: it can be written before the listing, or the seller, is indexed.
+pub fn put_moderated_listing(
+    owner_id: &str,
+    listing_id: &str,
+    uri: &str,
+    moderator_id: &str,
+    tag_id: &str,
+    label: &str,
+    moderated_at: i64,
+) -> Query {
+    Query::new(
+        "put_moderated_listing",
+        "MERGE (marker:ModeratedListing {moderator_id: $moderator_id, tag_id: $tag_id})
+         SET marker.owner_id = $owner_id,
+             marker.listing_id = $listing_id,
+             marker.uri = $uri,
+             marker.label = $label,
+             marker.moderated_at = $moderated_at",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+    .param("uri", uri)
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("moderated_at", moderated_at)
+}
+
 /// Creates or updates a marketplace listing node of a seller.
 /// The query returns no rows when the seller user is not yet indexed (missing dependency).
 pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {

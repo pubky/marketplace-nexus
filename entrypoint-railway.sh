@@ -17,6 +17,10 @@ TESTNET_HOST="${NEXUS_TESTNET_HOST:-localhost}"
 # events), so keep the batch large and the sleep short.
 EVENTS_LIMIT="${NEXUS_EVENTS_LIMIT:-1000}"
 WATCHER_SLEEP="${NEXUS_WATCHER_SLEEP:-500}"
+# Labels that, placed by the moderator key NEXUS_MODERATION_ID, take the tagged
+# post, user, file or marketplace listing out of the index. Comma separated;
+# set it empty to turn moderation off.
+MODERATED_TAGS="${NEXUS_MODERATED_TAGS-moderated}"
 
 # Echoed config must never contain URL userinfo (`://user:pass@`) or secret
 # assignment values. The file written for nexusd keeps the real values.
@@ -42,6 +46,16 @@ redact_generated_config() {
 	'
 }
 
+moderated_tags_toml=""
+old_ifs="$IFS"
+IFS=,
+for label in $MODERATED_TAGS; do
+	label="$(printf '%s' "$label" | tr -cd 'A-Za-z0-9_-')"
+	[ -n "$label" ] || continue
+	moderated_tags_toml="${moderated_tags_toml}${moderated_tags_toml:+, }\"${label}\""
+done
+IFS="$old_ifs"
+
 mkdir -p "$CONFIG_DIR/static/files"
 
 echo "=== Railway nexusd entrypoint ==="
@@ -65,7 +79,7 @@ events_limit = ${EVENTS_LIMIT}
 monitored_homeservers_limit = 50
 watcher_sleep = ${WATCHER_SLEEP}
 moderation_id = "${NEXUS_MODERATION_ID:-51y9w1skwcryb3iq4sia3x49qwpgstc5feo5tqon65gid7o99khy}"
-moderated_tags = []
+moderated_tags = [${moderated_tags_toml}]
 
 [stack]
 log_level = "info"
