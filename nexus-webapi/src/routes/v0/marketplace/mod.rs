@@ -1,6 +1,7 @@
 use crate::routes::v0::endpoints::{
-    DROP_ROUTE, LISTING_REVIEWS_ROUTE, LISTING_ROUTE, LISTING_TAGGERS_ROUTE, LISTING_TAGS_ROUTE,
-    SHOP_REPUTATION_ROUTE, SHOP_REVIEWS_ROUTE, SHOP_ROUTE, SHOP_TAGGERS_ROUTE, SHOP_TAGS_ROUTE,
+    DROP_ROUTE, LISTING_MODERATION_ROUTE, LISTING_REVIEWS_ROUTE, LISTING_ROUTE,
+    LISTING_TAGGERS_ROUTE, LISTING_TAGS_ROUTE, SHOP_REPUTATION_ROUTE, SHOP_REVIEWS_ROUTE,
+    SHOP_ROUTE, SHOP_TAGGERS_ROUTE, SHOP_TAGS_ROUTE,
 };
 use crate::routes::AppState;
 use axum::routing::get;
@@ -21,6 +22,10 @@ pub fn routes() -> Router<AppState> {
         .route(SHOP_REVIEWS_ROUTE, get(reviews::shop_reviews_handler))
         .route(SHOP_REPUTATION_ROUTE, get(reviews::shop_reputation_handler))
         .route(LISTING_ROUTE, get(listing::listing_details_handler))
+        .route(
+            LISTING_MODERATION_ROUTE,
+            get(listing::listing_moderation_handler),
+        )
         .route(LISTING_TAGS_ROUTE, get(tags::listing_tags_handler))
         .route(LISTING_TAGGERS_ROUTE, get(tags::listing_taggers_handler))
         .route(LISTING_REVIEWS_ROUTE, get(reviews::listing_reviews_handler))

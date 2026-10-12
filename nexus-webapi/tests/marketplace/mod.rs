@@ -4,7 +4,9 @@ use crate::utils::{get_request, invalid_get_request};
 use anyhow::Result;
 use axum::http::StatusCode;
 use nexus_common::db::{exec_single_row, queries, OperationOutcome};
-use nexus_common::models::marketplace::{ListingDetails, ListingSaleFormat, ShopDetails};
+use nexus_common::models::marketplace::{
+    ListingDetails, ListingSaleFormat, ModeratedListing, ModeratedUser, ShopDetails,
+};
 use nexus_common::models::traits::Collection;
 use nexus_common::models::user::UserDetails;
 use pubky::Keypair;
@@ -520,6 +522,89 @@ async fn test_listing_details_and_delete() -> Result<()> {
     assert!(listings
         .iter()
         .all(|listing| listing["id"] != listing_id.as_str()));
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_listing_moderation_state_follows_the_listing_and_seller_markers() -> Result<()> {
+    let (seller_id, _, listing_ids) = seed_marketplace().await?;
+    let moderator_id = Keypair::random().public_key().to_z32();
+    let moderation_route =
+        |listing_id: &str| format!("/v0/listing/{seller_id}/{listing_id}/moderation");
+
+    // Nothing moderated, and a listing the index never held is not moderated either
+    for listing_id in listing_ids
+        .iter()
+        .map(String::as_str)
+        .chain(["Z0AAAAAAAAAAA"])
+    {
+        let body = get_request(&moderation_route(listing_id)).await?;
+        assert_eq!(body["moderated"], false);
+        assert_eq!(body["listing_moderated"], false);
+        assert_eq!(body["seller_moderated"], false);
+    }
+
+    // A marker on one listing moderates that listing only
+    ModeratedListing::put(
+        &seller_id,
+        &listing_ids[0],
+        &listing_uri_builder(seller_id.clone(), listing_ids[0].clone()),
+        &moderator_id,
+        "listing-tag",
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    let body = get_request(&moderation_route(&listing_ids[0])).await?;
+    assert_eq!(body["moderated"], true);
+    assert_eq!(body["listing_moderated"], true);
+    assert_eq!(body["seller_moderated"], false);
+    let body = get_request(&moderation_route(&listing_ids[1])).await?;
+    assert_eq!(body["moderated"], false);
+
+    // A marker on the seller moderates every listing of the seller, indexed or not
+    ModeratedUser::put(
+        &seller_id,
+        &format!("pubky://{seller_id}/pub/pubky.app/profile.json"),
+        &moderator_id,
+        "user-tag",
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    for listing_id in listing_ids
+        .iter()
+        .map(String::as_str)
+        .chain(["Z0AAAAAAAAAAA"])
+    {
+        let body = get_request(&moderation_route(listing_id)).await?;
+        assert_eq!(body["moderated"], true);
+        assert_eq!(body["seller_moderated"], true);
+    }
+    assert_eq!(
+        get_request(&moderation_route(&listing_ids[0])).await?["listing_moderated"],
+        true
+    );
+
+    // Graph-backed reads exclude the seller's shop and listings while the marker stands
+    assert!(ListingDetails::get_from_graph(&seller_id, &listing_ids[2])
+        .await?
+        .is_none());
+    assert!(ShopDetails::get_from_graph(&seller_id).await?.is_none());
+
+    // Removing the markers lifts the moderation
+    ModeratedListing::delete(&moderator_id, "listing-tag").await?;
+    ModeratedUser::delete(&moderator_id, "user-tag").await?;
+    for listing_id in listing_ids.iter().map(String::as_str) {
+        let body = get_request(&moderation_route(listing_id)).await?;
+        assert_eq!(body["moderated"], false);
+    }
+
+    assert!(ListingDetails::get_from_graph(&seller_id, &listing_ids[2])
+        .await?
+        .is_some());
+    assert!(ShopDetails::get_from_graph(&seller_id).await?.is_some());
 
     Ok(())
 }
