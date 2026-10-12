@@ -46,6 +46,10 @@ redact_generated_config() {
 	'
 }
 
+if [ -z "${NEXUS_MODERATION_ID:-}" ]; then
+	echo "WARNING: NEXUS_MODERATION_ID is not set; moderation trusts the built-in fallback key, which is not pubky.app's production moderator. Set it to the production moderator key (docs/railway-deploy.md, 'Moderation: launched setting')." >&2
+fi
+
 moderated_tags_toml=""
 old_ifs="$IFS"
 IFS=,
