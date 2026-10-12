@@ -65,4 +65,19 @@ if ! grep -Fxqe 'moderated_tags = []' "$CFG"; then
 	exit 1
 fi
 
+if ! grep -Fqe 'WARNING: NEXUS_MODERATION_ID is not set' "$OUT"; then
+	echo "FAIL: an unset NEXUS_MODERATION_ID did not warn" >&2
+	exit 1
+fi
+
+NEXUS_MODERATION_ID='uo7jgkykft4885n8cruizwy6khw71mnu5pq3ay9i8pw1ymcn85ko' sh "$ENTRYPOINT" >"$OUT" 2>&1
+if ! grep -Fxqe 'moderation_id = "uo7jgkykft4885n8cruizwy6khw71mnu5pq3ay9i8pw1ymcn85ko"' "$CFG"; then
+	echo "FAIL: NEXUS_MODERATION_ID did not set the moderator key" >&2
+	exit 1
+fi
+if grep -Fqe 'NEXUS_MODERATION_ID is not set' "$OUT"; then
+	echo "FAIL: a set NEXUS_MODERATION_ID still warned" >&2
+	exit 1
+fi
+
 echo "PASS: entrypoint echo has no URL userinfo; on-disk config keeps credentials"

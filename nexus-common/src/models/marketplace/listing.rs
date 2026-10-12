@@ -1,8 +1,8 @@
 use super::ListingStream;
 use crate::db::kv::RedisResult;
 use crate::db::{
-    exec_single_row, execute_graph_operation, fetch_row_from_graph, queries, GraphResult,
-    OperationOutcome, RedisOps,
+    exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, fetch_row_from_graph,
+    queries, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
 use chrono::Utc;
@@ -224,6 +224,18 @@ impl ListingDetails {
 
         let listing: ListingDetails = row.get("details")?;
         Ok(Some(listing))
+    }
+
+    /// The ids of every listing a seller has in the graph.
+    pub async fn ids_of_owner(owner_id: &str) -> GraphResult<Vec<String>> {
+        let rows = fetch_all_rows_from_graph(queries::get::listing_ids_of_owner(owner_id)).await?;
+        let mut listing_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(listing_id) = row.get("listing_id")? {
+                listing_ids.push(listing_id);
+            }
+        }
+        Ok(listing_ids)
     }
 
     // Save new graph node

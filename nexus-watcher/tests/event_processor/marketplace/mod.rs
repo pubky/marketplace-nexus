@@ -7,4 +7,5 @@ mod shop;
 mod stale_prune;
 mod tag;
 mod tag_cleanup;
+mod user_moderation;
 pub(crate) mod utils;

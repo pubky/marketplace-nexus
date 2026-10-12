@@ -42,14 +42,62 @@ Variables set on the `nexusd` service:
 | `PORT` | `8080` | API bind port (entrypoint uses it for `public_addr`) |
 | `NEXUS_EVENTS_LIMIT` | default `1000` | Events fetched per watcher poll |
 | `NEXUS_WATCHER_SLEEP` | default `500` (ms) | Sleep between watcher polls |
-| `NEXUS_MODERATION_ID` | default: the upstream moderator key | Public key (pubky) of the moderator account whose moderation tags are trusted. Always set it to the marketplace moderator: unset means the upstream key |
-| `NEXUS_MODERATED_TAGS` | default `moderated` | Comma-separated labels that take the tagged post, user, file or listing out of the index when the moderator places them; an empty value (set, but empty) turns moderation off. See "Proof listings and reindex" in the README |
+| `NEXUS_MODERATION_ID` | no safe default | Public key (pubky) of pubky.app's production moderator account, the one account whose moderation tags are trusted. Set it explicitly: unset falls back to a built-in key that is not verified as pubky.app's production moderator, and the entrypoint warns |
+| `NEXUS_MODERATED_TAGS` | default `moderated` | Comma-separated labels that, placed by the moderator, take the tagged post, user, file or listing out of the index (a tagged user takes their shop and listings with them). Set it to pubky.app's production label list; an empty value (set, but empty) turns moderation off. See "Moderation: launched setting" below |
 
 Moderation is on by default with the current entrypoint: when
 `NEXUS_MODERATED_TAGS` is unset it defaults to `moderated`, so set
-`NEXUS_MODERATION_ID` to the marketplace moderator in the same change that
-deploys the image. Both variables are declared with `preserve()` in
-`.railway/railway.ts`, so an IaC apply keeps the values set in Railway.
+`NEXUS_MODERATION_ID` to the moderator key in the same change that deploys the
+image. Both variables are declared with `preserve()` in `.railway/railway.ts`,
+so an IaC apply keeps the values set in Railway.
+
+### Moderation: launched setting
+
+The Shop index applies the same moderation as pubky.app: content and users that
+pubky.app's moderator account tags are removed from the index.
+
+| Setting | Railway variable (generated `config.toml` key under `[watcher]`) | Launched value | Where the value comes from |
+|---|---|---|---|
+| Moderator key | `NEXUS_MODERATION_ID` (`moderation_id`) | pubky.app's production moderator public key | The operators of pubky.app's production Nexus hold it in that deployment's watcher config (`moderation_id`). It is not in any public repository: upstream `pubky-nexus` ships only a test key (`uo7jgkykft4885n8cruizwy6khw71mnu5pq3ay9i8pw1ymcn85ko`, marked "test user key, overridden by config.toml value"), and this entrypoint's built-in fallback (`51y9w1skwcryb3iq4sia3x49qwpgstc5feo5tqon65gid7o99khy`) is an older upstream constant that was never confirmed as the live key. |
+| Moderation labels | `NEXUS_MODERATED_TAGS` (`moderated_tags`) | pubky.app's production label list, comma separated | Same source (`moderated_tags` in that config). Upstream's defaults, to compare against and not to copy blindly: `hatespeech`, `harassement` (sic), `terrorism`, `violence`, `illegal_activities`, `il_adult_nu_sex_act`. This fork also moderates `moderated`, the label its proof-listing cleanup uses; keep it in the list only while the moderator account uses it. |
+
+Who sets it: whoever operates the Shop index deployment (the Railway service,
+or the GCP deployment's `[watcher]` config), copying the two values from the
+pubky.app production Nexus configuration. Nothing in this repository can supply
+them. Do not put a personal or throwaway key here: a moderator tag from any
+other key is an ordinary community tag.
+
+After a deploy, read the generated config in the service log
+("Generated config (credentials redacted)"): `moderation_id` must equal
+pubky.app's production moderator key and `moderated_tags` its production label
+list, and the boot log must not contain the `NEXUS_MODERATION_ID is not set`
+warning. The moderator account must be on a homeserver this Nexus watches, or
+its tags are never seen (see the next section).
+
+What the moderator's tags do on this index:
+
+| Tag on | Effect |
+|---|---|
+| a marketplace listing | the listing leaves the graph, the details cache and every stream; stays out across a reindex (`ModeratedListing` marker) |
+| a user's profile | the user, their shop and every listing leave the index; the shop and listings stay out across a reindex, and a listing or shop the seller publishes later is not indexed (`ModeratedUser` marker) |
+| a post, file or tag | removed, as on pubky.app |
+
+Removing the moderator's tag restores what it hid, from the seller's
+homeserver. `GET /v0/listing/{seller_id}/{listing_id}/moderation` reports
+whether a listing is moderated, through the listing's own marker or its
+seller's, for a listing the index holds or not; the transaction service reads
+it before it sells, takes a bid on, or takes an offer on a listing.
+
+### Index discovery: launched setting
+
+| Setting | Launched value | Where |
+|---|---|---|
+| Default homeserver | exactly one: the value of `NEXUS_HOMESERVER` | `homeserver` in the generated config |
+| Discovery limit | `50` | `monitored_homeservers_limit = 50`, fixed in `entrypoint-railway.sh` (no variable) |
+
+The watcher always polls the default homeserver. It adds other homeservers it
+discovers through follows, tags, mentions and reviews, up to the discovery limit
+of 50 monitored homeservers in total.
 
 ### Homeserver watching: no credentials, full history replay
 

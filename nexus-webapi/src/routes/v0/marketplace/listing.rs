@@ -1,9 +1,10 @@
-use crate::routes::v0::endpoints::LISTING_ROUTE;
+use crate::routes::v0::endpoints::{LISTING_MODERATION_ROUTE, LISTING_ROUTE};
 use crate::{Error, Result};
 use axum::extract::Path;
 use axum::Json;
 use nexus_common::models::marketplace::{
-    ListingDetails, ListingSaleFormat, ListingStreamEntry, ReputationSummary,
+    ListingDetails, ListingModerationState, ListingSaleFormat, ListingStreamEntry,
+    ReputationSummary,
 };
 use pubky_app_specs::{
     PubkyAppFulfillmentMethod, PubkyAppListingCondition, PubkyAppListingState, PubkyAppReviewRole,
@@ -52,11 +53,40 @@ pub async fn listing_details_handler(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = LISTING_MODERATION_ROUTE,
+    description = "Whether the configured moderator's tags keep a listing out of the marketplace \
+index, because a tag hides the listing itself or hides its seller (which hides the seller's shop and \
+every listing). A listing that is not moderated, including one the index has never seen, answers \
+`moderated: false`. A transaction service reads this before it sells, takes a bid on, or takes an \
+offer on a listing.",
+    tag = "Marketplace",
+    params(
+        ("seller_id" = String, Path, description = "Seller Pubky ID"),
+        ("listing_id" = String, Path, description = "Listing Crockford32 ID")
+    ),
+    responses(
+        (status = 200, description = "Moderation state of the listing", body = ListingModerationState),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn listing_moderation_handler(
+    Path((seller_id, listing_id)): Path<(String, String)>,
+) -> Result<Json<ListingModerationState>> {
+    debug!("GET {LISTING_MODERATION_ROUTE} seller_id:{seller_id}, listing_id:{listing_id}");
+
+    Ok(Json(
+        ListingModerationState::get(&seller_id, &listing_id).await?,
+    ))
+}
+
 #[derive(OpenApi)]
 #[openapi(
-    paths(listing_details_handler),
+    paths(listing_details_handler, listing_moderation_handler),
     components(schemas(
         ListingDetails,
+        ListingModerationState,
         ListingStreamEntry,
         ListingSaleFormat,
         PubkyAppListingState,

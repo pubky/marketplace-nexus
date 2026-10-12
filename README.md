@@ -301,6 +301,22 @@ Railway, comma separated, empty turns moderation off), the listing is removed
 from the graph, the details cache and every stream, and its community tags go
 with it. Tags by anyone else, or with other labels, have no effect.
 
+The same key and labels, on a user's profile
+(`pubky://<user>/pub/pubky.app/profile.json`), hide the user and cascade to the
+user's marketplace shop and every listing: they leave the graph, the details
+cache and every stream. Like a listing tag, the user tag leaves a marker node
+(`ModeratedUser`, keyed by the moderator's tag record) that does not depend on
+the user, the shop or any listing being indexed, so a replay in any event order
+keeps the shop and listings out, and a shop or listing the seller publishes
+later is not indexed. The moderator deleting the tag deletes the marker and
+re-indexes the profile, shop and listings from the user's homeserver (a record
+the user has deleted stays gone, and a listing hidden by its own tag stays
+hidden). `GET /v0/listing/{seller_id}/{listing_id}/moderation` returns
+`{moderated, listing_moderated, seller_moderated}` from the markers, whether or
+not the index holds the listing, so a transaction service can refuse to sell a
+moderated listing. The production moderator key and labels are configuration:
+see `docs/railway-deploy.md`, "Moderation: launched setting".
+
 The moderation tag is itself a record on the moderator's homeserver, so a
 reindex that replays the watched homeservers replays it. Replay order does not
 matter: the tag leaves a marker node (`ModeratedListing`, keyed by the

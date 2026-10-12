@@ -462,6 +462,34 @@ pub fn put_moderated_listing(
     .param("moderated_at", moderated_at)
 }
 
+/// Records that a moderator tag hides a user's shop and listings. Like the
+/// listing marker it is its own node, keyed by the moderator's tag record, and
+/// is not connected to the user: it can be written before the user, the shop
+/// or any listing is indexed.
+pub fn put_moderated_user(
+    user_id: &str,
+    uri: &str,
+    moderator_id: &str,
+    tag_id: &str,
+    label: &str,
+    moderated_at: i64,
+) -> Query {
+    Query::new(
+        "put_moderated_user",
+        "MERGE (marker:ModeratedUser {moderator_id: $moderator_id, tag_id: $tag_id})
+         SET marker.user_id = $user_id,
+             marker.uri = $uri,
+             marker.label = $label,
+             marker.moderated_at = $moderated_at",
+    )
+    .param("user_id", user_id)
+    .param("uri", uri)
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("moderated_at", moderated_at)
+}
+
 /// Creates or updates a marketplace listing node of a seller.
 /// The query returns no rows when the seller user is not yet indexed (missing dependency).
 pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {

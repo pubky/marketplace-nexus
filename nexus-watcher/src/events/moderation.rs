@@ -48,12 +48,20 @@ impl Moderation {
                 handlers::tag::del(user_id, tag_id).await
             }
             Resource::User => {
-                // Delete the user profile and return the result
+                // Hide the user: their profile is deleted and their shop and
+                // listings are taken out of the index and kept out
                 info!(
-                    "Moderation tag '{}' detected. Deleting user profile {}",
+                    "Moderation tag '{}' detected. Hiding user {}",
                     moderator_tag.label, user_id
                 );
-                handlers::user::del(user_id).await
+                handlers::user::moderate(
+                    user_id,
+                    &moderator_tag.uri,
+                    moderator_id,
+                    tag_id,
+                    &moderator_tag.label,
+                )
+                .await
             }
             Resource::File(file_id) => {
                 // Delete the file and return the result

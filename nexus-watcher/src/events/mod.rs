@@ -124,9 +124,10 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
             handlers::bookmark::del(user_id, bookmark_id.clone()).await?
         }
         Resource::Tag(tag_id) => {
-            // A moderator's tag on a listing is never indexed as a tag: removing
-            // it only lifts the listing's moderation marker.
+            // A moderator's tag on a listing or a user is never indexed as a
+            // tag: removing it only lifts the moderation marker.
             let released = handlers::listing::release_moderation(&user_id, tag_id).await?;
+            let released = handlers::user::release_moderation(&user_id, tag_id).await? || released;
             match handlers::tag::del(user_id, tag_id.clone()).await {
                 Err(EventProcessorError::SkipIndexing) if released => {}
                 other => other?,
