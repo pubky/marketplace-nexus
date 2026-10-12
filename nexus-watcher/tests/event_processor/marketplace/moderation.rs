@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::Utc;
 use nexus_common::db::kv::SortOrder;
 use nexus_common::db::{fetch_all_rows_from_graph, queries};
-use nexus_common::models::event::EventType;
+use nexus_common::models::event::{EventProcessorError, EventType};
 use nexus_common::models::marketplace::{
     ListingDetails, ListingStream, ListingStreamFilters, ListingStreamSorting, ModeratedListing,
 };
@@ -20,15 +20,16 @@ use pubky::{recovery_file, Keypair};
 use pubky_app_specs::{
     listing_uri_builder,
     traits::{HasIdPath, HashId, TimestampId},
-    PubkyAppListing, PubkyAppListingCondition, PubkyAppTag, PubkyAppUser, PubkyId,
+    user_uri_builder, PubkyAppListing, PubkyAppListingCondition, PubkyAppTag, PubkyAppUser,
+    PubkyId,
 };
 use std::sync::Arc;
 use tokio::fs;
 
 /// The label `default_moderation_tests` moderates on behalf of the test moderator.
-const MODERATED_LABEL: &str = "label_to_moderate";
+pub(super) const MODERATED_LABEL: &str = "label_to_moderate";
 
-fn seller_profile(name: &str) -> PubkyAppUser {
+pub(super) fn seller_profile(name: &str) -> PubkyAppUser {
     PubkyAppUser {
         bio: None,
         image: None,
@@ -38,14 +39,14 @@ fn seller_profile(name: &str) -> PubkyAppUser {
     }
 }
 
-async fn moderator_keypair() -> Keypair {
+pub(super) async fn moderator_keypair() -> Keypair {
     let recovery = fs::read("./tests/event_processor/utils/moderator_key.pkarr")
         .await
         .unwrap();
     recovery_file::decrypt_recovery_file(&recovery, "password").unwrap()
 }
 
-fn tag_on_listing(owner_id: &str, listing_id: &str, label: &str) -> PubkyAppTag {
+pub(super) fn tag_on_listing(owner_id: &str, listing_id: &str, label: &str) -> PubkyAppTag {
     PubkyAppTag {
         uri: listing_uri_builder(owner_id.to_string(), listing_id.to_string()),
         label: label.to_string(),
@@ -53,7 +54,7 @@ fn tag_on_listing(owner_id: &str, listing_id: &str, label: &str) -> PubkyAppTag 
     }
 }
 
-fn tag_event_uri(tagger_id: &str, tag: &PubkyAppTag) -> String {
+pub(super) fn tag_event_uri(tagger_id: &str, tag: &PubkyAppTag) -> String {
     format!(
         "pubky://{tagger_id}{}",
         PubkyAppTag::create_path(&tag.create_id())
@@ -67,7 +68,7 @@ fn seller_filters(seller_id: &str) -> ListingStreamFilters {
     }
 }
 
-async fn seller_stream_ids(seller_id: &str) -> Vec<String> {
+pub(super) async fn seller_stream_ids(seller_id: &str) -> Vec<String> {
     ListingStream::get_listings(
         seller_filters(seller_id),
         Pagination::default(),
@@ -82,7 +83,7 @@ async fn seller_stream_ids(seller_id: &str) -> Vec<String> {
 
 /// Asserts the listing is everywhere in the index: graph, details cache,
 /// the per-seller stream and the detail read.
-async fn assert_listed(owner_id: &str, listing_id: &str) {
+pub(super) async fn assert_listed(owner_id: &str, listing_id: &str) {
     assert!(ListingDetails::get_from_graph(owner_id, listing_id)
         .await
         .unwrap()
@@ -101,7 +102,7 @@ async fn assert_listed(owner_id: &str, listing_id: &str) {
 }
 
 /// Asserts no part of the index serves the listing.
-async fn assert_hidden(owner_id: &str, listing_id: &str) {
+pub(super) async fn assert_hidden(owner_id: &str, listing_id: &str) {
     assert!(ListingDetails::get_from_graph(owner_id, listing_id)
         .await
         .unwrap()
@@ -543,6 +544,121 @@ async fn moderation_leaves_the_sellers_other_listings_alone() -> Result<()> {
     assert_hidden(&seller_id, &hidden_id).await;
     assert_listed(&seller_id, &kept_id).await;
     assert_eq!(seller_stream_ids(&seller_id).await, vec![kept_id.clone()]);
+
+    test.del(&moderator_kp, &moderation_tag.hs_path()).await?;
+    test.del(&seller_kp, &hidden_path).await?;
+    test.del(&seller_kp, &kept_path).await?;
+    Ok(())
+}
+
+/// Every ordering of `items`.
+fn permutations(items: &[String]) -> Vec<Vec<String>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut orderings = Vec::new();
+    for index in 0..items.len() {
+        let mut rest = items.to_vec();
+        let head = rest.remove(index);
+        for mut tail in permutations(&rest) {
+            tail.insert(0, head.clone());
+            orderings.push(tail);
+        }
+    }
+    orderings
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_moderated_listing_stays_out_when_the_whole_index_is_rebuilt_in_any_event_order(
+) -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let seller_kp = Keypair::random();
+    let seller_id = test
+        .create_user(&seller_kp, &seller_profile("Watcher:ModRebuild:Seller"))
+        .await?;
+    let moderator_kp = moderator_keypair().await;
+    let moderator_id = test
+        .create_user(
+            &moderator_kp,
+            &seller_profile("Watcher:ModRebuild:Moderator"),
+        )
+        .await?;
+
+    let listing = test_listing(
+        &seller_id,
+        "Rebuilt boots",
+        "fashion",
+        PubkyAppListingCondition::New,
+        9_000,
+    );
+    let (hidden_id, hidden_path) = test.create_listing(&seller_kp, &listing).await?;
+    let (kept_id, kept_path) = test.create_listing(&seller_kp, &listing).await?;
+    let moderation_tag = tag_on_listing(&seller_id, &hidden_id, MODERATED_LABEL);
+    test.put(&moderator_kp, &moderation_tag.hs_path(), &moderation_tag)
+        .await?;
+    assert_hidden(&seller_id, &hidden_id).await;
+    assert_listed(&seller_id, &kept_id).await;
+
+    let profile_line = format!("PUT {}", user_uri_builder(seller_id.clone()));
+    let hidden_line = format!(
+        "PUT {}",
+        listing_uri_builder(seller_id.clone(), hidden_id.clone())
+    );
+    let kept_line = format!(
+        "PUT {}",
+        listing_uri_builder(seller_id.clone(), kept_id.clone())
+    );
+    let tag_line = format!("PUT {}", tag_event_uri(&moderator_id, &moderation_tag));
+    let tag_id = moderation_tag.create_id();
+    let moderation = Arc::new(default_moderation_tests());
+    let seller = PubkyId::try_from(seller_id.as_str()).map_err(anyhow::Error::msg)?;
+
+    let orderings = permutations(&[
+        profile_line.clone(),
+        hidden_line.clone(),
+        kept_line.clone(),
+        tag_line.clone(),
+    ]);
+    assert_eq!(orderings.len(), 24);
+
+    for order in orderings {
+        // A rebuild starts from clean databases: wipe the marker, the listings
+        // and the seller's user
+        ModeratedListing::delete(&moderator_id, &tag_id).await?;
+        for listing_id in [&hidden_id, &kept_id] {
+            nexus_watcher::events::handlers::listing::del(seller.clone(), listing_id.clone())
+                .await?;
+        }
+        let _ = nexus_watcher::events::handlers::user::del(seller.clone()).await;
+        assert!(!ModeratedListing::is_moderated(&seller_id, &hidden_id).await?);
+
+        // Events whose dependency is not there yet wait in the retry queue; the
+        // second pass is the retry
+        for pass in 0..2 {
+            for line in &order {
+                if pass == 1 && line == &tag_line {
+                    continue;
+                }
+                match retrieve_and_handle_event_line(line, moderation.clone()).await {
+                    Ok(()) | Err(EventProcessorError::SkipIndexing) => {}
+                    Err(e) if format!("{e:?}").contains("MissingDependency") => {}
+                    Err(e) => return Err(anyhow::anyhow!("{e:?} replaying {line}")),
+                }
+            }
+        }
+
+        assert!(
+            ModeratedListing::is_moderated(&seller_id, &hidden_id).await?,
+            "the marker is rebuilt from the moderator's tag: {order:?}"
+        );
+        assert_hidden(&seller_id, &hidden_id).await;
+        assert_listed(&seller_id, &kept_id).await;
+        assert_eq!(
+            seller_stream_ids(&seller_id).await,
+            vec![kept_id.clone()],
+            "only the unmoderated listing is served after a rebuild in the order {order:?}"
+        );
+    }
 
     test.del(&moderator_kp, &moderation_tag.hs_path()).await?;
     test.del(&seller_kp, &hidden_path).await?;
