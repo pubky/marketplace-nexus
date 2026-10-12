@@ -171,6 +171,17 @@ pub fn delete_moderated_listing(moderator_id: &str, tag_id: &str) -> Query {
     .param("tag_id", tag_id)
 }
 
+/// Deletes the user moderation marker written for one moderator tag.
+pub fn delete_moderated_user(moderator_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "delete_moderated_user",
+        "MATCH (marker:ModeratedUser {moderator_id: $moderator_id, tag_id: $tag_id})
+         DELETE marker",
+    )
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+}
+
 /// Deletes a listing node and all its relationships
 /// # Arguments
 /// * `owner_id` - The unique identifier of the user who owns the listing
