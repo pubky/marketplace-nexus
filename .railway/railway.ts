@@ -14,7 +14,7 @@ const PRODUCTION_ENVIRONMENT_ID = "aa35d5df-634d-4cdd-9e53-49b0d9c73efc";
 
 // Pinned to the live GHCR digest. Bump in the same PR as each IMAGE connect.
 const LIVE_IMAGE =
-  "ghcr.io/pubky/marketplace-nexus@sha256:196de7851d8b840da0eecf4d16b74988559dddd8cfd6355fd32204cc74a015e7";
+  "ghcr.io/pubky/marketplace-nexus@sha256:87e63c50b8a3297aafcafb677d7b27ddbefaae1a271f58515fed243039d75ad6";
 
 const operationalEnv = {
   NEXUS_EVENTS_LIMIT: preserve(),
