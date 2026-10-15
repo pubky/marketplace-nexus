@@ -13,10 +13,21 @@ pub use errors::EventProcessorError;
 /// before any handler can fetch the body.
 pub const MARKETPLACE_DELIVERABLES_PATH: &str = "/pub/pubky.app/marketplace/v1/deliverables/";
 
-fn is_marketplace_deliverable(uri: &str) -> bool {
+/// Homeservers list every write in `/events`, including files of other apps
+/// such as Paykit. Nexus only indexes this app's namespace.
+const PUBKY_APP_PATH: &str = "/pub/pubky.app/";
+
+fn uri_path(uri: &str) -> Option<&str> {
     uri.strip_prefix("pubky://")
         .and_then(|rest| rest.find('/').map(|slash| &rest[slash..]))
-        .is_some_and(|path| path.starts_with(MARKETPLACE_DELIVERABLES_PATH))
+}
+
+fn is_marketplace_deliverable(uri: &str) -> bool {
+    uri_path(uri).is_some_and(|path| path.starts_with(MARKETPLACE_DELIVERABLES_PATH))
+}
+
+fn is_other_app(uri: &str) -> bool {
+    uri_path(uri).is_some_and(|path| !path.starts_with(PUBKY_APP_PATH))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -80,6 +91,10 @@ impl Event {
         let uri = parts[1].to_string();
         if is_marketplace_deliverable(&uri) {
             debug!("Skipping {event_type} for a marketplace deliverable");
+            return Ok(None);
+        }
+        if is_other_app(&uri) {
+            debug!("Skipping {event_type} for another app: {uri}");
             return Ok(None);
         }
         let parsed_uri = ParsedUri::try_from(uri.as_str()).map_err(|e| {
@@ -187,7 +202,6 @@ mod tests {
         for path in [
             "/pub/pubky.app/marketplace/v1/deliverablesx/abc/1",
             "/pub/pubky.app/marketplace/v1/media/abc",
-            "/pub/other.app/marketplace/v1/deliverables/abc/1",
         ] {
             assert!(
                 matches!(
@@ -199,6 +213,30 @@ mod tests {
         }
         assert!(!is_marketplace_deliverable(
             "https://example.com/pub/pubky.app/marketplace/v1/deliverables/a/1"
+        ));
+    }
+
+    #[test]
+    fn other_app_events_skipped() {
+        for kind in ["PUT", "DEL"] {
+            for path in [
+                "/pub/paykit/v0/shared-state.bin",
+                "/pub/paykit/v0/shared-state-writes/3cd20c5c24e8524e",
+                "/pub/other.app/marketplace/v1/deliverables/abc/1",
+                "/pub/pubky.appx/posts/0033SSE3B1FQ0",
+            ] {
+                let parsed = Event::parse_event(&line(kind, path), PathBuf::new())
+                    .expect("another app's event is not an error");
+                assert!(parsed.is_none(), "{kind} {path} yields no event to handle");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_pubky_app_resource_still_refused() {
+        assert!(matches!(
+            Event::parse_event(&line("PUT", "/pub/pubky.app/unknown/abc"), PathBuf::new()),
+            Err(EventProcessorError::InvalidEventLine(_))
         ));
     }
 }
