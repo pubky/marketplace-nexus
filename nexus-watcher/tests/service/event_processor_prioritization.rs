@@ -72,6 +72,39 @@ async fn rate_limited_homeserver_does_not_consume_the_next_poll_slot() -> Result
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn rate_limited_default_homeserver_does_not_schedule_one_beyond_the_limit(
+) -> Result<(), DynError> {
+    setup().await?;
+
+    let runner = EventProcessorRunner {
+        default_homeserver: PubkyId::try_from(HS_IDS[0]).unwrap(),
+        shutdown_rx: tokio::sync::watch::channel(false).1,
+        limit: 1000,
+        monitored_homeservers_limit: 1,
+        files_path: PathBuf::from("/tmp/nexus-watcher-test"),
+        tracer_name: String::from("unit-test-rate-limit-monitored-set"),
+        moderation: Arc::new(default_moderation_tests()),
+        poll_backoff: Arc::new(HomeserverPollBackoff::default()),
+    };
+
+    for hs_id in &HS_IDS[..2] {
+        Homeserver::new(PubkyId::try_from(hs_id).unwrap())
+            .put_to_graph()
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(runner.pre_run_all().await?, vec![HS_IDS[0].to_string()]);
+
+    runner
+        .poll_backoff
+        .defer(HS_IDS[0], std::time::Duration::from_secs(5));
+
+    assert!(runner.pre_run_all().await?.is_empty());
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn test_mock_event_processor_runner_default_homeserver_prioritization() -> Result<(), DynError>
 {
     // Initialize the test

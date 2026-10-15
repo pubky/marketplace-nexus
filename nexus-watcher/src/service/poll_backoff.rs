@@ -37,8 +37,8 @@ impl HomeserverPollBackoff {
     ) -> Vec<String> {
         homeserver_ids
             .into_iter()
-            .filter(|homeserver_id| self.is_allowed(homeserver_id))
             .take(limit)
+            .filter(|homeserver_id| self.is_allowed(homeserver_id))
             .cloned()
             .collect()
     }
@@ -59,11 +59,24 @@ mod tests {
     }
 
     #[test]
-    fn skipped_rate_limited_feed_does_not_consume_runner_limit() {
+    fn rate_limited_feed_does_not_hand_its_slot_to_an_unmonitored_feed() {
         let backoff = HomeserverPollBackoff::default();
-        let homeservers = vec!["rate-limited".to_string(), "healthy".to_string()];
+        let homeservers = vec!["default".to_string(), "beyond-limit".to_string()];
+        backoff.defer("default", Duration::from_secs(5));
+
+        assert!(backoff.eligible(&homeservers, 1).is_empty());
+    }
+
+    #[test]
+    fn rate_limited_feed_is_skipped_within_the_monitored_set() {
+        let backoff = HomeserverPollBackoff::default();
+        let homeservers = vec![
+            "rate-limited".to_string(),
+            "healthy".to_string(),
+            "beyond-limit".to_string(),
+        ];
         backoff.defer("rate-limited", Duration::from_secs(5));
 
-        assert_eq!(backoff.eligible(&homeservers, 1), vec!["healthy"]);
+        assert_eq!(backoff.eligible(&homeservers, 2), vec!["healthy"]);
     }
 }
