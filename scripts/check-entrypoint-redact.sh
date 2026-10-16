@@ -53,6 +53,17 @@ if ! grep -Fxqe 'moderated_tags = ["moderated"]' "$CFG"; then
 	exit 1
 fi
 
+if ! grep -Fxqe 'allowed_homeservers = []' "$CFG"; then
+	echo "FAIL: on-disk config restricts homeservers without NEXUS_ALLOWED_HOMESERVERS" >&2
+	exit 1
+fi
+
+NEXUS_ALLOWED_HOMESERVERS=' 8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty ,0lv!,"ufibwbmed6jeq9k4p583go95wofakh9fwpp4k734trq79pd9u1uy"' sh "$ENTRYPOINT" >"$OUT" 2>&1
+if ! grep -Fxqe 'allowed_homeservers = ["8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty", "ufibwbmed6jeq9k4p583go95wofakh9fwpp4k734trq79pd9u1uy"]' "$CFG"; then
+	echo "FAIL: NEXUS_ALLOWED_HOMESERVERS did not produce the sanitized homeserver list" >&2
+	exit 1
+fi
+
 NEXUS_MODERATED_TAGS=' spam, "bad label",,illegal_activities ' sh "$ENTRYPOINT" >"$OUT" 2>&1
 if ! grep -Fxqe 'moderated_tags = ["spam", "badlabel", "illegal_activities"]' "$CFG"; then
 	echo "FAIL: NEXUS_MODERATED_TAGS did not produce the sanitized label list" >&2

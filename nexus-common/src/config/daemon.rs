@@ -229,6 +229,37 @@ password = "fixture-neo4j-password"
     }
 
     #[test]
+    fn railway_config_without_allowed_homeservers_allows_all() {
+        let daemon = DaemonConfig::try_from_str(RAILWAY_DATA_CONFIG_TOML).expect("parses");
+        assert!(daemon.stack.allowed_homeservers.is_empty());
+    }
+
+    #[test]
+    fn railway_config_reads_allowed_homeservers() {
+        let toml = RAILWAY_DATA_CONFIG_TOML.replace(
+            "files_path = \"/data/static/files\"",
+            "files_path = \"/data/static/files\"\nallowed_homeservers = [\"8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty\"]",
+        );
+        let daemon = DaemonConfig::try_from_str(&toml).expect("parses");
+        let ids: Vec<&str> = daemon
+            .stack
+            .allowed_homeservers
+            .iter()
+            .map(|id| id.as_ref())
+            .collect();
+        assert_eq!(
+            ids,
+            ["8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty"]
+        );
+
+        let bad = RAILWAY_DATA_CONFIG_TOML.replace(
+            "files_path = \"/data/static/files\"",
+            "files_path = \"/data/static/files\"\nallowed_homeservers = [\"not-a-pubky\"]",
+        );
+        assert!(DaemonConfig::try_from_str(&bad).is_err());
+    }
+
+    #[test]
     fn production_toml_shapes_round_trip_raw_urls_and_redact_display() {
         let daemon = DaemonConfig::try_from_str(RAILWAY_DATA_CONFIG_TOML)
             .expect("Railway /data/config.toml shape parses");
