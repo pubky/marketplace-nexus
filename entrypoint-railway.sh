@@ -21,6 +21,11 @@ WATCHER_SLEEP="${NEXUS_WATCHER_SLEEP:-500}"
 # post, user, file or marketplace listing out of the index. Comma separated;
 # set it empty to turn moderation off.
 MODERATED_TAGS="${NEXUS_MODERATED_TAGS-moderated}"
+# Homeservers this index may watch, comma separated z-base-32 ids. When set,
+# the watcher polls only these and never adds another homeserver it discovers
+# (follows, tags, mentions, reviews, /v0/bootstrap); NEXUS_HOMESERVER must be
+# one of them. Unset or empty watches every homeserver it discovers.
+ALLOWED_HOMESERVERS="${NEXUS_ALLOWED_HOMESERVERS:-}"
 
 # Echoed config must never contain URL userinfo (`://user:pass@`) or secret
 # assignment values. The file written for nexusd keeps the real values.
@@ -58,6 +63,12 @@ for label in $MODERATED_TAGS; do
 	[ -n "$label" ] || continue
 	moderated_tags_toml="${moderated_tags_toml}${moderated_tags_toml:+, }\"${label}\""
 done
+allowed_homeservers_toml=""
+for homeserver in $ALLOWED_HOMESERVERS; do
+	homeserver="$(printf '%s' "$homeserver" | tr -cd 'ybndrfg8ejkmcpqxot1uwisza345h769')"
+	[ -n "$homeserver" ] || continue
+	allowed_homeservers_toml="${allowed_homeservers_toml}${allowed_homeservers_toml:+, }\"${homeserver}\""
+done
 IFS="$old_ifs"
 
 mkdir -p "$CONFIG_DIR/static/files"
@@ -66,6 +77,7 @@ echo "=== Railway nexusd entrypoint ==="
 echo "TESTNET=${TESTNET}"
 echo "TESTNET_HOST=${TESTNET_HOST}"
 echo "HOMESERVER=${HOMESERVER}"
+echo "ALLOWED_HOMESERVERS=[${allowed_homeservers_toml}]"
 
 cat > "$CONFIG_DIR/config.toml" <<EOF
 [api]
@@ -88,6 +100,7 @@ moderated_tags = [${moderated_tags_toml}]
 [stack]
 log_level = "info"
 files_path = "/data/static/files"
+allowed_homeservers = [${allowed_homeservers_toml}]
 
 [stack.db]
 redis = "${REDIS_URL}"

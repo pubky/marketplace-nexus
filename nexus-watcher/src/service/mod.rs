@@ -12,12 +12,12 @@ pub use constants::{
 use nexus_common::types::DynError;
 pub use poll_backoff::HomeserverPollBackoff;
 pub use processor::EventProcessor;
-pub use processor_runner::EventProcessorRunner;
+pub use processor_runner::{order_homeservers, EventProcessorRunner};
 pub use traits::{TEventProcessor, TEventProcessorRunner};
 
 use crate::NexusWatcherBuilder;
 use nexus_common::file::ConfigLoader;
-use nexus_common::models::homeserver::Homeserver;
+use nexus_common::models::homeserver::{Homeserver, HomeserverAllowlist};
 use nexus_common::utils::create_shutdown_rx;
 use nexus_common::{DaemonConfig, WatcherConfig};
 use pubky_app_specs::PubkyId;
@@ -25,6 +25,20 @@ use std::path::PathBuf;
 use tokio::sync::watch::Receiver;
 use tokio::time::Duration;
 use tracing::{debug, error, info};
+
+/// A watcher whose default homeserver the allowlist refuses would poll nothing; fail at start instead.
+pub fn check_default_homeserver_allowed(
+    default_homeserver: &PubkyId,
+    allowlist: &HomeserverAllowlist,
+) -> Result<(), DynError> {
+    if allowlist.allows(default_homeserver.as_ref()) {
+        return Ok(());
+    }
+    Err(format!(
+        "the default homeserver {default_homeserver} is not in allowed_homeservers ({allowlist})"
+    )
+    .into())
+}
 
 pub struct NexusWatcher {}
 
@@ -78,6 +92,7 @@ impl NexusWatcher {
         debug!(?config, "Running NexusWatcher with ");
 
         let config_hs = PubkyId::try_from(config.homeserver.as_ref())?;
+        check_default_homeserver_allowed(&config_hs, HomeserverAllowlist::current())?;
         Homeserver::persist_if_unknown(config_hs).await?;
 
         let mut interval = tokio::time::interval(Duration::from_millis(config.watcher_sleep));
@@ -100,5 +115,29 @@ impl NexusWatcher {
         }
         info!("Nexus Watcher shut down gracefully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_default_homeserver_allowed;
+    use nexus_common::models::homeserver::HomeserverAllowlist;
+    use pubky_app_specs::PubkyId;
+
+    const PROD: &str = "8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty";
+    const STAGING: &str = "ufibwbmed6jeq9k4p583go95wofakh9fwpp4k734trq79pd9u1uy";
+
+    #[test]
+    fn default_homeserver_must_be_allowed() {
+        let default = PubkyId::try_from(STAGING).unwrap();
+        assert!(
+            check_default_homeserver_allowed(&default, &HomeserverAllowlist::default()).is_ok()
+        );
+        assert!(
+            check_default_homeserver_allowed(&default, &HomeserverAllowlist::new([STAGING]))
+                .is_ok()
+        );
+        let refused = check_default_homeserver_allowed(&default, &HomeserverAllowlist::new([PROD]));
+        assert!(refused.unwrap_err().to_string().contains(STAGING));
     }
 }

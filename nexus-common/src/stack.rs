@@ -1,4 +1,5 @@
 use crate::db::{Neo4jConnector, RedisConnector};
+use crate::models::homeserver::HomeserverAllowlist;
 use crate::types::DynError;
 use crate::{Level, StackConfig};
 use opentelemetry::{global, KeyValue};
@@ -20,6 +21,12 @@ impl StackManager {
         // Initialize logging and metrics
         Self::setup_logging(name, &config.otlp_endpoint, config.log_level).await;
         Self::setup_metrics(name, &config.otlp_endpoint).await;
+
+        let allowlist = HomeserverAllowlist::new(&config.allowed_homeservers);
+        if allowlist.is_restricted() {
+            info!("Watching only the allowed homeservers: {allowlist}");
+        }
+        allowlist.install();
 
         // Initialize Redis and Neo4j
         RedisConnector::init(&config.db.redis).await?;

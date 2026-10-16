@@ -1,7 +1,7 @@
 use crate::events::Moderation;
 use crate::service::traits::{TEventProcessor, TEventProcessorRunner};
 use crate::service::{processor::EventProcessor, HomeserverPollBackoff};
-use nexus_common::models::homeserver::Homeserver;
+use nexus_common::models::homeserver::{Homeserver, HomeserverAllowlist};
 use nexus_common::types::DynError;
 use nexus_common::WatcherConfig;
 use pubky_app_specs::PubkyId;
@@ -42,6 +42,21 @@ impl EventProcessorRunner {
     }
 }
 
+/// Polling order: the known homeservers the allowlist permits (a homeserver already in the graph
+/// from before the allowlist was set is skipped too), with the default first.
+pub fn order_homeservers(
+    mut hs_ids: Vec<String>,
+    default_homeserver: &str,
+    allowlist: &HomeserverAllowlist,
+) -> Vec<String> {
+    hs_ids.retain(|hs_id| allowlist.allows(hs_id));
+    if let Some(default_pos) = hs_ids.iter().position(|hs_id| hs_id == default_homeserver) {
+        let default_hs = hs_ids.remove(default_pos);
+        hs_ids.insert(0, default_hs);
+    }
+    hs_ids
+}
+
 #[async_trait::async_trait]
 impl TEventProcessorRunner for EventProcessorRunner {
     fn shutdown_rx(&self) -> Receiver<bool> {
@@ -57,18 +72,11 @@ impl TEventProcessorRunner for EventProcessorRunner {
     }
 
     async fn homeservers_by_priority(&self) -> Result<Vec<String>, DynError> {
-        let mut hs_ids = Homeserver::get_all_from_graph().await?;
-
-        // Move default homeserver to index 0 if it exists in the array to prioritize its processing
-        if let Some(default_pos) = hs_ids
-            .iter()
-            .position(|hs_id| hs_id == self.default_homeserver())
-        {
-            let default_hs = hs_ids.remove(default_pos);
-            hs_ids.insert(0, default_hs);
-        }
-
-        Ok(hs_ids)
+        Ok(order_homeservers(
+            Homeserver::get_all_from_graph().await?,
+            self.default_homeserver(),
+            HomeserverAllowlist::current(),
+        ))
     }
 
     async fn pre_run_all(&self) -> Result<Vec<String>, DynError> {
@@ -95,5 +103,35 @@ impl TEventProcessorRunner for EventProcessorRunner {
             shutdown_rx: self.shutdown_rx.clone(),
             poll_backoff: self.poll_backoff.clone(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order_homeservers;
+    use nexus_common::models::homeserver::HomeserverAllowlist;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_allowlist_polls_every_known_homeserver_default_first() {
+        let ordered =
+            order_homeservers(ids(&["a", "b", "c"]), "b", &HomeserverAllowlist::default());
+        assert_eq!(ordered, ids(&["b", "a", "c"]));
+    }
+
+    #[test]
+    fn restricted_allowlist_drops_known_homeservers_it_does_not_list() {
+        let allowlist = HomeserverAllowlist::new(["a", "c"]);
+        let ordered = order_homeservers(ids(&["a", "b", "c"]), "c", &allowlist);
+        assert_eq!(ordered, ids(&["c", "a"]));
+    }
+
+    #[test]
+    fn restricted_allowlist_can_leave_nothing_to_poll() {
+        let allowlist = HomeserverAllowlist::new(["z"]);
+        assert!(order_homeservers(ids(&["a", "b"]), "a", &allowlist).is_empty());
     }
 }

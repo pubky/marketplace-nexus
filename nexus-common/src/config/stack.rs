@@ -1,4 +1,5 @@
 use crate::{db::DatabaseConfig, get_files_dir_pathbuf};
+use pubky_app_specs::PubkyId;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt::Debug, path::PathBuf};
 
@@ -19,6 +20,11 @@ pub struct StackConfig {
     pub files_path: PathBuf,
     pub otlp_endpoint: Option<String>,
     pub db: DatabaseConfig,
+    /// Homeservers this indexer may watch. When non-empty, the watcher polls only these, and a
+    /// homeserver discovered through a follow, tag, mention, review or `/v0/bootstrap` is added only
+    /// if it is listed. Empty (the default) allows every homeserver.
+    #[serde(default)]
+    pub allowed_homeservers: Vec<PubkyId>,
 }
 
 /// Utility function
@@ -33,6 +39,7 @@ impl Default for StackConfig {
             files_path: get_files_dir_pathbuf(),
             otlp_endpoint: None,
             db: DatabaseConfig::default(),
+            allowed_homeservers: Vec::new(),
         }
     }
 }

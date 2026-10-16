@@ -14,7 +14,64 @@ use pubky::PublicKey;
 use pubky_app_specs::ParsedUri;
 use pubky_app_specs::PubkyId;
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::OnceLock;
+use tracing::{info, warn};
+
+static ALLOWED_HOMESERVERS: OnceLock<HomeserverAllowlist> = OnceLock::new();
+
+/// The homeservers this process may watch ([crate::StackConfig::allowed_homeservers]).
+/// Empty allows every homeserver.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HomeserverAllowlist(BTreeSet<String>);
+
+impl HomeserverAllowlist {
+    pub fn new<I, S>(ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self(ids.into_iter().map(|id| id.as_ref().to_string()).collect())
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    pub fn allows(&self, homeserver_id: &str) -> bool {
+        self.0.is_empty() || self.0.contains(homeserver_id)
+    }
+
+    /// Makes this the process-wide allowlist. The first install wins: the API and the watcher of
+    /// one `nexusd` share a [crate::StackConfig], so a second install with other contents is a
+    /// misconfiguration and is reported, not applied.
+    pub fn install(self) {
+        if let Err(rejected) = ALLOWED_HOMESERVERS.set(self) {
+            if Some(&rejected) != ALLOWED_HOMESERVERS.get() {
+                warn!("Ignoring a second, different homeserver allowlist: {rejected}");
+            }
+        }
+    }
+
+    /// The installed allowlist, or the empty (allow-all) one before [Self::install].
+    pub fn current() -> &'static HomeserverAllowlist {
+        static ALLOW_ALL: OnceLock<HomeserverAllowlist> = OnceLock::new();
+        ALLOWED_HOMESERVERS
+            .get()
+            .unwrap_or_else(|| ALLOW_ALL.get_or_init(HomeserverAllowlist::default))
+    }
+}
+
+impl fmt::Display for HomeserverAllowlist {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.is_empty() {
+            return f.write_str("all");
+        }
+        let ids: Vec<&str> = self.0.iter().map(String::as_str).collect();
+        f.write_str(&ids.join(", "))
+    }
+}
 
 /// Represents a homeserver with its public key, URL, and cursor.
 #[derive(Serialize, Deserialize, Debug)]
@@ -95,16 +152,33 @@ impl Homeserver {
         }
     }
 
-    /// Verifies if homeserver exists in the graph, or persists it if missing
+    /// Verifies if homeserver exists in the graph, or persists it if missing and allowed by the
+    /// installed [HomeserverAllowlist]. Every new homeserver enters through here (the configured
+    /// default at watcher start, and discovery from events and `/v0/bootstrap`).
     pub async fn persist_if_unknown(homeserver_id: PubkyId) -> ModelResult<()> {
-        if Self::get_from_graph(&homeserver_id).await?.is_none() {
-            info!("Persisting new homeserver: {homeserver_id}");
-            let homeserver = Homeserver::new(homeserver_id);
-            homeserver.put_to_graph().await?;
-            homeserver.put_to_index().await?;
-        }
+        Self::persist_if_unknown_in(homeserver_id, HomeserverAllowlist::current())
+            .await
+            .map(|_| ())
+    }
 
-        Ok(())
+    /// [Self::persist_if_unknown] against an explicit allowlist. Returns whether the homeserver is
+    /// now known: `false` when the allowlist refused a homeserver the graph did not have.
+    pub async fn persist_if_unknown_in(
+        homeserver_id: PubkyId,
+        allowlist: &HomeserverAllowlist,
+    ) -> ModelResult<bool> {
+        if Self::get_from_graph(&homeserver_id).await?.is_some() {
+            return Ok(true);
+        }
+        if !allowlist.allows(homeserver_id.as_ref()) {
+            info!("Not watching homeserver {homeserver_id}: not in the allowed homeservers");
+            return Ok(false);
+        }
+        info!("Persisting new homeserver: {homeserver_id}");
+        let homeserver = Homeserver::new(homeserver_id);
+        homeserver.put_to_graph().await?;
+        homeserver.put_to_index().await?;
+        Ok(true)
     }
 
     /// Retrieves all homeservers from the graph.
@@ -165,10 +239,15 @@ impl Homeserver {
         // would render the `pubky`-prefixed form, which PubkyId rejects.)
         let hs_pk = PubkyId::try_from(ref_post_author_hs.z32().as_str())
             .map_err(ModelError::from_generic)?;
-        Self::persist_if_unknown(hs_pk.clone())
+        Self::persist_if_unknown_in(hs_pk.clone(), HomeserverAllowlist::current())
             .await
-            .inspect(|_| tracing::info!("Ingested homeserver {hs_pk}"))
+            .inspect(|known| {
+                if *known {
+                    tracing::info!("Ingested homeserver {hs_pk}")
+                }
+            })
             .inspect_err(|e| tracing::error!("Failed to ingest homeserver {hs_pk}: {e}"))
+            .map(|_| ())
     }
 }
 
@@ -224,6 +303,68 @@ mod tests {
 
         assert_eq!(id, hs_from_index.id);
 
+        Ok(())
+    }
+
+    fn random_id() -> PubkyId {
+        PubkyId::try_from(&Keypair::random().public_key().to_z32())
+            .expect("random key is a pubky id")
+    }
+
+    #[test]
+    fn empty_allowlist_allows_every_homeserver() {
+        let allowlist = HomeserverAllowlist::default();
+        assert!(!allowlist.is_restricted());
+        assert!(allowlist.allows(random_id().as_ref()));
+        assert_eq!(allowlist.to_string(), "all");
+    }
+
+    #[test]
+    fn restricted_allowlist_allows_only_listed_homeservers() {
+        let (listed, other) = (random_id(), random_id());
+        let allowlist = HomeserverAllowlist::new([&listed]);
+        assert!(allowlist.is_restricted());
+        assert!(allowlist.allows(listed.as_ref()));
+        assert!(!allowlist.allows(other.as_ref()));
+        assert_eq!(allowlist.to_string(), listed.to_string());
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn restricted_allowlist_refuses_an_unknown_homeserver() -> Result<(), DynError> {
+        StackManager::setup("unit-hs-test", &StackConfig::default()).await?;
+        let (listed, other) = (random_id(), random_id());
+        let allowlist = HomeserverAllowlist::new([&listed]);
+
+        assert!(!Homeserver::persist_if_unknown_in(other.clone(), &allowlist).await?);
+        assert!(Homeserver::get_from_graph(&other).await?.is_none());
+        assert!(Homeserver::get_from_index(&other).await?.is_none());
+
+        assert!(Homeserver::persist_if_unknown_in(listed.clone(), &allowlist).await?);
+        assert!(Homeserver::get_from_graph(&listed).await?.is_some());
+        assert!(Homeserver::get_from_index(&listed).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn allowlist_keeps_a_homeserver_the_graph_already_has() -> Result<(), DynError> {
+        StackManager::setup("unit-hs-test", &StackConfig::default()).await?;
+        let known = random_id();
+        Homeserver::new(known.clone()).put_to_graph().await?;
+
+        let allowlist = HomeserverAllowlist::new([random_id()]);
+        assert!(Homeserver::persist_if_unknown_in(known.clone(), &allowlist).await?);
+        assert!(Homeserver::get_from_graph(&known).await?.is_some());
+        Ok(())
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn empty_allowlist_persists_an_unknown_homeserver() -> Result<(), DynError> {
+        StackManager::setup("unit-hs-test", &StackConfig::default()).await?;
+        let id = random_id();
+        assert!(
+            Homeserver::persist_if_unknown_in(id.clone(), &HomeserverAllowlist::default()).await?
+        );
+        assert!(Homeserver::get_from_graph(&id).await?.is_some());
         Ok(())
     }
 }

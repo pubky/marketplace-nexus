@@ -35,6 +35,7 @@ async fn main() -> Result<(), DynError> {
                 files_path: get_files_dir_pathbuf(),
                 otlp_endpoint: None,
                 db: DatabaseConfig::default(),
+                allowed_homeservers: Vec::new(),
             };
             let config = WatcherConfig {
                 name: String::from("nexusd.watcher"),
