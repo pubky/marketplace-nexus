@@ -585,3 +585,80 @@ async fn review_record_404_is_reported_as_gone() -> Result<()> {
     test.cleanup_user(&reviewer_kp).await?;
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn test_each_attested_order_keeps_its_own_review() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+
+    let seller_kp = Keypair::random();
+    let seller_id = test
+        .create_user(&seller_kp, &test_user("Watcher:ReviewPerOrder:Seller"))
+        .await?;
+    let shop_path: pubky::ResourcePath = PubkyAppShop::create_path().parse()?;
+    test.put(&seller_kp, &shop_path, &test_shop(&seller_id))
+        .await?;
+    let listing = test_listing(
+        &seller_id,
+        "Twice bought",
+        "electronics",
+        PubkyAppListingCondition::Excellent,
+        10_000,
+    );
+    let (listing_id, _listing_path) = test.create_listing(&seller_kp, &listing).await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &test_user("Watcher:ReviewPerOrder:Buyer"))
+        .await?;
+    let attestor = test_attestor_key();
+
+    // One buyer, two attested orders of the same listing: a 5 and then a 1.
+    let mut review_ids = Vec::new();
+    for (seed, overall) in [('1', 5), ('2', 1)] {
+        let claims = test_attestation_claims(
+            &attestor_pubky(&attestor),
+            &buyer_id,
+            &seller_id,
+            &seller_id,
+            &listing_id,
+            seed,
+        );
+        let mut review = test_review(
+            &buyer_id,
+            &seller_id,
+            &seller_id,
+            &listing_id,
+            overall,
+            "Per-order review.",
+            &sign_attestation(&claims, &attestor),
+        );
+        review.order_ref = Some(claims.order_ref.clone());
+        let (review_id, _path) = test.create_review(&buyer_kp, &review).await?;
+        let indexed = ReviewDetails::get_from_index(&buyer_id, &review_id)
+            .await
+            .unwrap()
+            .expect("Each order's review must be indexed");
+        assert!(indexed.verified, "The orderRef binds to the attestation");
+        review_ids.push(review_id);
+    }
+    assert_ne!(review_ids[0], review_ids[1], "Each order gets its own path");
+
+    // The first review survives the second: both are listed and counted.
+    let listing_reviews =
+        ReviewStream::get_by_listing(&seller_id, &listing_id, Pagination::default())
+            .await
+            .unwrap()
+            .expect("The listing review stream should not be empty");
+    assert_eq!(listing_reviews.0.len(), 2);
+    let summary =
+        ReputationSummary::get_by_subject(&seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await
+            .unwrap()
+            .expect("The subject reputation summary should exist");
+    assert_eq!(summary.count, 2);
+    assert_eq!(summary.verified_count, 2);
+    assert_eq!(summary.avg, 3.0);
+
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
