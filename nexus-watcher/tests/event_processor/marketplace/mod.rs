@@ -4,6 +4,7 @@ mod homeserver_binding;
 mod listing;
 mod moderation;
 mod review;
+mod review_moderation;
 mod shop;
 mod stale_prune;
 mod tag;

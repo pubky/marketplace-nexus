@@ -319,6 +319,21 @@ not the index holds the listing, so a transaction service can refuse to sell a
 moderated listing. The production moderator key and labels are configuration:
 see `docs/operations.md`, "Moderation: launched setting".
 
+Marketplace reviews are moderated in place, never deleted. The moderator key
+tagging a review URI
+(`pubky://<reviewer>/pub/pubky.app/marketplace/v1/reviews/<review_id>`) with a
+label in `moderated_tags` hides its text (`moderation: {state: "text_hidden",
+reason: <label>}`, ratings still counted); a label in `review_exclude_tags`
+(`review_fraud` by default; an empty list turns review exclusion off) sets
+`{state: "excluded", reason: <label>}`, which also leaves the review out of
+every aggregate. A `review_exclude_tags` label on a user's profile excludes
+every review the user wrote without hiding the user; a moderated user's reviews
+are `text_hidden`. Review streams return `moderation` (`null` when none) and an
+empty `text` for a moderated review. The markers (`ModeratedReview`,
+`ExcludedReviewer`) are keyed by the moderator's tag record like the listing
+marker, so a replay in any order and an edit of the review keep the state, and
+deleting the tag lifts it.
+
 The moderation tag is itself a record on the moderator's homeserver, so a
 reindex that replays the watched homeservers replays it. Replay order does not
 matter: the tag leaves a marker node (`ModeratedListing`, keyed by the

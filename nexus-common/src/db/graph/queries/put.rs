@@ -1,6 +1,8 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::Query;
-use crate::models::marketplace::{DropDetails, ListingDetails, ReviewDetails, ShopDetails};
+use crate::models::marketplace::{
+    DropDetails, ListingDetails, ReviewDetails, ReviewModeration, ShopDetails,
+};
 use crate::models::post::PostRelationships;
 use crate::models::{file::FileDetails, post::PostDetails, user::UserDetails};
 use pubky_app_specs::{ParsedUri, Resource};
@@ -490,6 +492,67 @@ pub fn put_moderated_user(
     .param("moderated_at", moderated_at)
 }
 
+/// Records that a moderator tag moderates a review (`state` is `text_hidden`
+/// or `excluded`). Its own node, keyed by the moderator's tag record and not
+/// connected to the review edge: it can be written before the review is
+/// indexed and outlives edits of it.
+#[allow(clippy::too_many_arguments)]
+pub fn put_moderated_review(
+    reviewer_id: &str,
+    review_id: &str,
+    uri: &str,
+    moderator_id: &str,
+    tag_id: &str,
+    label: &str,
+    state: &str,
+    moderated_at: i64,
+) -> Query {
+    Query::new(
+        "put_moderated_review",
+        "MERGE (marker:ModeratedReview {moderator_id: $moderator_id, tag_id: $tag_id})
+         SET marker.reviewer_id = $reviewer_id,
+             marker.review_id = $review_id,
+             marker.uri = $uri,
+             marker.label = $label,
+             marker.state = $state,
+             marker.moderated_at = $moderated_at",
+    )
+    .param("reviewer_id", reviewer_id)
+    .param("review_id", review_id)
+    .param("uri", uri)
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("state", state)
+    .param("moderated_at", moderated_at)
+}
+
+/// Records that a moderator tag excludes every review a user wrote. Its own
+/// node, keyed by the moderator's tag record and not connected to the user.
+pub fn put_excluded_reviewer(
+    user_id: &str,
+    uri: &str,
+    moderator_id: &str,
+    tag_id: &str,
+    label: &str,
+    moderated_at: i64,
+) -> Query {
+    Query::new(
+        "put_excluded_reviewer",
+        "MERGE (marker:ExcludedReviewer {moderator_id: $moderator_id, tag_id: $tag_id})
+         SET marker.user_id = $user_id,
+             marker.uri = $uri,
+             marker.label = $label,
+             marker.moderated_at = $moderated_at",
+    )
+    .param("user_id", user_id)
+    .param("uri", uri)
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+    .param("label", label)
+    .param("moderated_at", moderated_at)
+}
+
 /// Creates or updates a marketplace listing node of a seller.
 /// The query returns no rows when the seller user is not yet indexed (missing dependency).
 pub fn create_listing(listing: &ListingDetails) -> GraphResult<Query> {
@@ -658,6 +721,8 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
             r.order_ref = $order_ref,
             r.order_scoped = $order_scoped,
             r.edited_late = $edited_late,
+            r.moderation = $moderation,
+            r.moderation_reason = $moderation_reason,
             r.created_at = $created_at,
             r.updated_at = $updated_at,
             r.revision = $revision
@@ -680,6 +745,20 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
     .param("order_ref", review.order_ref.clone())
     .param("order_scoped", review.order_scoped)
     .param("edited_late", review.edited_late)
+    .param(
+        "moderation",
+        review
+            .moderation
+            .as_ref()
+            .map(|moderation| moderation.state.as_str().to_string()),
+    )
+    .param(
+        "moderation_reason",
+        review
+            .moderation
+            .as_ref()
+            .map(|moderation| moderation.reason.clone()),
+    )
     .param("created_at", review.created_at.to_string())
     .param("updated_at", review.updated_at.to_string())
     .param("revision", review.revision);
@@ -699,6 +778,31 @@ pub fn set_review_superseded(reviewer_id: &str, review_id: &str, superseded: boo
     .param("reviewer_id", reviewer_id.to_string())
     .param("review_id", review_id.to_string())
     .param("superseded", superseded)
+}
+
+/// Sets (or clears, with `None`) a review edge's moderation state and reason.
+pub fn set_review_moderation(
+    reviewer_id: &str,
+    review_id: &str,
+    moderation: Option<&ReviewModeration>,
+) -> Query {
+    Query::new(
+        "set_review_moderation",
+        "MATCH (reviewer:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+        SET r.moderation = $moderation,
+            r.moderation_reason = $moderation_reason
+        RETURN true AS flag;",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
+    .param(
+        "moderation",
+        moderation.map(|moderation| moderation.state.as_str().to_string()),
+    )
+    .param(
+        "moderation_reason",
+        moderation.map(|moderation| moderation.reason.clone()),
+    )
 }
 
 /// Sets or clears the `has_response` flag on a review edge (maintained by

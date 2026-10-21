@@ -4,7 +4,10 @@ use crate::events::EventProcessorError;
 use nexus_common::db::reindex::{get_all_user_ids, get_indexed_review_ids};
 use nexus_common::db::{OperationOutcome, PubkyConnector};
 use nexus_common::models::homeserver::Homeserver;
-use nexus_common::models::marketplace::{ReputationSummary, ReviewDetails};
+use nexus_common::models::marketplace::{
+    ExcludedReviewer, ModeratedReview, ReputationSummary, ReviewDetails, ReviewModeration,
+    ReviewModerationState,
+};
 use nexus_common::models::user::UserDetails;
 use nexus_common::types::DynError;
 use pubky_app_specs::{
@@ -43,6 +46,9 @@ pub async fn sync_put(
     // re-evaluates it against the record's previous attested order.
     let prior = ReviewDetails::get_from_index(&user_id, &review_id).await?;
     details.superseded = prior.as_ref().is_some_and(|prior| prior.superseded);
+    // Moderation lives in markers keyed by the moderator's tag, so a tag
+    // replayed before the review, and every edit, keep the review moderated.
+    details.moderation = ReviewModeration::get(&user_id, &review_id, None).await?;
 
     // SAVE TO GRAPH: requires both the reviewer and the subject users
     let existed = match details.put_to_graph().await? {
@@ -56,6 +62,10 @@ pub async fn sync_put(
     // SAVE TO INDEX: an edit refreshes the details JSON only; the review
     // keeps its original position in the review sorted sets
     details.put_to_index(existed).await?;
+    // A moderator tag handled while this review was being written.
+    if let Some(refreshed) = ReviewDetails::refresh_moderation(&user_id, &review_id, None).await? {
+        details = refreshed;
+    }
 
     // ONE COUNT PER ATTESTED ORDER: a scoped record supersedes its legacy twin
     details.resolve_order_twins(prior.as_ref()).await?;
@@ -78,6 +88,137 @@ pub async fn del(user_id: PubkyId, review_id: String) -> Result<(), EventProcess
     recompute_reputation(&details).await?;
 
     Ok(())
+}
+
+/// Moderates a review because the configured moderator tagged its URI: a
+/// moderated label hides its text, a review-exclusion label leaves it out of
+/// the aggregates. The marker is written first and holds for a review indexed
+/// later; nothing is deleted.
+#[allow(clippy::too_many_arguments)]
+pub async fn moderate(
+    reviewer_id: PubkyId,
+    review_id: String,
+    uri: &str,
+    moderator_id: &PubkyId,
+    tag_id: &str,
+    label: &str,
+    state: ReviewModerationState,
+) -> Result<(), EventProcessorError> {
+    info!(
+        "Moderation tag '{label}' on review {reviewer_id}/{review_id}; marking it {}",
+        state.as_str()
+    );
+    ModeratedReview::put(
+        &reviewer_id,
+        &review_id,
+        uri,
+        moderator_id,
+        tag_id,
+        label,
+        state,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    refresh_moderation(&reviewer_id, &review_id, None).await?;
+    Ok(())
+}
+
+/// Excludes every review a user wrote from the aggregates because the
+/// configured moderator tagged the user with a review-exclusion label. The
+/// user, their shop and their listings stay; reviews they publish later are
+/// excluded too.
+pub async fn exclude_reviewer(
+    user_id: PubkyId,
+    uri: &str,
+    moderator_id: &PubkyId,
+    tag_id: &str,
+    label: &str,
+) -> Result<(), EventProcessorError> {
+    info!("Moderation tag '{label}' on user {user_id}; excluding their reviews");
+    ExcludedReviewer::put(
+        &user_id,
+        uri,
+        moderator_id,
+        tag_id,
+        label,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    refresh_reviewer_moderation(&user_id, None).await?;
+    Ok(())
+}
+
+/// Handles the moderator deleting one of its moderation tags. Returns whether
+/// the tag moderated a review or excluded a reviewer.
+///
+/// The affected reviews are re-derived without the tag's marker before the
+/// marker is removed, so a failure leaves the marker in place and the retried
+/// tag deletion starts over.
+pub async fn release_moderation(
+    moderator_id: &PubkyId,
+    tag_id: &str,
+) -> Result<bool, EventProcessorError> {
+    let reviews = ModeratedReview::reviews_of_tag(moderator_id, tag_id).await?;
+    let reviewers = ExcludedReviewer::users_of_tag(moderator_id, tag_id).await?;
+    if reviews.is_empty() && reviewers.is_empty() {
+        return Ok(false);
+    }
+    let releasing = Some((moderator_id.as_ref(), tag_id));
+    for (reviewer_id, review_id) in &reviews {
+        info!("Moderation tag removed; releasing review {reviewer_id}/{review_id}");
+        refresh_moderation(reviewer_id, review_id, releasing).await?;
+    }
+    for reviewer_id in &reviewers {
+        info!("Moderation tag removed; counting the reviews of {reviewer_id} again");
+        refresh_reviewer_moderation(reviewer_id, releasing).await?;
+    }
+    ModeratedReview::delete(moderator_id, tag_id).await?;
+    ExcludedReviewer::delete(moderator_id, tag_id).await?;
+    Ok(true)
+}
+
+/// Re-derives the moderation of every review the user wrote, after a marker on
+/// the user was written or (with `releasing`) is being removed. Returns how
+/// many reviews changed.
+pub async fn refresh_reviewer_moderation(
+    reviewer_id: &str,
+    releasing: Option<(&str, &str)>,
+) -> Result<usize, EventProcessorError> {
+    let mut changed = 0;
+    for review_id in ReviewDetails::ids_of_reviewer(reviewer_id).await? {
+        if refresh_moderation(reviewer_id, &review_id, releasing).await? {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
+/// One-shot recompute: re-derives the moderation of every indexed review from
+/// the markers, so the reviews of users moderated before review moderation
+/// existed are hidden, and recomputes the aggregates that changed. Returns how
+/// many reviews changed. Idempotent.
+pub async fn recompute_all_review_moderation() -> Result<usize, EventProcessorError> {
+    let mut changed = 0;
+    for reviewer_id in ReviewDetails::reviewer_ids().await? {
+        changed += refresh_reviewer_moderation(&reviewer_id, None).await?;
+    }
+    Ok(changed)
+}
+
+/// Re-derives one review's moderation and, when it changed, its aggregates.
+/// Returns whether it changed.
+async fn refresh_moderation(
+    reviewer_id: &str,
+    review_id: &str,
+    releasing: Option<(&str, &str)>,
+) -> Result<bool, EventProcessorError> {
+    match ReviewDetails::refresh_moderation(reviewer_id, review_id, releasing).await? {
+        Some(details) => {
+            recompute_reputation(&details).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 /// Recomputes the subject-scoped aggregate and, for buyer reviews, the
