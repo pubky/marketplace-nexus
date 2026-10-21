@@ -48,7 +48,7 @@ pub async fn sync_put(
     details.superseded = prior.as_ref().is_some_and(|prior| prior.superseded);
     // Moderation lives in markers keyed by the moderator's tag, so a tag
     // replayed before the review, and every edit, keep the review moderated.
-    details.moderation = ReviewModeration::get(&user_id, &review_id, None).await?;
+    details.moderation = ReviewModeration::get(&user_id, &review_id).await?;
 
     // SAVE TO GRAPH: requires both the reviewer and the subject users
     let existed = match details.put_to_graph().await? {
@@ -63,7 +63,7 @@ pub async fn sync_put(
     // keeps its original position in the review sorted sets
     details.put_to_index(existed).await?;
     // A moderator tag handled while this review was being written.
-    if let Some(refreshed) = ReviewDetails::refresh_moderation(&user_id, &review_id, None).await? {
+    if let Some(refreshed) = ReviewDetails::refresh_moderation(&user_id, &review_id).await? {
         details = refreshed;
     }
 
@@ -119,7 +119,7 @@ pub async fn moderate(
         chrono::Utc::now().timestamp_millis(),
     )
     .await?;
-    refresh_moderation(&reviewer_id, &review_id, None).await?;
+    refresh_moderation(&reviewer_id, &review_id).await?;
     Ok(())
 }
 
@@ -144,16 +144,19 @@ pub async fn exclude_reviewer(
         chrono::Utc::now().timestamp_millis(),
     )
     .await?;
-    refresh_reviewer_moderation(&user_id, None).await?;
+    refresh_reviewer_moderation(&user_id).await?;
     Ok(())
 }
 
 /// Handles the moderator deleting one of its moderation tags. Returns whether
 /// the tag moderated a review or excluded a reviewer.
 ///
-/// The affected reviews are re-derived without the tag's marker before the
-/// marker is removed, so a failure leaves the marker in place and the retried
-/// tag deletion starts over.
+/// The tag's markers are first flagged as being released, which every
+/// derivation of a review's moderation skips, then the affected reviews are
+/// re-derived, then the markers are removed. A re-derivation running
+/// alongside (the one-shot recompute next to a live watcher) therefore never
+/// writes the released moderation back, and a failure leaves the markers in
+/// place so the retried tag deletion starts over.
 pub async fn release_moderation(
     moderator_id: &PubkyId,
     tag_id: &str,
@@ -163,14 +166,15 @@ pub async fn release_moderation(
     if reviews.is_empty() && reviewers.is_empty() {
         return Ok(false);
     }
-    let releasing = Some((moderator_id.as_ref(), tag_id));
+    ModeratedReview::mark_releasing(moderator_id, tag_id).await?;
+    ExcludedReviewer::mark_releasing(moderator_id, tag_id).await?;
     for (reviewer_id, review_id) in &reviews {
         info!("Moderation tag removed; releasing review {reviewer_id}/{review_id}");
-        refresh_moderation(reviewer_id, review_id, releasing).await?;
+        refresh_moderation(reviewer_id, review_id).await?;
     }
     for reviewer_id in &reviewers {
         info!("Moderation tag removed; counting the reviews of {reviewer_id} again");
-        refresh_reviewer_moderation(reviewer_id, releasing).await?;
+        refresh_reviewer_moderation(reviewer_id).await?;
     }
     ModeratedReview::delete(moderator_id, tag_id).await?;
     ExcludedReviewer::delete(moderator_id, tag_id).await?;
@@ -178,15 +182,12 @@ pub async fn release_moderation(
 }
 
 /// Re-derives the moderation of every review the user wrote, after a marker on
-/// the user was written or (with `releasing`) is being removed. Returns how
-/// many reviews changed.
-pub async fn refresh_reviewer_moderation(
-    reviewer_id: &str,
-    releasing: Option<(&str, &str)>,
-) -> Result<usize, EventProcessorError> {
+/// the user was written or flagged as being released. Returns how many
+/// reviews changed.
+pub async fn refresh_reviewer_moderation(reviewer_id: &str) -> Result<usize, EventProcessorError> {
     let mut changed = 0;
     for review_id in ReviewDetails::ids_of_reviewer(reviewer_id).await? {
-        if refresh_moderation(reviewer_id, &review_id, releasing).await? {
+        if refresh_moderation(reviewer_id, &review_id).await? {
             changed += 1;
         }
     }
@@ -200,7 +201,7 @@ pub async fn refresh_reviewer_moderation(
 pub async fn recompute_all_review_moderation() -> Result<usize, EventProcessorError> {
     let mut changed = 0;
     for reviewer_id in ReviewDetails::reviewer_ids().await? {
-        changed += refresh_reviewer_moderation(&reviewer_id, None).await?;
+        changed += refresh_reviewer_moderation(&reviewer_id).await?;
     }
     Ok(changed)
 }
@@ -210,9 +211,8 @@ pub async fn recompute_all_review_moderation() -> Result<usize, EventProcessorEr
 async fn refresh_moderation(
     reviewer_id: &str,
     review_id: &str,
-    releasing: Option<(&str, &str)>,
 ) -> Result<bool, EventProcessorError> {
-    match ReviewDetails::refresh_moderation(reviewer_id, review_id, releasing).await? {
+    match ReviewDetails::refresh_moderation(reviewer_id, review_id).await? {
         Some(details) => {
             recompute_reputation(&details).await?;
             Ok(true)

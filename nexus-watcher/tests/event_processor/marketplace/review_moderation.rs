@@ -590,6 +590,100 @@ async fn review_fraud_on_a_user_excludes_every_review_they_wrote_without_hiding_
     Ok(())
 }
 
+/// A release re-derives the reviews before it removes the marker. Another
+/// process re-deriving them in between (the one-shot recompute next to a live
+/// watcher) must not write the released moderation back: that write would
+/// outlive the marker.
+#[tokio_shared_rt::test(shared)]
+async fn a_rederivation_during_a_release_does_not_bring_the_moderation_back() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewReleaseRace").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(
+            &buyer_kp,
+            &seller_profile("Watcher:ReviewReleaseRace:Buyer"),
+        )
+        .await?;
+    let moderator_kp = moderator_keypair().await;
+    test.create_user(
+        &moderator_kp,
+        &seller_profile("Watcher:ReviewReleaseRace:Moderator"),
+    )
+    .await?;
+    let moderator_id = default_moderation_tests().id;
+
+    let text = "Reviewed while the moderator changes its mind.";
+    let review = buyer_review(&market, &buyer_id, 'b', 3, text);
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+
+    // Moderating the user deletes their profile, so that case comes last.
+    let cases = [
+        (
+            tag_on_user(&buyer_id, EXCLUDE_LABEL),
+            ReviewModerationState::Excluded,
+        ),
+        (
+            tag_on_review(&buyer_id, &review_id, EXCLUDE_LABEL),
+            ReviewModerationState::Excluded,
+        ),
+        (
+            tag_on_review(&buyer_id, &review_id, MODERATED_LABEL),
+            ReviewModerationState::TextHidden,
+        ),
+        (
+            tag_on_user(&buyer_id, MODERATED_LABEL),
+            ReviewModerationState::TextHidden,
+        ),
+    ];
+    for (tag, state) in cases {
+        test.put(&moderator_kp, &tag.hs_path(), &tag).await?;
+        assert_moderation(
+            &market,
+            &buyer_id,
+            &review_id,
+            moderation(state, &tag.label),
+            text,
+        )
+        .await;
+
+        // The release's steps up to the marker removal, with the other
+        // process's re-derivation forced right before that removal.
+        let tag_id = tag.create_id();
+        ModeratedReview::mark_releasing(&moderator_id, &tag_id).await?;
+        ExcludedReviewer::mark_releasing(&moderator_id, &tag_id).await?;
+        ModeratedUser::mark_releasing(&moderator_id, &tag_id).await?;
+        assert_eq!(
+            handlers::review::refresh_reviewer_moderation(&buyer_id).await?,
+            1
+        );
+        assert_eq!(
+            handlers::review::refresh_reviewer_moderation(&buyer_id).await?,
+            0,
+            "a re-derivation during the release keeps the review released"
+        );
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        assert_counted(&market, 1, 3.0).await;
+
+        // The release itself finishes with nothing to bring back.
+        test.del(&moderator_kp, &tag.hs_path()).await?;
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        assert_counted(&market, 1, 3.0).await;
+        assert!(ModeratedReview::reviews_of_tag(&moderator_id, &tag_id)
+            .await?
+            .is_empty());
+        assert!(ExcludedReviewer::users_of_tag(&moderator_id, &tag_id)
+            .await?
+            .is_empty());
+        assert!(!ModeratedUser::is_moderated(&buyer_id).await?);
+    }
+
+    test.del(&buyer_kp, &review_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
 #[tokio_shared_rt::test(shared)]
 async fn review_tags_that_are_not_the_moderators_moderate_nothing() -> Result<()> {
     let mut test = WatcherTest::setup().await?;

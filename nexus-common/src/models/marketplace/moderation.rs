@@ -160,6 +160,17 @@ impl ModeratedUser {
         Ok(users)
     }
 
+    /// Flags the marker of one moderator tag record as being released: review
+    /// moderation stops applying it, the shop and listings stay hidden until
+    /// [`Self::delete`].
+    pub async fn mark_releasing(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::put::mark_moderated_user_releasing(
+            moderator_id,
+            tag_id,
+        ))
+        .await
+    }
+
     /// Removes the marker written by one moderator tag record.
     pub async fn delete(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
         exec_single_row(queries::del::delete_moderated_user(moderator_id, tag_id)).await
@@ -222,6 +233,16 @@ impl ModeratedReview {
         Ok(reviews)
     }
 
+    /// Flags the marker of one moderator tag record as being released: review
+    /// moderation stops applying it.
+    pub async fn mark_releasing(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::put::mark_moderated_review_releasing(
+            moderator_id,
+            tag_id,
+        ))
+        .await
+    }
+
     /// Removes the marker written by one moderator tag record.
     pub async fn delete(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
         exec_single_row(queries::del::delete_moderated_review(moderator_id, tag_id)).await
@@ -272,6 +293,16 @@ impl ExcludedReviewer {
         Ok(users)
     }
 
+    /// Flags the marker of one moderator tag record as being released: review
+    /// moderation stops applying it.
+    pub async fn mark_releasing(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::put::mark_excluded_reviewer_releasing(
+            moderator_id,
+            tag_id,
+        ))
+        .await
+    }
+
     /// Removes the marker written by one moderator tag record.
     pub async fn delete(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
         exec_single_row(queries::del::delete_excluded_reviewer(moderator_id, tag_id)).await
@@ -320,21 +351,11 @@ impl ReviewModeration {
     /// moderation marker hiding its reviewer (which hides the text, ratings
     /// kept). Exclusion wins over hidden text; among markers of one state the
     /// lowest tag id gives the reason, so a replay picks the same one.
-    /// `releasing` is a moderator tag `(moderator_id, tag_id)` being removed,
-    /// whose markers are left out.
-    pub async fn get(
-        reviewer_id: &str,
-        review_id: &str,
-        releasing: Option<(&str, &str)>,
-    ) -> GraphResult<Option<Self>> {
-        let (moderator_id, tag_id) = releasing.unwrap_or_default();
-        let row = fetch_row_from_graph(queries::get::review_moderation(
-            reviewer_id,
-            review_id,
-            moderator_id,
-            tag_id,
-        ))
-        .await?;
+    /// Markers flagged as being released are left out, in every process, from
+    /// the moment the release starts.
+    pub async fn get(reviewer_id: &str, review_id: &str) -> GraphResult<Option<Self>> {
+        let row =
+            fetch_row_from_graph(queries::get::review_moderation(reviewer_id, review_id)).await?;
         let Some(row) = row else {
             return Ok(None);
         };

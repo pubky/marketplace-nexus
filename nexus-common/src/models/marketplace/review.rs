@@ -324,16 +324,15 @@ impl ReviewDetails {
     /// [`ReviewModeration::get`]) and stores it on the edge and the details
     /// JSON. Returns the updated details when the moderation changed, `None`
     /// when it did not or the review is not indexed (its ingest reads the
-    /// markers). `releasing` is a moderator tag being removed.
+    /// markers).
     pub async fn refresh_moderation(
         reviewer_id: &str,
         review_id: &str,
-        releasing: Option<(&str, &str)>,
     ) -> ModelResult<Option<Self>> {
         let Some(mut details) = Self::get_from_index(reviewer_id, review_id).await? else {
             return Ok(None);
         };
-        let moderation = ReviewModeration::get(reviewer_id, review_id, releasing).await?;
+        let moderation = ReviewModeration::get(reviewer_id, review_id).await?;
         if details.moderation == moderation {
             return Ok(None);
         }

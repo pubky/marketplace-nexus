@@ -1038,36 +1038,29 @@ pub fn excluded_reviewers_of_tag(moderator_id: &str, tag_id: &str) -> Query {
 /// The moderation that applies to one review (`state`, `reason`), or no row.
 /// Markers on the review, review-exclusion markers on its reviewer and
 /// moderation markers hiding its reviewer all apply; `excluded` wins over
-/// `text_hidden`, then the lowest tag id. The markers of the tag record
-/// `(releasing_moderator_id, releasing_tag_id)` are left out.
-pub fn review_moderation(
-    reviewer_id: &str,
-    review_id: &str,
-    releasing_moderator_id: &str,
-    releasing_tag_id: &str,
-) -> Query {
+/// `text_hidden`, then the lowest tag id. Markers whose tag is being released
+/// (`releasing`) are left out.
+pub fn review_moderation(reviewer_id: &str, review_id: &str) -> Query {
     Query::new(
         "review_moderation",
         "CALL () {
             MATCH (m:ModeratedReview {reviewer_id: $reviewer_id, review_id: $review_id})
-            RETURN m.state AS state, m.label AS reason, m.moderator_id AS moderator_id, m.tag_id AS tag_id
+            RETURN m.state AS state, m.label AS reason, m.tag_id AS tag_id, m.releasing AS releasing
             UNION ALL
             MATCH (m:ExcludedReviewer {user_id: $reviewer_id})
-            RETURN 'excluded' AS state, m.label AS reason, m.moderator_id AS moderator_id, m.tag_id AS tag_id
+            RETURN 'excluded' AS state, m.label AS reason, m.tag_id AS tag_id, m.releasing AS releasing
             UNION ALL
             MATCH (m:ModeratedUser {user_id: $reviewer_id})
-            RETURN 'text_hidden' AS state, m.label AS reason, m.moderator_id AS moderator_id, m.tag_id AS tag_id
+            RETURN 'text_hidden' AS state, m.label AS reason, m.tag_id AS tag_id, m.releasing AS releasing
          }
-         WITH state, reason, moderator_id, tag_id
-         WHERE NOT (moderator_id = $releasing_moderator_id AND tag_id = $releasing_tag_id)
+         WITH state, reason, tag_id, releasing
+         WHERE releasing IS NULL
          RETURN state, reason
          ORDER BY CASE state WHEN 'excluded' THEN 0 ELSE 1 END, tag_id, reason
          LIMIT 1",
     )
     .param("reviewer_id", reviewer_id)
     .param("review_id", review_id)
-    .param("releasing_moderator_id", releasing_moderator_id)
-    .param("releasing_tag_id", releasing_tag_id)
 }
 
 /// The ids of every user who has a review in the graph.
