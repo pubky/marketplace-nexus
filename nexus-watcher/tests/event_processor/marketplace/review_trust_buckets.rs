@@ -25,15 +25,15 @@ fn other_attestor_key() -> SigningKey {
     SigningKey::from_bytes(&[43u8; 32])
 }
 
-struct Market {
-    seller_kp: Keypair,
-    seller_id: String,
+pub(super) struct Market {
+    pub(super) seller_kp: Keypair,
+    pub(super) seller_id: String,
     listing: PubkyAppListing,
-    listing_id: String,
+    pub(super) listing_id: String,
     listing_path: ResourcePath,
 }
 
-async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
+pub(super) async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
     let seller_kp = Keypair::random();
     let seller_id = test
         .create_user(&seller_kp, &seller_profile(&format!("{name}:Seller")))
@@ -59,7 +59,7 @@ async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
     })
 }
 
-async fn buyer(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
+pub(super) async fn buyer(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> {
     let keypair = Keypair::random();
     let id = test.create_user(&keypair, &seller_profile(name)).await?;
     Ok((keypair, id))
@@ -68,7 +68,7 @@ async fn buyer(test: &mut WatcherTest, name: &str) -> Result<(Keypair, String)> 
 /// An order-scoped buyer review of the market's listing, attested by
 /// `attestor` for order number `order` at `iat` with `price_decade`.
 #[derive(Clone)]
-struct Order<'a> {
+pub(super) struct Order<'a> {
     attestor: &'a SigningKey,
     order: u64,
     iat: i64,
@@ -79,7 +79,7 @@ struct Order<'a> {
 }
 
 impl<'a> Order<'a> {
-    fn new(attestor: &'a SigningKey, order: u64, iat: i64, overall: i64) -> Self {
+    pub(super) fn new(attestor: &'a SigningKey, order: u64, iat: i64, overall: i64) -> Self {
         Order {
             attestor,
             order,
@@ -102,7 +102,7 @@ impl<'a> Order<'a> {
         self
     }
 
-    fn review(&self, market: &Market, buyer_id: &str) -> PubkyAppMarketplaceReview {
+    pub(super) fn review(&self, market: &Market, buyer_id: &str) -> PubkyAppMarketplaceReview {
         let mut claims = test_attestation_claims(
             &attestor_pubky(self.attestor),
             buyer_id,

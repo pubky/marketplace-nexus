@@ -1,4 +1,5 @@
 mod drops;
+mod review_filters;
 mod reviews;
 
 use crate::utils::{get_request, invalid_get_request};

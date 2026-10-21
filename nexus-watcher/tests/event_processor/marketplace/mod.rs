@@ -4,6 +4,7 @@ mod homeserver_binding;
 mod listing;
 mod moderation;
 mod review;
+mod review_filters;
 mod review_moderation;
 mod review_per_item;
 mod review_trust_buckets;
