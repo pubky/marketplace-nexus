@@ -38,8 +38,9 @@ pub struct ReputationSnippet {
 /// `attestors=` parameter, a scope's reviews inside the given attestor
 /// windows.
 ///
-/// A counted review verified, is not superseded by its order-scoped twin and
-/// is not excluded by moderation. Every figure is a sum or a count, so a
+/// A counted review is verified with an attestation `iat`, is not superseded
+/// by its order-scoped twin and is not excluded by moderation; unverified
+/// reviews are never counted. Every figure is a sum or a count, so a
 /// client can add the buckets of several trusted attestors.
 /// - rating = `sum_buyer_means / buyers`: the mean over buyers of each
 ///   buyer's mean `overall`.
