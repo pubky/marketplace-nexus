@@ -959,8 +959,10 @@ fn is_edited_late(created_at: &str, updated_at: &str) -> bool {
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+    use std::sync::LazyLock;
 
-    const ATTESTOR: &str = "8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty";
+    static ATTESTOR: LazyLock<String> =
+        LazyLock::new(|| pubky::Keypair::random().public_key().to_z32());
 
     fn params<'a>() -> ReviewStreamParams<'a> {
         ReviewStreamParams::default()
@@ -983,7 +985,7 @@ mod filter_tests {
             indexed_at,
             rating_overall: rating,
             price_weight: weight,
-            attestor_id: order.map(|_| ATTESTOR.to_string()),
+            attestor_id: order.map(|_| ATTESTOR.clone()),
             order_ref: order.map(str::to_string),
             iat,
             counted,
@@ -1012,7 +1014,7 @@ mod filter_tests {
 
     #[test]
     fn parameters_validate() {
-        let viewer = Some(ATTESTOR);
+        let viewer = Some(ATTESTOR.as_str());
         let filter = ReviewStreamFilter::parse(ReviewStreamParams {
             viewer_id: viewer,
             reach: Some(ReviewReach::Wot),
@@ -1115,7 +1117,9 @@ mod filter_tests {
     #[test]
     fn attestor_windows_keep_only_covered_reviews() {
         let filter = ReviewStreamFilter {
-            attestors: Some(AttestorWindow::parse_list(&format!("{ATTESTOR}:400:2500")).unwrap()),
+            attestors: Some(
+                AttestorWindow::parse_list(&format!("{}:400:2500", *ATTESTOR)).unwrap(),
+            ),
             ..Default::default()
         };
         let (page, matched) = filter.apply(rows(), None, None);
@@ -1131,7 +1135,7 @@ mod filter_tests {
         );
 
         let nothing = ReviewStreamFilter {
-            attestors: Some(AttestorWindow::parse_list(&format!("{ATTESTOR}:9000:")).unwrap()),
+            attestors: Some(AttestorWindow::parse_list(&format!("{}:9000:", *ATTESTOR)).unwrap()),
             ..Default::default()
         };
         let (page, matched) = nothing.apply(rows(), None, None);
