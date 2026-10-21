@@ -509,12 +509,27 @@ pub async fn ingest_review_from_homeserver(
     review_id: &str,
 ) -> Result<bool, EventProcessorError> {
     let reviewer = PubkyId::try_from(user_id).map_err(EventProcessorError::generic)?;
+    match fetch_review_record(user_id, review_id).await? {
+        Some(review) => {
+            sync_put(review, reviewer, review_id.to_string()).await?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Reads one review record from the reviewer's homeserver; `None` when the
+/// record no longer exists there.
+async fn fetch_review_record(
+    user_id: &str,
+    review_id: &str,
+) -> Result<Option<PubkyAppMarketplaceReview>, EventProcessorError> {
     let uri = marketplace_review_uri_builder(user_id.to_string(), review_id.to_string());
 
     let pubky = PubkyConnector::get()?;
     let response = match pubky.public_storage().get(&uri).await {
         Ok(response) => response,
-        Err(e) if is_homeserver_not_found(&e) => return Ok(false),
+        Err(e) if is_homeserver_not_found(&e) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let blob = response
@@ -526,12 +541,77 @@ pub async fn ingest_review_from_homeserver(
     let pubky_object =
         PubkyAppObject::from_resource(&resource, &blob).map_err(EventProcessorError::generic)?;
     match pubky_object {
-        PubkyAppObject::MarketplaceReview(review) => {
-            sync_put(review, reviewer, review_id.to_string()).await?;
-            Ok(true)
-        }
+        PubkyAppObject::MarketplaceReview(review) => Ok(Some(review)),
         _ => Err(EventProcessorError::generic(format!(
             "Expected a marketplace review record at {uri}"
         ))),
     }
+}
+
+/// Outcome tally of the one-shot trust-bucket backfill.
+#[derive(Debug, Default)]
+pub struct TrustBucketBackfill {
+    /// Verified reviews re-read from their homeserver, now carrying their
+    /// attestation's `iat` and price weight.
+    pub refetched: usize,
+    /// Reviews whose record left the homeserver; they stay out of the trust
+    /// buckets until their deletion is indexed.
+    pub gone: usize,
+    /// Reviews whose homeserver could not be reached; they stay out of the
+    /// trust buckets until their next edit.
+    pub unreachable: usize,
+    /// Reviews that were read but could not be ingested.
+    pub failed: usize,
+    /// Subject and listing aggregates recomputed.
+    pub aggregates: usize,
+}
+
+/// One-shot backfill for the trust buckets. Verified reviews indexed before
+/// the index kept their attestation's `iat` and price weight are re-read from
+/// the reviewer's homeserver and run through the normal ingest (the index
+/// never stored the attestation, so it cannot derive them offline). Every
+/// subject and listing aggregate is then recomputed, so each carries its
+/// buckets and unverified count. Idempotent: a re-run re-reads only reviews
+/// still without `iat`.
+pub async fn backfill_trust_buckets() -> Result<TrustBucketBackfill, EventProcessorError> {
+    let mut summary = TrustBucketBackfill::default();
+    for (reviewer_id, review_id) in ReviewDetails::without_attestation_time().await? {
+        let reviewer =
+            PubkyId::try_from(reviewer_id.as_str()).map_err(EventProcessorError::generic)?;
+        match fetch_review_record(&reviewer_id, &review_id).await {
+            Ok(Some(review)) => match sync_put(review, reviewer, review_id.clone()).await {
+                Ok(()) => summary.refetched += 1,
+                Err(e) => {
+                    warn!(
+                        "Trust-bucket backfill could not ingest {}/{}: {:?}",
+                        reviewer_id, review_id, e
+                    );
+                    summary.failed += 1;
+                }
+            },
+            Ok(None) => {
+                debug!(
+                    "Review {}/{} left the homeserver; it stays unbucketed",
+                    reviewer_id, review_id
+                );
+                summary.gone += 1;
+            }
+            Err(e) => {
+                warn!(
+                    "Review {}/{} is unreachable; it stays unbucketed until its next edit: {:?}",
+                    reviewer_id, review_id, e
+                );
+                summary.unreachable += 1;
+            }
+        }
+    }
+    let (subjects, listings) = ReviewDetails::aggregate_scopes().await?;
+    for (subject_id, role) in &subjects {
+        ReputationSummary::recompute_subject(subject_id, *role).await?;
+    }
+    for (listing_owner_id, listing_id) in &listings {
+        ReputationSummary::recompute_listing(listing_owner_id, listing_id).await?;
+    }
+    summary.aggregates = subjects.len() + listings.len();
+    Ok(summary)
 }

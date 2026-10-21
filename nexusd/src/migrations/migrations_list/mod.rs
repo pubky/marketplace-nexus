@@ -5,4 +5,5 @@ pub mod remove_muted_1771718400;
 pub mod review_backfill_1787905961;
 pub mod review_moderation_recompute_1792579958;
 pub mod review_per_item_recompute_1792584000;
+pub mod review_trust_buckets_backfill_1792587206;
 pub mod users_by_pk_reindex_1751635096;
