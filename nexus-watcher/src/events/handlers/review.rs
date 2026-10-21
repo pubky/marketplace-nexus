@@ -236,8 +236,8 @@ pub async fn recompute_per_item_counting() -> Result<PerItemRecompute, EventProc
         }
     }
     ReviewDetails::flag_unkeyed_seller_fields().await?;
-    for (attestor_id, order_ref, role) in ReviewDetails::order_keys().await? {
-        ReviewDetails::resolve_seller_fields(&attestor_id, &order_ref, role).await?;
+    for (reviewer_id, attestor_id, order_ref, role) in ReviewDetails::order_keys().await? {
+        ReviewDetails::resolve_seller_fields(&reviewer_id, &attestor_id, &order_ref, role).await?;
         summary.orders += 1;
     }
     let (subjects, listings) = ReviewDetails::aggregate_scopes().await?;
@@ -277,13 +277,13 @@ async fn settle_seller_fields(
     prior: Option<&ReviewDetails>,
 ) -> Result<(), EventProcessorError> {
     let key = details.order_key();
-    if let Some((attestor_id, order_ref, role)) = key {
-        ReviewDetails::resolve_seller_fields(attestor_id, order_ref, role).await?;
+    if let Some((reviewer_id, attestor_id, order_ref, role)) = key {
+        ReviewDetails::resolve_seller_fields(reviewer_id, attestor_id, order_ref, role).await?;
     }
     if let Some(prior_key) = prior.and_then(ReviewDetails::order_key) {
         if Some(prior_key) != key {
-            let (attestor_id, order_ref, role) = prior_key;
-            ReviewDetails::resolve_seller_fields(attestor_id, order_ref, role).await?;
+            let (reviewer_id, attestor_id, order_ref, role) = prior_key;
+            ReviewDetails::resolve_seller_fields(reviewer_id, attestor_id, order_ref, role).await?;
         }
     }
     Ok(())

@@ -388,8 +388,35 @@ async fn copies_updated_at_the_same_time_count_the_lowest_review_id() -> Result<
     };
     assert_seller_fields(&market.seller_id, 2, shipping, communication).await;
 
+    // Another buyer attested under the same orderRef, with a later copy,
+    // rates the seller once more and leaves the first buyer's copy counted.
+    let other_kp = Keypair::random();
+    let other_id = test
+        .create_user(&other_kp, &seller_profile("Watcher:ReviewSellerTie:Other"))
+        .await?;
+    let other = rated_item(
+        &market,
+        &other_id,
+        &market.listing_a,
+        'f',
+        5,
+        3,
+        4,
+        "2026-08-20T13:00:00Z",
+    );
+    let (_other_id, other_path) = test.create_review(&other_kp, &other).await?;
+    assert_seller_fields(
+        &market.seller_id,
+        3,
+        (shipping + 3.0) / 2.0,
+        (communication + 4.0) / 2.0,
+    )
+    .await;
+
+    test.del(&other_kp, &other_path).await?;
     test.del(&buyer_kp, &item_a_path).await?;
     test.del(&buyer_kp, &item_b_path).await?;
+    test.cleanup_user(&other_kp).await?;
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
     Ok(())

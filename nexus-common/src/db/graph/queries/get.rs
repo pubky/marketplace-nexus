@@ -1070,14 +1070,15 @@ pub fn review_moderation(
     .param("releasing_tag_id", releasing_tag_id)
 }
 
-/// The distinct attested orders `(attestor_id, order_ref, role)` of the
-/// verified review edges.
+/// The distinct reviewer orders `(reviewer_id, attestor_id, order_ref, role)`
+/// of the verified review edges.
 pub fn review_order_keys() -> Query {
     Query::new(
         "review_order_keys",
-        "MATCH (:User)-[r:REVIEWED]->(:User)
+        "MATCH (reviewer:User)-[r:REVIEWED]->(:User)
          WHERE r.verified AND r.attestor_id IS NOT NULL AND r.order_ref IS NOT NULL
-         RETURN DISTINCT r.attestor_id AS attestor_id, r.order_ref AS order_ref, r.role AS role",
+         RETURN DISTINCT reviewer.id AS reviewer_id, r.attestor_id AS attestor_id,
+             r.order_ref AS order_ref, r.role AS role",
     )
 }
 
@@ -1680,7 +1681,8 @@ fn reputation_return(seller_fields: &str) -> String {
 }
 
 /// A seller's shipping and communication ratings are written on every item
-/// review of an order and count once per `(iss, order_ref, role)`: only on
+/// review of an order and count once per `(iss, order_ref, role)` and
+/// reviewer: only on
 /// the copy flagged `seller_fields_counted` (see
 /// [`crate::db::graph::queries::put::resolve_seller_fields`]). An edge
 /// without the flag counts its own.

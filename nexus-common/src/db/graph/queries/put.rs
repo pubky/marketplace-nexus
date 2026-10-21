@@ -774,14 +774,20 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
 
 /// Settles which copy of an order's seller fields counts. Every item review
 /// of an order carries the seller rating (shipping, communication); among the
-/// verified edges of one `(attestor_id, order_ref, role)` the one that counts
+/// reviewer's verified edges of one `(attestor_id, order_ref, role)` (the
+/// seller rating is one per order and buyer) the one that counts
 /// in the aggregates (not superseded, not excluded) with the latest
 /// `updated_at`, ties to the lowest review id, is flagged
 /// `seller_fields_counted` and every other copy is cleared.
-pub fn resolve_seller_fields(attestor_id: &str, order_ref: &str, role: &str) -> Query {
+pub fn resolve_seller_fields(
+    reviewer_id: &str,
+    attestor_id: &str,
+    order_ref: &str,
+    role: &str,
+) -> Query {
     Query::new(
         "resolve_seller_fields",
-        "MATCH (:User)-[r:REVIEWED]->(:User)
+        "MATCH (:User {id: $reviewer_id})-[r:REVIEWED]->(:User)
          WHERE r.order_ref = $order_ref AND r.attestor_id = $attestor_id
              AND r.role = $role AND r.verified
          WITH r, (coalesce(r.superseded, false) = false
@@ -792,6 +798,7 @@ pub fn resolve_seller_fields(attestor_id: &str, order_ref: &str, role: &str) -> 
          WITH copies[position] AS copy, position = 0 AND counted[0] AS flag
          SET copy.seller_fields_counted = flag",
     )
+    .param("reviewer_id", reviewer_id)
     .param("attestor_id", attestor_id)
     .param("order_ref", order_ref)
     .param("role", role)
