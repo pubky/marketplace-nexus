@@ -643,9 +643,19 @@ impl ReviewStream {
                 order_ref: row.get("order_ref")?,
                 iat: row.get("iat")?,
                 counted: row.get("counted")?,
+                seller_fields_counted: row.get("seller_fields_counted")?,
+                rating_shipping: row.get("rating_shipping")?,
+                rating_communication: row.get("rating_communication")?,
             });
         }
-        let (page, matched) = filter.apply(rows, pagination.skip, pagination.limit);
+        let seller_score = matches!(
+            scope,
+            ReviewStreamScope::Subject {
+                role: PubkyAppReviewRole::BuyerReviewingSeller,
+                ..
+            }
+        );
+        let (page, matched) = filter.apply(rows, pagination.skip, pagination.limit, seller_score);
         let reviews = Self::hydrate(&page).await?;
         Ok(FilteredReviewStream { reviews, matched })
     }
@@ -815,12 +825,13 @@ impl ReviewStreamFilter {
 
     /// Keeps the rows the attestor windows cover, sorts them, and returns the
     /// `(reviewer_id, review_id)` keys of the page with the figures of the
-    /// counted matches.
+    /// counted matches. `seller_score` adds the RV2 seller figures.
     fn apply(
         &self,
         rows: Vec<FilteredReviewRow>,
         skip: Option<usize>,
         limit: Option<usize>,
+        seller_score: bool,
     ) -> (Vec<(String, String)>, ReviewMatch) {
         let mut rows: Vec<FilteredReviewRow> = match &self.attestors {
             None => rows,
@@ -836,7 +847,7 @@ impl ReviewStreamFilter {
         };
 
         let counted: Vec<CountedReview> = rows.iter().filter_map(|row| row.counted()).collect();
-        let matched = ReviewMatch::from_bucket(&ReputationBucket::compute(&counted, false));
+        let matched = ReviewMatch::from_bucket(&ReputationBucket::compute(&counted, seller_score));
 
         rows.sort_by(|a, b| self.sort.compare(a, b));
         let page = rows
@@ -878,6 +889,10 @@ struct FilteredReviewRow {
     iat: Option<i64>,
     /// Verified with an `iat`, and not excluded by moderation.
     counted: bool,
+    /// Whether this review carries its order's counted seller rating.
+    seller_fields_counted: bool,
+    rating_shipping: Option<i64>,
+    rating_communication: Option<i64>,
 }
 
 impl FilteredReviewRow {
@@ -897,9 +912,9 @@ impl FilteredReviewRow {
                 .and_then(|weight| u8::try_from(weight).ok())
                 .unwrap_or(1),
             iat,
-            seller_fields_counted: false,
-            rating_shipping: None,
-            rating_communication: None,
+            seller_fields_counted: self.seller_fields_counted,
+            rating_shipping: self.rating_shipping,
+            rating_communication: self.rating_communication,
         })
     }
 }
@@ -909,19 +924,50 @@ impl FilteredReviewRow {
 /// `(attestor, order_ref)`, and the mean over buyers of each buyer's mean
 /// `ratings.overall` (`null` when nothing counts). Unverified and excluded
 /// reviews are listed but never counted.
+///
+/// On the seller scope (the `buyer_reviewing_seller` subject stream) it also
+/// carries the RV2 seller rating, as [`ReputationBucket`]'s seller figures:
+/// `seller_buyers` buyers with an order carrying shipping or communication,
+/// and `seller_avg`, the mean over them of their mean order score
+/// ((shipping + communication) / 2, or the one present), `null` when no
+/// buyer has one. Both keys are absent on other scopes.
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq)]
 pub struct ReviewMatch {
     pub buyers: u64,
     pub orders: u64,
     pub avg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller_buyers: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_option"
+    )]
+    #[schema(value_type = Option<f64>)]
+    pub seller_avg: Option<Option<f64>>,
+}
+
+/// Reads a present key, `null` included, as `Some`: an absent key stays
+/// `None` through `#[serde(default)]`.
+fn present_option<'de, D>(deserializer: D) -> Result<Option<Option<f64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<f64>::deserialize(deserializer).map(Some)
 }
 
 impl ReviewMatch {
     fn from_bucket(bucket: &ReputationBucket) -> Self {
+        let seller_avg = match (bucket.seller_buyers, bucket.sum_seller_buyer_means) {
+            (Some(buyers), Some(sum)) => Some((buyers > 0).then(|| sum / buyers as f64)),
+            _ => None,
+        };
         ReviewMatch {
             buyers: bucket.buyers,
             orders: bucket.orders,
             avg: (bucket.buyers > 0).then(|| bucket.sum_buyer_means / bucket.buyers as f64),
+            seller_buyers: bucket.seller_buyers,
+            seller_avg,
         }
     }
 }
@@ -989,6 +1035,9 @@ mod filter_tests {
             order_ref: order.map(str::to_string),
             iat,
             counted,
+            seller_fields_counted: true,
+            rating_shipping: None,
+            rating_communication: None,
         }
     }
 
@@ -1089,7 +1138,7 @@ mod filter_tests {
                 sort,
                 ..Default::default()
             };
-            let (page, _) = filter.apply(rows(), None, None);
+            let (page, _) = filter.apply(rows(), None, None, false);
             ids(&page).join(",")
         };
         assert_eq!(order(ReviewSort::Newest), "r4,r2,r3,r1,r5");
@@ -1101,7 +1150,7 @@ mod filter_tests {
     #[test]
     fn matched_counts_every_counted_match_and_pages_do_not_change_it() {
         let filter = ReviewStreamFilter::default();
-        let (page, matched) = filter.apply(rows(), Some(1), Some(2));
+        let (page, matched) = filter.apply(rows(), Some(1), Some(2), false);
         assert_eq!(ids(&page), ["r2", "r3"]);
         // b1: (5 + 3) / 2, b2: 1; the unverified and excluded rows don't count.
         assert_eq!(
@@ -1109,7 +1158,9 @@ mod filter_tests {
             ReviewMatch {
                 buyers: 2,
                 orders: 3,
-                avg: Some((4.0 + 1.0) / 2.0)
+                avg: Some((4.0 + 1.0) / 2.0),
+                seller_buyers: None,
+                seller_avg: None
             }
         );
     }
@@ -1122,7 +1173,7 @@ mod filter_tests {
             ),
             ..Default::default()
         };
-        let (page, matched) = filter.apply(rows(), None, None);
+        let (page, matched) = filter.apply(rows(), None, None, false);
         // r5 is covered and listed, but excluded from the counts.
         assert_eq!(ids(&page), ["r3", "r1", "r5"]);
         assert_eq!(
@@ -1130,7 +1181,9 @@ mod filter_tests {
             ReviewMatch {
                 buyers: 2,
                 orders: 2,
-                avg: Some(3.0)
+                avg: Some(3.0),
+                seller_buyers: None,
+                seller_avg: None
             }
         );
 
@@ -1138,15 +1191,61 @@ mod filter_tests {
             attestors: Some(AttestorWindow::parse_list(&format!("{}:9000:", *ATTESTOR)).unwrap()),
             ..Default::default()
         };
-        let (page, matched) = nothing.apply(rows(), None, None);
+        let (page, matched) = nothing.apply(rows(), None, None, false);
         assert!(page.is_empty());
         assert_eq!(
             matched,
             ReviewMatch {
                 buyers: 0,
                 orders: 0,
-                avg: None
+                avg: None,
+                seller_buyers: None,
+                seller_avg: None
             }
+        );
+    }
+
+    #[test]
+    fn the_seller_scope_adds_the_rv2_seller_score() {
+        let mut rows = rows();
+        // b1 rated shipping 4 on one order and both (5, 2) on the other;
+        // b2 rated communication 2 only; b4's copy is excluded.
+        rows[0].rating_shipping = Some(4);
+        rows[1].rating_shipping = Some(5);
+        rows[1].rating_communication = Some(2);
+        rows[2].rating_communication = Some(2);
+        rows[4].rating_shipping = Some(1);
+        let (_, matched) = ReviewStreamFilter::default().apply(rows.clone(), None, None, true);
+        assert_eq!(matched.seller_buyers, Some(2));
+        assert_eq!(
+            matched.seller_avg,
+            Some(Some(((4.0 + 3.5) / 2.0 + 2.0) / 2.0))
+        );
+        let json = serde_json::to_value(&matched).unwrap();
+        assert_eq!(json["seller_buyers"], 2);
+
+        // A copy not flagged as its order's seller rating does not count.
+        rows[2].seller_fields_counted = false;
+        let (_, matched) = ReviewStreamFilter::default().apply(rows.clone(), None, None, true);
+        assert_eq!(matched.seller_buyers, Some(1));
+
+        // Legacy reviews without seller fields: the keys stay, avg is null.
+        let (_, legacy) = ReviewStreamFilter::default().apply(self::rows(), None, None, true);
+        assert_eq!(
+            (legacy.seller_buyers, legacy.seller_avg),
+            (Some(0), Some(None))
+        );
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(json.get("seller_avg"), Some(&serde_json::Value::Null));
+        assert_eq!(serde_json::from_value::<ReviewMatch>(json).unwrap(), legacy);
+
+        // Other scopes leave both keys out.
+        let (_, listing) = ReviewStreamFilter::default().apply(rows, None, None, false);
+        let json = serde_json::to_value(&listing).unwrap();
+        assert!(json.get("seller_buyers").is_none() && json.get("seller_avg").is_none());
+        assert_eq!(
+            serde_json::from_value::<ReviewMatch>(json).unwrap(),
+            listing
         );
     }
 }

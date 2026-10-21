@@ -119,7 +119,10 @@ the response is `{"reviews": [<entry>…], "matched": {"buyers", "orders", "avg"
   reviews without one last; highest or lowest `ratings.overall` first. Ties go newest first.
 - `matched` counts every match, not only the page, by counting rules v2: distinct buyers, distinct attested
   orders, and `avg`, the mean over buyers of each buyer's mean `overall` (`null` when nothing counts).
-  Unverified and moderation-excluded reviews are listed but never counted.
+  Unverified and moderation-excluded reviews are listed but never counted. On the seller scope
+  (`buyer_reviewing_seller` reviews about a subject) it also carries the seller rating: `seller_buyers`,
+  the buyers with an order rating shipping or communication, and `seller_avg`, the mean over them of
+  their mean order score ((shipping + communication) / 2, or the one present), `null` when none has one.
 The index holds follows and tags between the users it indexes (its own homeserver's users on a
 homeserver-scoped deployment), so reach and tags see only those.
 400 on a malformed or inconsistent parameter."#,
@@ -242,7 +245,10 @@ the response is `{"reviews": [<entry>…], "matched": {"buyers", "orders", "avg"
   reviews without one last; highest or lowest `ratings.overall` first. Ties go newest first.
 - `matched` counts every match, not only the page, by counting rules v2: distinct buyers, distinct attested
   orders, and `avg`, the mean over buyers of each buyer's mean `overall` (`null` when nothing counts).
-  Unverified and moderation-excluded reviews are listed but never counted.
+  Unverified and moderation-excluded reviews are listed but never counted. On the seller scope
+  (`buyer_reviewing_seller` reviews about a subject) it also carries the seller rating: `seller_buyers`,
+  the buyers with an order rating shipping or communication, and `seller_avg`, the mean over them of
+  their mean order score ((shipping + communication) / 2, or the one present), `null` when none has one.
 The index holds follows and tags between the users it indexes (its own homeserver's users on a
 homeserver-scoped deployment), so reach and tags see only those.
 400 on a malformed or inconsistent parameter."#,

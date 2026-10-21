@@ -52,21 +52,23 @@ async fn seed_graph() -> Result<Graph> {
     let attestor = key();
     let other_tagger = key();
     let base = chrono::Utc::now().timestamp_millis();
-    // (name, overall, price weight, order index); indexed in this order.
-    let buyers: [(&'static str, i64, Option<u8>); 7] = [
-        ("friend", 5, Some(1)),
-        ("followed", 4, Some(3)),
-        ("two_hops", 3, Some(2)),
-        ("three_hops", 2, Some(5)),
-        ("tagged", 1, Some(4)),
-        ("viewer", 5, Some(2)),
-        ("unverified", 3, None),
+    // (name, overall, price weight, (shipping, communication)); indexed in
+    // this order. `three_hops` is a legacy review without seller fields.
+    type SellerFields = (Option<i64>, Option<i64>);
+    let buyers: [(&'static str, i64, Option<u8>, SellerFields); 7] = [
+        ("friend", 5, Some(1), (Some(5), Some(3))),
+        ("followed", 4, Some(3), (Some(4), None)),
+        ("two_hops", 3, Some(2), (None, Some(2))),
+        ("three_hops", 2, Some(5), (None, None)),
+        ("tagged", 1, Some(4), (Some(1), Some(1))),
+        ("viewer", 5, Some(2), (Some(5), Some(5))),
+        ("unverified", 3, None, (Some(3), Some(3))),
     ];
     let mut ids: HashMap<&'static str, String> = HashMap::new();
     for user in [&seller, &other_tagger] {
         seed_user(user).await?;
     }
-    for (i, (name, overall, weight)) in buyers.iter().enumerate() {
+    for (i, (name, overall, weight, (shipping, communication))) in buyers.iter().enumerate() {
         let id = if *name == "viewer" {
             viewer.clone()
         } else {
@@ -76,9 +78,20 @@ async fn seed_graph() -> Result<Graph> {
         let order_ref = format!("{:064x}", i + 1);
         let iat = 1_790_000_100 + 100 * i as i64;
         let attested = weight.map(|weight| (attestor.as_str(), order_ref.as_str(), iat, weight));
-        let details = review(&id, &seller, REVIEW_ID, *overall, attested, base + i as i64);
+        let mut details = review(&id, &seller, REVIEW_ID, *overall, attested, base + i as i64);
+        details.rating_shipping = *shipping;
+        details.rating_communication = *communication;
         details.put_to_graph().await?;
         details.put_to_index(false).await?;
+        if weight.is_some() {
+            ReviewDetails::resolve_seller_fields(
+                &id,
+                &attestor,
+                &order_ref,
+                PubkyAppReviewRole::BuyerReviewingSeller,
+            )
+            .await?;
+        }
         ids.insert(name, id);
     }
 
@@ -130,9 +143,22 @@ impl Graph {
         let shop = get_request(&shop).await?;
         let listing = get_request(&listing).await?;
         assert_eq!(self.reviewers(&shop), self.reviewers(&listing), "{query}");
-        assert_eq!(shop["matched"], listing["matched"], "{query}");
-        Ok((self.reviewers(&shop), shop["matched"].clone()))
+        assert_eq!(
+            item_figures(&shop["matched"]),
+            listing["matched"],
+            "{query}"
+        );
+        Ok((self.reviewers(&shop), item_figures(&shop["matched"])))
     }
+}
+
+/// `matched` without the storefront's seller score keys.
+fn item_figures(matched: &Value) -> Value {
+    serde_json::json!({
+        "buyers": matched["buyers"],
+        "orders": matched["orders"],
+        "avg": matched["avg"],
+    })
 }
 
 fn matched(buyers: u64, orders: u64, avg: Option<f64>) -> Value {
@@ -291,7 +317,7 @@ async fn test_each_sort_orders_the_stream() -> Result<()> {
     let shop = shop.replace("limit=30&", "");
     let page = get_request(&shop).await?;
     assert_eq!(graph.reviewers(&page), ["followed", "viewer"]);
-    assert_eq!(page["matched"], counted);
+    assert_eq!(item_figures(&page["matched"]), counted);
 
     // The price weight sort reads the served weights.
     let weights: Vec<Value> = get_request(&graph.routes("sort=value")[0]).await?["reviews"]
@@ -405,5 +431,85 @@ async fn test_inconsistent_filter_parameters_are_rejected() -> Result<()> {
             invalid_get_request(&route, StatusCode::BAD_REQUEST).await?;
         }
     }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_the_storefront_matched_carries_the_rv2_seller_score() -> Result<()> {
+    let graph = seed_graph().await?;
+    let attestor = &graph.attestor;
+    let shop_matched = async |query: &str| -> Result<Value> {
+        Ok(get_request(&graph.routes(query)[0]).await?["matched"].clone())
+    };
+
+    // Every buyer with a seller rating: friend (5 + 3) / 2, followed 4,
+    // two_hops 2, tagged 1, viewer 5; three_hops' legacy review has none,
+    // and the unverified review never counts.
+    let all = shop_matched("sort=newest").await?;
+    assert_eq!(all["seller_buyers"], 5);
+    assert_eq!(all["seller_avg"].as_f64(), Some(16.0 / 5.0));
+    let following = shop_matched(&format!("viewer_id={}&reach=following", graph.viewer)).await?;
+    assert_eq!(following["seller_buyers"], 2);
+    assert_eq!(following["seller_avg"].as_f64(), Some(4.0));
+
+    // The scoped seller figure of the same scope is the same score.
+    for attestors in [
+        attestor.to_string(),
+        format!("{attestor}:1790000200:1790000500"),
+        format!("{attestor}::1790000200,{attestor}:1790000400:"),
+    ] {
+        let matched = shop_matched(&format!("attestors={attestors}")).await?;
+        let reputation = get_request(&format!(
+            "/v0/shop/{}/reputation?attestors={attestors}",
+            graph.seller
+        ))
+        .await?;
+        let scoped = &reputation["scoped"];
+        let seller_buyers = scoped["seller_buyers"].as_u64().unwrap();
+        assert!(seller_buyers > 0, "{attestors}");
+        assert_eq!(matched["seller_buyers"], seller_buyers, "{attestors}");
+        assert_eq!(
+            matched["seller_avg"].as_f64(),
+            Some(scoped["sum_seller_buyer_means"].as_f64().unwrap() / seller_buyers as f64),
+            "{attestors}"
+        );
+    }
+
+    // The listing stream carries no seller score.
+    let listing = get_request(&graph.routes("sort=newest")[1]).await?;
+    assert!(listing["matched"].get("seller_buyers").is_none());
+    assert!(listing["matched"].get("seller_avg").is_none());
+
+    // A seller whose only reviews are legacy ones: no seller rating yet.
+    let seller = key();
+    let buyer = key();
+    seed_user(&seller).await?;
+    seed_user(&buyer).await?;
+    let order_ref = format!("{:064x}", 1);
+    let mut legacy = review(
+        &buyer,
+        &seller,
+        REVIEW_ID,
+        4,
+        Some((attestor, &order_ref, 1_790_000_100, 1)),
+        chrono::Utc::now().timestamp_millis(),
+    );
+    legacy.rating_shipping = None;
+    legacy.rating_communication = None;
+    legacy.put_to_graph().await?;
+    legacy.put_to_index(false).await?;
+    ReviewDetails::resolve_seller_fields(
+        &buyer,
+        attestor,
+        &order_ref,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+    )
+    .await?;
+    let matched =
+        get_request(&format!("/v0/shop/{seller}/reviews?sort=newest")).await?["matched"].clone();
+    assert_eq!(matched["buyers"], 1);
+    assert_eq!(matched["seller_buyers"], 0);
+    assert_eq!(matched.get("seller_avg"), Some(&Value::Null));
+
     Ok(())
 }

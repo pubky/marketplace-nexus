@@ -1811,7 +1811,8 @@ pub fn listing_counting_rows(listing_owner_id: &str, listing_id: &str) -> Query 
 /// superseded by its order-scoped twin, indexed within `[end, start]` (the
 /// stream's score bounds, either optional), by a reviewer the viewer filter
 /// keeps. `counted` marks the rows the counted figures may use (verified
-/// with an `iat`, not excluded by moderation, as [`review_counting_rows`]).
+/// with an `iat`, not excluded by moderation, as [`review_counting_rows`]),
+/// and `seller_fields_counted` the copy carrying its order's seller rating.
 ///
 /// The viewer filter follows pubky.app's post-stream reach: `following`,
 /// `friends` and `wot` (`FOLLOWS*1..depth`) leave out the viewer's own
@@ -1826,6 +1827,10 @@ pub fn filtered_review_rows(
 ) -> Query {
     use crate::models::marketplace::{ReviewReach, ReviewStreamScope};
 
+    let seller_fields = match scope {
+        ReviewStreamScope::Subject { .. } => SELLER_FIELDS_ONCE_PER_ORDER,
+        ReviewStreamScope::Listing { .. } => "true",
+    };
     let mut cypher = String::new();
     if reviewers.uses_viewer() {
         cypher.push_str("MATCH (viewer:User {id: $viewer_id})\n");
@@ -1875,7 +1880,10 @@ pub fn filtered_review_rows(
             r.order_ref AS order_ref, r.iat AS iat,
             (coalesce(r.verified, false) AND r.attestor_id IS NOT NULL
                 AND r.order_ref IS NOT NULL AND r.iat IS NOT NULL
-                AND {REPUTATION_NOT_EXCLUDED}) AS counted"
+                AND {REPUTATION_NOT_EXCLUDED}) AS counted,
+            {seller_fields} AS seller_fields_counted,
+            r.rating_shipping AS rating_shipping,
+            r.rating_communication AS rating_communication"
     ));
 
     let query = match scope {
