@@ -53,6 +53,9 @@ pub async fn sync_put(
     // keeps its original position in the review sorted sets
     details.put_to_index(existed).await?;
 
+    // ONE COUNT PER ATTESTED ORDER: a scoped record supersedes its legacy twin
+    details.resolve_order_twins().await?;
+
     // AGGREGATES: recompute the affected scopes from the graph
     recompute_reputation(&details).await?;
 
@@ -67,6 +70,7 @@ pub async fn del(user_id: PubkyId, review_id: String) -> Result<(), EventProcess
     };
 
     details.delete().await?;
+    details.restore_order_twins().await?;
     recompute_reputation(&details).await?;
 
     Ok(())

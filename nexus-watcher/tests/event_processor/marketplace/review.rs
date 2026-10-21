@@ -662,3 +662,188 @@ async fn test_each_attested_order_keeps_its_own_review() -> Result<()> {
     test.cleanup_user(&seller_kp).await?;
     Ok(())
 }
+
+/// One buyer, one listing, one attested order: the record shape published
+/// before per-order reviews (no `orderRef`) and the per-order one.
+async fn order_twin_fixture(
+    test: &mut WatcherTest,
+    name: &str,
+) -> Result<(
+    Keypair,
+    Keypair,
+    String,
+    String,
+    pubky_app_specs::PubkyAppMarketplaceReview,
+    pubky_app_specs::PubkyAppMarketplaceReview,
+)> {
+    let seller_kp = Keypair::random();
+    let seller_id = test
+        .create_user(&seller_kp, &test_user(&format!("Watcher:{name}:Seller")))
+        .await?;
+    let shop_path: pubky::ResourcePath = PubkyAppShop::create_path().parse()?;
+    test.put(&seller_kp, &shop_path, &test_shop(&seller_id))
+        .await?;
+    let listing = test_listing(
+        &seller_id,
+        "Bought once",
+        "electronics",
+        PubkyAppListingCondition::Excellent,
+        10_000,
+    );
+    let (listing_id, _listing_path) = test.create_listing(&seller_kp, &listing).await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &test_user(&format!("Watcher:{name}:Buyer")))
+        .await?;
+    let attestor = test_attestor_key();
+    let claims = test_attestation_claims(
+        &attestor_pubky(&attestor),
+        &buyer_id,
+        &seller_id,
+        &seller_id,
+        &listing_id,
+        '7',
+    );
+    let jws = sign_attestation(&claims, &attestor);
+    let legacy = test_review(
+        &buyer_id,
+        &seller_id,
+        &seller_id,
+        &listing_id,
+        5,
+        "Published before per-order reviews.",
+        &jws,
+    );
+    let mut scoped = test_review(
+        &buyer_id,
+        &seller_id,
+        &seller_id,
+        &listing_id,
+        1,
+        "Published per order.",
+        &jws,
+    );
+    scoped.order_ref = Some(claims.order_ref.clone());
+    Ok((seller_kp, buyer_kp, seller_id, listing_id, legacy, scoped))
+}
+
+/// Asserts the seller's and the listing's aggregates and streams hold
+/// exactly one review, the one with `review_id` and `rating`.
+async fn assert_counted_once(
+    seller_id: &str,
+    listing_id: &str,
+    review_id: &str,
+    rating: i64,
+) -> Result<()> {
+    let summary =
+        ReputationSummary::get_by_subject(seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await
+            .unwrap()
+            .expect("The subject reputation summary should exist");
+    assert_eq!(summary.count, 1, "One attested order counts once");
+    assert_eq!(summary.verified_count, 1);
+    assert_eq!(summary.avg, rating as f64);
+    let listing_summary = ReputationSummary::get_by_listing(seller_id, listing_id)
+        .await
+        .unwrap()
+        .expect("The listing reputation summary should exist");
+    assert_eq!(listing_summary.count, 1);
+    let subject_stream = ReviewStream::get_by_subject(
+        seller_id,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+        Pagination::default(),
+    )
+    .await
+    .unwrap()
+    .expect("The subject review stream should not be empty");
+    assert_eq!(subject_stream.0.len(), 1);
+    assert_eq!(subject_stream.0[0].review.review_id, review_id);
+    let listing_stream = ReviewStream::get_by_listing(seller_id, listing_id, Pagination::default())
+        .await
+        .unwrap()
+        .expect("The listing review stream should not be empty");
+    assert_eq!(listing_stream.0.len(), 1);
+    assert_eq!(listing_stream.0[0].review.review_id, review_id);
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_scoped_review_supersedes_its_legacy_twin() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, buyer_kp, seller_id, listing_id, legacy, scoped) =
+        order_twin_fixture(&mut test, "ReviewTwin:LegacyFirst").await?;
+
+    let (legacy_id, _legacy_path) = test.create_review(&buyer_kp, &legacy).await?;
+    let (scoped_id, scoped_path) = test.create_review(&buyer_kp, &scoped).await?;
+    assert_ne!(legacy_id, scoped_id);
+    assert_counted_once(&seller_id, &listing_id, &scoped_id, 1).await?;
+    let buyer_id = legacy.owner_pubky.clone();
+    let legacy_details = ReviewDetails::get_from_index(&buyer_id, &legacy_id)
+        .await
+        .unwrap()
+        .expect("A superseded review stays indexed");
+    assert!(legacy_details.superseded);
+
+    // Deleting the scoped record brings the legacy one back.
+    test.del(&buyer_kp, &scoped_path).await?;
+    assert_counted_once(&seller_id, &listing_id, &legacy_id, 5).await?;
+    assert!(
+        !ReviewDetails::get_from_index(&buyer_id, &legacy_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .superseded
+    );
+
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_legacy_review_after_its_scoped_twin_is_superseded() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, buyer_kp, seller_id, listing_id, legacy, scoped) =
+        order_twin_fixture(&mut test, "ReviewTwin:ScopedFirst").await?;
+
+    let (scoped_id, _scoped_path) = test.create_review(&buyer_kp, &scoped).await?;
+    let (_legacy_id, _legacy_path) = test.create_review(&buyer_kp, &legacy).await?;
+    assert_counted_once(&seller_id, &listing_id, &scoped_id, 1).await?;
+
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_review_is_never_superseded() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, buyer_kp, seller_id, _listing_id, mut legacy, scoped) =
+        order_twin_fixture(&mut test, "ReviewTwin:Unverified").await?;
+    // A legacy record whose attestation does not verify has no attested order.
+    legacy.eligibility_attestation = "a".repeat(64);
+
+    let (legacy_id, _legacy_path) = test.create_review(&buyer_kp, &legacy).await?;
+    let (_scoped_id, _scoped_path) = test.create_review(&buyer_kp, &scoped).await?;
+    let summary =
+        ReputationSummary::get_by_subject(&seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await
+            .unwrap()
+            .expect("The subject reputation summary should exist");
+    assert_eq!(
+        summary.count, 2,
+        "An unverified review is counted as before"
+    );
+    assert_eq!(summary.verified_count, 1);
+    assert!(
+        !ReviewDetails::get_from_index(&legacy.owner_pubky, &legacy_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .superseded
+    );
+
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}

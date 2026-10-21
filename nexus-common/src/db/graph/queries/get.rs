@@ -1572,12 +1572,37 @@ const REPUTATION_RETURN: &str = "
             max(r.created_at) AS last_reviewed_at
         ";
 
+/// The reviewer's other verified review edges in one role that carry the
+/// same attested order `(attestor_id, order_ref)`: a legacy record and its
+/// order-scoped twin embed the same attestation.
+pub fn review_order_twins(
+    reviewer_id: &str,
+    review_id: &str,
+    role: &str,
+    attestor_id: &str,
+    order_ref: &str,
+) -> Query {
+    Query::new(
+        "review_order_twins",
+        "MATCH (:User {id: $reviewer_id})-[t:REVIEWED]->(:User)
+        WHERE t.review_id <> $review_id AND t.verified AND t.role = $role
+            AND t.attestor_id = $attestor_id AND t.order_ref = $order_ref
+        RETURN t.review_id AS review_id, coalesce(t.order_scoped, false) AS order_scoped",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
+    .param("role", role.to_string())
+    .param("attestor_id", attestor_id.to_string())
+    .param("order_ref", order_ref.to_string())
+}
+
 /// Aggregates every `REVIEWED` edge pointing at a subject in one role into
-/// the reputation summary row.
+/// the reputation summary row, leaving out legacy records superseded by
+/// their order-scoped twin.
 pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
     let cypher = format!(
         "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
-        WHERE r.role = $role
+        WHERE r.role = $role AND coalesce(r.superseded, false) = false
         {REPUTATION_RETURN}"
     );
     Query::new("subject_reputation", &cypher)
@@ -1592,6 +1617,7 @@ pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
     let cypher = format!(
         "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
         WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id
+            AND coalesce(r.superseded, false) = false
         {REPUTATION_RETURN}"
     );
     Query::new("listing_reputation", &cypher)

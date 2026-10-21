@@ -656,6 +656,7 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
             r.verified = $verified,
             r.attestor_id = $attestor_id,
             r.order_ref = $order_ref,
+            r.order_scoped = $order_scoped,
             r.edited_late = $edited_late,
             r.created_at = $created_at,
             r.updated_at = $updated_at,
@@ -677,12 +678,27 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
     .param("verified", review.verified)
     .param("attestor_id", review.attestor_id.clone())
     .param("order_ref", review.order_ref.clone())
+    .param("order_scoped", review.order_scoped)
     .param("edited_late", review.edited_late)
     .param("created_at", review.created_at.to_string())
     .param("updated_at", review.updated_at.to_string())
     .param("revision", review.revision);
 
     Ok(query)
+}
+
+/// Marks a review edge as superseded by its order-scoped twin (or clears
+/// it), so the reputation aggregates count each attested order once.
+pub fn set_review_superseded(reviewer_id: &str, review_id: &str, superseded: bool) -> Query {
+    Query::new(
+        "set_review_superseded",
+        "MATCH (reviewer:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+        SET r.superseded = $superseded
+        RETURN true AS flag;",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
+    .param("superseded", superseded)
 }
 
 /// Sets or clears the `has_response` flag on a review edge (maintained by
