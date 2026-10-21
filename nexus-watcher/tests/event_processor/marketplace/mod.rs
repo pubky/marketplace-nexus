@@ -1,3 +1,4 @@
+mod attestor;
 mod deliverable;
 mod drop;
 mod homeserver_binding;
