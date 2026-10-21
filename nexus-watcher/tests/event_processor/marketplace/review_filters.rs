@@ -84,17 +84,17 @@ async fn homeserver_follows_and_tags_drive_the_review_filters() -> Result<()> {
     let seller = &market.seller_id;
     assert_eq!(
         reviewers(seller, &viewer_id, Some(ReviewReach::Following), &[]).await?,
-        [followed_id.clone()]
+        [followed_id.as_str()]
     );
     assert_eq!(
         reviewers(seller, &viewer_id, None, &["trusted"]).await?,
-        [tagged_id.clone()]
+        [tagged_id.as_str()]
     );
     // `followed` now follows `other`: two hops from the viewer.
     test.create_follow(&followed_kp, &other_id).await?;
     assert_eq!(
         reviewers(seller, &viewer_id, Some(ReviewReach::Wot), &[]).await?,
-        [other_id.clone(), followed_id.clone()]
+        [other_id.as_str(), followed_id.as_str()]
     );
 
     test.del(&viewer_kp, &follow_path).await?;
