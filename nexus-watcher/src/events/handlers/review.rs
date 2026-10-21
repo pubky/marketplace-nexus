@@ -38,7 +38,11 @@ pub async fn sync_put(
         )));
     }
 
-    let details = ReviewDetails::from_homeserver(&review, &user_id);
+    let mut details = ReviewDetails::from_homeserver(&review, &user_id);
+    // An edit keeps its supersession state until resolve_order_twins
+    // re-evaluates it against the record's previous attested order.
+    let prior = ReviewDetails::get_from_index(&user_id, &review_id).await?;
+    details.superseded = prior.as_ref().is_some_and(|prior| prior.superseded);
 
     // SAVE TO GRAPH: requires both the reviewer and the subject users
     let existed = match details.put_to_graph().await? {
@@ -52,6 +56,9 @@ pub async fn sync_put(
     // SAVE TO INDEX: an edit refreshes the details JSON only; the review
     // keeps its original position in the review sorted sets
     details.put_to_index(existed).await?;
+
+    // ONE COUNT PER ATTESTED ORDER: a scoped record supersedes its legacy twin
+    details.resolve_order_twins(prior.as_ref()).await?;
 
     // AGGREGATES: recompute the affected scopes from the graph
     recompute_reputation(&details).await?;
@@ -67,6 +74,7 @@ pub async fn del(user_id: PubkyId, review_id: String) -> Result<(), EventProcess
     };
 
     details.delete().await?;
+    details.restore_order_twins().await?;
     recompute_reputation(&details).await?;
 
     Ok(())

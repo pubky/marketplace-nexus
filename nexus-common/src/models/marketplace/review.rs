@@ -1,7 +1,8 @@
 use super::ReviewResponseDetails;
 use crate::db::kv::{RedisResult, SortOrder};
 use crate::db::{
-    exec_single_row, execute_graph_operation, queries, GraphResult, OperationOutcome, RedisOps,
+    exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, queries, GraphResult,
+    OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
 use crate::types::Pagination;
@@ -60,6 +61,14 @@ pub struct ReviewDetails {
     /// True when `updated_at` moved more than the marketplace's 24h edit
     /// window after `created_at` (see [`REVIEW_EDIT_WINDOW_SECONDS`]).
     pub edited_late: bool,
+    /// True when the record carries `orderRef` (its ID is per attested order).
+    #[serde(default)]
+    pub order_scoped: bool,
+    /// True when an order-scoped record carries this legacy record's
+    /// attestation: it counts once, as the scoped record, so this one is left
+    /// out of aggregates and review streams.
+    #[serde(default)]
+    pub superseded: bool,
     pub created_at: String,
     pub updated_at: String,
     pub revision: i64,
@@ -101,6 +110,8 @@ impl ReviewDetails {
             attestor_id,
             order_ref,
             edited_late: is_edited_late(&review.created_at, &review.updated_at),
+            order_scoped: review.is_order_scoped(),
+            superseded: false,
             created_at: review.created_at.clone(),
             updated_at: review.updated_at.clone(),
             revision: review.revision,
@@ -131,24 +142,149 @@ impl ReviewDetails {
         if is_edit {
             return Ok(());
         }
-        let member = format!("{}:{}", self.reviewer_id, self.review_id);
-        let score = self.indexed_at as f64;
-        let subject_key = [
+        self.add_to_streams().await
+    }
+
+    /// The sorted sets this review is listed in: the subject's and, for
+    /// buyer reviews, the listing's. A listing's star rating comes from
+    /// buyers; seller-side reviews of buyers reference the listing but do not
+    /// rate it.
+    fn stream_keys(&self) -> Vec<Vec<&str>> {
+        let mut keys = vec![[
             &REVIEW_SUBJECT_KEY_PARTS[..],
             &[self.subject_id.as_str(), self.role.as_str()],
         ]
-        .concat();
-        Self::put_index_sorted_set(&subject_key, &[(score, member.as_str())], None, None).await?;
-        // A listing's star rating comes from buyers; seller-side reviews of
-        // buyers reference the listing but do not rate it.
+        .concat()];
         if self.role == PubkyAppReviewRole::BuyerReviewingSeller {
-            let listing_key = [
-                &REVIEW_LISTING_KEY_PARTS[..],
-                &[self.listing_owner_id.as_str(), self.listing_id.as_str()],
-            ]
-            .concat();
-            Self::put_index_sorted_set(&listing_key, &[(score, member.as_str())], None, None)
+            keys.push(
+                [
+                    &REVIEW_LISTING_KEY_PARTS[..],
+                    &[self.listing_owner_id.as_str(), self.listing_id.as_str()],
+                ]
+                .concat(),
+            );
+        }
+        keys
+    }
+
+    async fn add_to_streams(&self) -> RedisResult<()> {
+        let member = format!("{}:{}", self.reviewer_id, self.review_id);
+        let score = self.indexed_at as f64;
+        for key in self.stream_keys() {
+            Self::put_index_sorted_set(&key, &[(score, member.as_str())], None, None).await?;
+        }
+        Ok(())
+    }
+
+    async fn remove_from_streams(&self) -> RedisResult<()> {
+        let member = format!("{}:{}", self.reviewer_id, self.review_id);
+        for key in self.stream_keys() {
+            Self::remove_from_index_sorted_set(None, &key, &[member.as_str()]).await?;
+        }
+        Ok(())
+    }
+
+    /// The other verified reviews by this reviewer, in this role, that carry
+    /// the same attested order `(attestor, order_ref)`: a legacy record and
+    /// its order-scoped twin. Returns `(review_id, order_scoped)` pairs.
+    async fn order_twins(&self) -> GraphResult<Vec<(String, bool)>> {
+        let (Some(attestor_id), Some(order_ref)) = (&self.attestor_id, &self.order_ref) else {
+            return Ok(Vec::new());
+        };
+        let rows = fetch_all_rows_from_graph(queries::get::review_order_twins(
+            &self.reviewer_id,
+            &self.review_id,
+            self.role.as_str(),
+            attestor_id,
+            order_ref,
+        ))
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let review_id: String = row.get("review_id").ok()?;
+                let order_scoped: bool = row.get("order_scoped").unwrap_or(false);
+                Some((review_id, order_scoped))
+            })
+            .collect())
+    }
+
+    async fn set_superseded(
+        reviewer_id: &str,
+        review_id: &str,
+        superseded: bool,
+    ) -> ModelResult<()> {
+        exec_single_row(queries::put::set_review_superseded(
+            reviewer_id,
+            review_id,
+            superseded,
+        ))
+        .await?;
+        if let Some(mut details) = Self::get_from_index(reviewer_id, review_id).await? {
+            details.superseded = superseded;
+            details
+                .put_index_json(&[reviewer_id, review_id], None, None)
                 .await?;
+            if superseded {
+                details.remove_from_streams().await?;
+            } else {
+                details.add_to_streams().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Counts a verified review once per attested order (specs `.14`
+    /// counting rule): an order-scoped record supersedes every legacy record
+    /// carrying the same `(attestor, order_ref)` in the same role, and a
+    /// legacy record that arrives after its scoped twin is superseded at
+    /// once. Superseded records stay indexed but leave the aggregates and the
+    /// review streams. Unverified records are never part of this.
+    ///
+    /// `prior` is the record's indexed state before this write. An edit that
+    /// drops or changes a scoped record's attested order (say, its
+    /// attestation no longer verifies) frees the legacy twins it superseded,
+    /// and a superseded record that no longer qualifies counts again.
+    pub async fn resolve_order_twins(&self, prior: Option<&ReviewDetails>) -> ModelResult<()> {
+        if let Some(prior) = prior {
+            let same_scoped_order = self.verified
+                && self.order_scoped
+                && prior.attestor_id == self.attestor_id
+                && prior.order_ref == self.order_ref;
+            if !same_scoped_order {
+                prior.restore_order_twins().await?;
+            }
+        }
+        let twins = if self.verified {
+            self.order_twins().await?
+        } else {
+            Vec::new()
+        };
+        if self.verified && self.order_scoped {
+            for (twin_id, twin_scoped) in &twins {
+                if !twin_scoped {
+                    Self::set_superseded(&self.reviewer_id, twin_id, true).await?;
+                }
+            }
+        }
+        let superseded = self.verified
+            && !self.order_scoped
+            && twins.iter().any(|(_, twin_scoped)| *twin_scoped);
+        if superseded != self.superseded {
+            Self::set_superseded(&self.reviewer_id, &self.review_id, superseded).await?;
+        }
+        Ok(())
+    }
+
+    /// After an order-scoped review is deleted, its legacy twins count again.
+    pub async fn restore_order_twins(&self) -> ModelResult<()> {
+        if !self.verified || !self.order_scoped {
+            return Ok(());
+        }
+        for (twin_id, twin_scoped) in self.order_twins().await? {
+            if !twin_scoped {
+                Self::set_superseded(&self.reviewer_id, &twin_id, false).await?;
+            }
         }
         Ok(())
     }
@@ -161,21 +297,7 @@ impl ReviewDetails {
         ))
         .await?;
         Self::remove_from_index_multiple_json(&[&[&self.reviewer_id, &self.review_id]]).await?;
-        let member = format!("{}:{}", self.reviewer_id, self.review_id);
-        let subject_key = [
-            &REVIEW_SUBJECT_KEY_PARTS[..],
-            &[self.subject_id.as_str(), self.role.as_str()],
-        ]
-        .concat();
-        Self::remove_from_index_sorted_set(None, &subject_key, &[member.as_str()]).await?;
-        if self.role == PubkyAppReviewRole::BuyerReviewingSeller {
-            let listing_key = [
-                &REVIEW_LISTING_KEY_PARTS[..],
-                &[self.listing_owner_id.as_str(), self.listing_id.as_str()],
-            ]
-            .concat();
-            Self::remove_from_index_sorted_set(None, &listing_key, &[member.as_str()]).await?;
-        }
+        self.remove_from_streams().await?;
         Ok(())
     }
 }
