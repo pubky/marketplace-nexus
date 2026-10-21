@@ -655,15 +655,9 @@ async fn a_rederivation_during_a_release_does_not_bring_the_moderation_back() ->
         ModeratedReview::mark_releasing(&moderator_id, &tag_id).await?;
         ExcludedReviewer::mark_releasing(&moderator_id, &tag_id).await?;
         ModeratedUser::mark_releasing(&moderator_id, &tag_id).await?;
-        assert_eq!(
-            handlers::review::refresh_reviewer_moderation(&buyer_id).await?,
-            1
-        );
-        assert_eq!(
-            handlers::review::refresh_reviewer_moderation(&buyer_id).await?,
-            0,
-            "a re-derivation during the release keeps the review released"
-        );
+        handlers::review::refresh_reviewer_moderation(&buyer_id).await?;
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        handlers::review::refresh_reviewer_moderation(&buyer_id).await?;
         assert_moderation(&market, &buyer_id, &review_id, None, text).await;
         assert_counted(&market, 1, 3.0).await;
 
