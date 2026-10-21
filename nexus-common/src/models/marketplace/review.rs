@@ -240,19 +240,38 @@ impl ReviewDetails {
     /// legacy record that arrives after its scoped twin is superseded at
     /// once. Superseded records stay indexed but leave the aggregates and the
     /// review streams. Unverified records are never part of this.
-    pub async fn resolve_order_twins(&self) -> ModelResult<()> {
-        if !self.verified {
-            return Ok(());
+    ///
+    /// `prior` is the record's indexed state before this write. An edit that
+    /// drops or changes a scoped record's attested order (say, its
+    /// attestation no longer verifies) frees the legacy twins it superseded,
+    /// and a superseded record that no longer qualifies counts again.
+    pub async fn resolve_order_twins(&self, prior: Option<&ReviewDetails>) -> ModelResult<()> {
+        if let Some(prior) = prior {
+            let same_scoped_order = self.verified
+                && self.order_scoped
+                && prior.attestor_id == self.attestor_id
+                && prior.order_ref == self.order_ref;
+            if !same_scoped_order {
+                prior.restore_order_twins().await?;
+            }
         }
-        let twins = self.order_twins().await?;
-        if self.order_scoped {
+        let twins = if self.verified {
+            self.order_twins().await?
+        } else {
+            Vec::new()
+        };
+        if self.verified && self.order_scoped {
             for (twin_id, twin_scoped) in &twins {
                 if !twin_scoped {
                     Self::set_superseded(&self.reviewer_id, twin_id, true).await?;
                 }
             }
-        } else if twins.iter().any(|(_, twin_scoped)| *twin_scoped) {
-            Self::set_superseded(&self.reviewer_id, &self.review_id, true).await?;
+        }
+        let superseded = self.verified
+            && !self.order_scoped
+            && twins.iter().any(|(_, twin_scoped)| *twin_scoped);
+        if superseded != self.superseded {
+            Self::set_superseded(&self.reviewer_id, &self.review_id, superseded).await?;
         }
         Ok(())
     }

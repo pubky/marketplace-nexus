@@ -847,3 +847,41 @@ async fn test_unverified_review_is_never_superseded() -> Result<()> {
     test.cleanup_user(&seller_kp).await?;
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn test_edit_that_loses_verification_frees_the_twin() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (seller_kp, buyer_kp, seller_id, listing_id, legacy, scoped) =
+        order_twin_fixture(&mut test, "ReviewTwin:EditUnverified").await?;
+    let buyer_id = legacy.owner_pubky.clone();
+
+    let (legacy_id, _legacy_path) = test.create_review(&buyer_kp, &legacy).await?;
+    let (scoped_id, _scoped_path) = test.create_review(&buyer_kp, &scoped).await?;
+    assert_counted_once(&seller_id, &listing_id, &scoped_id, 1).await?;
+
+    // The scoped record is edited so its attestation no longer verifies: it
+    // no longer stands for the order, so the legacy twin counts again.
+    let mut edited = scoped.clone();
+    edited.eligibility_attestation = "a".repeat(64);
+    edited.revision = 2;
+    let (edited_id, _edited_path) = test.create_review(&buyer_kp, &edited).await?;
+    assert_eq!(edited_id, scoped_id, "An edit keeps the record's path");
+    let summary =
+        ReputationSummary::get_by_subject(&seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await
+            .unwrap()
+            .expect("The subject reputation summary should exist");
+    assert_eq!(summary.count, 2);
+    assert_eq!(summary.verified_count, 1);
+    assert!(
+        !ReviewDetails::get_from_index(&buyer_id, &legacy_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .superseded
+    );
+
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
+}
