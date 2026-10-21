@@ -16,8 +16,11 @@ Generic fixes go upstream as their own PRs. The marketplace code is being
 reduced to a thin layer on top of upstream Nexus, so this repo stops carrying
 a copy of upstream code.
 
-Images: `ghcr.io/pubky/marketplace-nexus`, tagged by source SHA. Deploy by
-digest.
+The container image is built from the [`Dockerfile`](Dockerfile); the team
+deploys it through
+[pubky/shop-migration](https://github.com/pubky/shop-migration). This repository
+carries no host-specific deployment configuration, and personal development
+hosting is out of scope for it.
 
 **Added over upstream:**
 
@@ -42,7 +45,7 @@ digest.
 concurrent processes create the same new index (surfaced by parallel test
 boots).
 
-Deploy runbook for the dedicated instance: `docs/railway-deploy.md`.
+Operating the dedicated instance (moderation setting, homeserver discovery and replay, backfill migrations): `docs/operations.md`.
 
 Pubky Nexus is the central bridge connecting Pubky homeservers with [Pubky-App’s](https://github.com/pubky/pubky-app) social clients. By aggregating events from homeservers into a rich social graph, Nexus transforms decentralized interactions into a high-performance, fully featured social-media-like API. It's designed to support Social-Semantic-Graph (SSG) inference, and more.
 
@@ -293,11 +296,10 @@ Safety rules:
 ### Proof listings and reindex (listing moderation)
 
 A listing is hidden by the same moderator-tag path Nexus uses for posts, users
-and files. When the moderator key (`moderation_id`, `NEXUS_MODERATION_ID` on
-Railway) tags a listing URI
+and files. When the moderator key (`moderation_id` in the watcher config) tags a listing URI
 (`pubky://<seller>/pub/pubky.app/marketplace/v1/listings/<listing_id>`) with a
-label in `moderated_tags` (`moderated` by default; `NEXUS_MODERATED_TAGS` on
-Railway, comma separated, empty turns moderation off), the listing is removed
+label in `moderated_tags` (`moderated` by default; an empty list turns
+moderation off), the listing is removed
 from the graph, the details cache and every stream, and its community tags go
 with it. Tags by anyone else, or with other labels, have no effect.
 
@@ -315,7 +317,7 @@ hidden). `GET /v0/listing/{seller_id}/{listing_id}/moderation` returns
 `{moderated, listing_moderated, seller_moderated}` from the markers, whether or
 not the index holds the listing, so a transaction service can refuse to sell a
 moderated listing. The production moderator key and labels are configuration:
-see `docs/railway-deploy.md`, "Moderation: launched setting".
+see `docs/operations.md`, "Moderation: launched setting".
 
 The moderation tag is itself a record on the moderator's homeserver, so a
 reindex that replays the watched homeservers replays it. Replay order does not

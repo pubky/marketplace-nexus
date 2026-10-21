@@ -226,8 +226,8 @@ mod tests {
             "neo4j://[redacted]@graph.internal:7687"
         );
         assert_eq!(
-            redact_connection_url("bolt://neo4j:graph-password@neo4j.railway.internal:7687"),
-            "bolt://[redacted]@neo4j.railway.internal:7687"
+            redact_connection_url("bolt://neo4j:graph-password@neo4j.internal:7687"),
+            "bolt://[redacted]@neo4j.internal:7687"
         );
     }
 
