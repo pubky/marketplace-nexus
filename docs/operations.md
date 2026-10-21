@@ -116,6 +116,15 @@ One-shot migrations (see the runbook in `README.md`):
   (shipping, communication) counts once, and every review aggregate is
   recomputed. No record is rewritten. It needs only the databases; run it
   once after the release that adds per-item reviews.
+- `ReviewTrustBucketsBackfill1792587206` re-reads every verified review
+  indexed without its attestation `iat` (indexed before per-attestor buckets
+  shipped) from the reviewer's homeserver, then recomputes every review
+  aggregate so each carries its per-attestor buckets. It needs outbound
+  access to homeservers. A homeserver that cannot be reached is reported and
+  skipped, not fatal: its reviews stay out of the buckets (never
+  over-counted) until their next edit. Run it once, after
+  `ReviewPerItemRecompute1792584000`, after the release that adds trust-scoped
+  aggregates.
 
 Run them where the databases are reachable, for example inside the `nexusd`
 container:
