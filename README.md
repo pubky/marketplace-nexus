@@ -38,6 +38,11 @@ hosting is out of scope for it.
   carry per-attestor buckets (one voice per buyer, price-weighted from the
   attested `price_decade` claim), and `attestors=<pubky>[:<from>:<until>],…`
   scopes a figure to the client's trust list and its validity windows.
+  Review streams filter by the viewer's follows and tags
+  (`viewer_id`, `reach=following|friends|wot`, `depth`, `tagged_by_viewer`)
+  and by `attestors=`, sort by `newest|value|rating_desc|rating_asc`, and
+  return the counted `matched` figures; reach and tags see the follows and
+  tags between indexed users only.
 - Marketplace tag aggregation endpoints for listings and shops.
 - The index stays deliberately **lossy**: variants, shipping options,
   attributes, digital-lock details, and any live stock/order state are
