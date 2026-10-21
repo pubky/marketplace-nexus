@@ -332,10 +332,8 @@ impl ReviewDetails {
         let mut keys = Vec::with_capacity(rows.len());
         for row in rows {
             let role: String = row.get("role")?;
-            let role = match role.as_str() {
-                "buyer_reviewing_seller" => PubkyAppReviewRole::BuyerReviewingSeller,
-                "seller_reviewing_buyer" => PubkyAppReviewRole::SellerReviewingBuyer,
-                _ => continue,
+            let Some(role) = role_from_graph(&role) else {
+                continue;
             };
             if let (Some(attestor_id), Some(order_ref)) =
                 (row.get("attestor_id")?, row.get("order_ref")?)
@@ -344,6 +342,41 @@ impl ReviewDetails {
             }
         }
         Ok(keys)
+    }
+
+    /// Every review aggregate scope in the graph: the `(subject_id, role)`
+    /// subject scopes and the `(listing_owner_id, listing_id)` listing scopes.
+    pub async fn aggregate_scopes(
+    ) -> GraphResult<(Vec<(String, PubkyAppReviewRole)>, Vec<(String, String)>)> {
+        let rows = fetch_all_rows_from_graph(queries::get::review_aggregate_scopes()).await?;
+        let mut subjects = std::collections::BTreeSet::new();
+        let mut listings = std::collections::BTreeSet::new();
+        for row in rows {
+            let subject_id: Option<String> = row.get("subject_id")?;
+            let role: String = row.get("role")?;
+            if role_from_graph(&role).is_none() {
+                continue;
+            }
+            if let Some(subject_id) = subject_id {
+                subjects.insert((subject_id, role));
+            }
+            let listing_owner_id: Option<String> = row.get("listing_owner_id")?;
+            let listing_id: Option<String> = row.get("listing_id")?;
+            if let (Some(listing_owner_id), Some(listing_id)) = (listing_owner_id, listing_id) {
+                listings.insert((listing_owner_id, listing_id));
+            }
+        }
+        let subjects = subjects
+            .into_iter()
+            .filter_map(|(subject_id, role)| role_from_graph(&role).map(|role| (subject_id, role)))
+            .collect();
+        Ok((subjects, listings.into_iter().collect()))
+    }
+
+    /// Flags every review edge without an attested order as counting its own
+    /// seller fields.
+    pub async fn flag_unkeyed_seller_fields() -> GraphResult<()> {
+        exec_single_row(queries::put::flag_unkeyed_seller_fields()).await
     }
 
     /// The ids of every review the reviewer has in the graph.
@@ -539,6 +572,16 @@ impl ReviewStream {
 
         Ok(Some(Self(views)))
     }
+}
+
+/// The review role stored on a `REVIEWED` edge.
+fn role_from_graph(role: &str) -> Option<PubkyAppReviewRole> {
+    [
+        PubkyAppReviewRole::BuyerReviewingSeller,
+        PubkyAppReviewRole::SellerReviewingBuyer,
+    ]
+    .into_iter()
+    .find(|candidate| candidate.as_str() == role)
 }
 
 /// True when `updated_at` is more than the marketplace edit window after

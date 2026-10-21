@@ -208,6 +208,49 @@ pub async fn recompute_all_review_moderation() -> Result<usize, EventProcessorEr
     Ok(changed)
 }
 
+/// Outcome tally of the one-shot per-item recompute.
+#[derive(Debug, Default)]
+pub struct PerItemRecompute {
+    /// Indexed reviews whose order twins were re-evaluated.
+    pub reviews: usize,
+    /// Attested orders whose counted seller-rating copy was settled.
+    pub orders: usize,
+    /// Subject and listing aggregates recomputed.
+    pub aggregates: usize,
+}
+
+/// One-shot recompute for per-item reviews. Re-evaluates every indexed
+/// review's order twins with the listing-aware match (a legacy review that an
+/// order-scoped review of another item of its order superseded counts
+/// again), flags the seller fields of reviews without an attested order,
+/// settles each attested order's counted seller-rating copy, then recomputes
+/// every subject and listing aggregate. Idempotent.
+pub async fn recompute_per_item_counting() -> Result<PerItemRecompute, EventProcessorError> {
+    let mut summary = PerItemRecompute::default();
+    for reviewer_id in ReviewDetails::reviewer_ids().await? {
+        for review_id in ReviewDetails::ids_of_reviewer(&reviewer_id).await? {
+            if let Some(details) = ReviewDetails::get_from_index(&reviewer_id, &review_id).await? {
+                details.resolve_order_twins(None).await?;
+                summary.reviews += 1;
+            }
+        }
+    }
+    ReviewDetails::flag_unkeyed_seller_fields().await?;
+    for (attestor_id, order_ref, role) in ReviewDetails::order_keys().await? {
+        ReviewDetails::resolve_seller_fields(&attestor_id, &order_ref, role).await?;
+        summary.orders += 1;
+    }
+    let (subjects, listings) = ReviewDetails::aggregate_scopes().await?;
+    for (subject_id, role) in &subjects {
+        ReputationSummary::recompute_subject(subject_id, *role).await?;
+    }
+    for (listing_owner_id, listing_id) in &listings {
+        ReputationSummary::recompute_listing(listing_owner_id, listing_id).await?;
+    }
+    summary.aggregates = subjects.len() + listings.len();
+    Ok(summary)
+}
+
 /// Re-derives one review's moderation and, when it changed, its aggregates.
 /// Returns whether it changed.
 async fn refresh_moderation(

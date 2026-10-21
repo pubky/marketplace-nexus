@@ -6,7 +6,11 @@ use super::utils::{
 use crate::event_processor::utils::watcher::{HomeserverHashIdPath, WatcherTest};
 use anyhow::Result;
 use chrono::Utc;
-use nexus_common::models::marketplace::{ReputationSummary, ReviewDetails};
+use nexus_common::db::graph::Query;
+use nexus_common::db::{exec_single_row, queries, RedisOps};
+use nexus_common::models::marketplace::{ReputationSummary, ReviewDetails, ReviewStream};
+use nexus_common::types::Pagination;
+use nexus_watcher::events::handlers::review::recompute_per_item_counting;
 use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::{
     marketplace_review_uri_builder, traits::HasPath, PubkyAppListingCondition,
@@ -386,6 +390,113 @@ async fn copies_updated_at_the_same_time_count_the_lowest_review_id() -> Result<
 
     test.del(&buyer_kp, &item_a_path).await?;
     test.del(&buyer_kp, &item_b_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// Puts a review back in the state an index without per-item counting left
+/// it in: superseded (by another item's scoped review of its order) or not,
+/// and with no seller-fields flag.
+async fn restore_pre_per_item_state(
+    buyer_id: &str,
+    review_id: &str,
+    superseded: bool,
+) -> Result<()> {
+    exec_single_row(queries::put::set_review_superseded(
+        buyer_id, review_id, superseded,
+    ))
+    .await?;
+    exec_single_row(
+        Query::new(
+            "test_remove_seller_fields_flag",
+            "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+             REMOVE r.seller_fields_counted",
+        )
+        .param("reviewer_id", buyer_id)
+        .param("review_id", review_id),
+    )
+    .await?;
+    let mut details = ReviewDetails::get_from_index(buyer_id, review_id)
+        .await?
+        .expect("indexed review");
+    details.superseded = superseded;
+    details
+        .put_index_json(&[buyer_id, review_id], None, None)
+        .await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn the_one_shot_recompute_recounts_reviews_indexed_before_per_item_counting() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewPerItemRecompute").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(
+            &buyer_kp,
+            &seller_profile("Watcher:ReviewPerItemRecompute:Buyer"),
+        )
+        .await?;
+
+    // Legacy item A and scoped item B of one order, both with a seller rating.
+    let mut legacy_a = item_review(&market, &buyer_id, &market.listing_a, '9', 4, false);
+    legacy_a.ratings.shipping = Some(5);
+    legacy_a.ratings.communication = Some(5);
+    let (legacy_a_id, legacy_a_path) = test.create_review(&buyer_kp, &legacy_a).await?;
+    let scoped_b = rated_item(
+        &market,
+        &buyer_id,
+        &market.listing_b,
+        '9',
+        2,
+        1,
+        3,
+        "2026-08-20T13:00:00Z",
+    );
+    let (scoped_b_id, scoped_b_path) = test.create_review(&buyer_kp, &scoped_b).await?;
+
+    // The index before this release: scoped B superseded legacy A, and no
+    // edge carries the seller-fields flag.
+    restore_pre_per_item_state(&buyer_id, &legacy_a_id, true).await?;
+    restore_pre_per_item_state(&buyer_id, &scoped_b_id, false).await?;
+    ReputationSummary::recompute_subject(
+        &market.seller_id,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+    )
+    .await?;
+    assert_eq!(summary_of_seller(&market.seller_id).await.count, 1);
+
+    let summary = recompute_per_item_counting().await?;
+    assert!(summary.reviews >= 2);
+    assert!(summary.orders >= 1);
+
+    assert!(
+        !ReviewDetails::get_from_index(&buyer_id, &legacy_a_id)
+            .await?
+            .expect("indexed")
+            .superseded,
+        "another item's scoped review no longer hides legacy A"
+    );
+    let listed =
+        ReviewStream::get_by_listing(&market.seller_id, &market.listing_a, Pagination::default())
+            .await?
+            .expect("listing A lists its legacy review");
+    assert_eq!(listed.0[0].review.review_id, legacy_a_id);
+    // Both items count; the order's seller rating counts once, from scoped B
+    // (legacy A's updatedAt is earlier).
+    assert_seller_fields(&market.seller_id, 2, 1.0, 3.0).await;
+    let listing_a = ReputationSummary::get_by_listing(&market.seller_id, &market.listing_a)
+        .await?
+        .expect("listing A aggregate");
+    assert_eq!(listing_a.count, 1);
+
+    // Idempotent.
+    recompute_per_item_counting().await?;
+    assert_seller_fields(&market.seller_id, 2, 1.0, 3.0).await;
+
+    test.del(&buyer_kp, &legacy_a_path).await?;
+    test.del(&buyer_kp, &scoped_b_path).await?;
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
     Ok(())
