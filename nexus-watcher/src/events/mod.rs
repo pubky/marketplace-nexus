@@ -1,8 +1,10 @@
+use handlers::listing::HomeserverRecord;
 use nexus_common::db::PubkyConnector;
 use nexus_common::models::event::{Event, EventProcessorError, EventType};
-use pubky_app_specs::{PubkyAppObject, Resource};
+use nexus_common::models::marketplace::{ModeratedListing, ModeratedUser};
+use pubky_app_specs::{PubkyAppObject, PubkyId, Resource};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub mod handlers;
 mod moderation;
@@ -124,6 +126,18 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
             handlers::bookmark::del(user_id, bookmark_id.clone()).await?
         }
         Resource::Tag(tag_id) => {
+            // A DEL line alone never lifts moderation: the marker goes only once the
+            // moderator's own homeserver answers that the tag record is gone.
+            if tag_has_moderation_markers(&user_id, tag_id).await?
+                && handlers::listing::record_on_homeserver(&event.uri).await?
+                    == HomeserverRecord::Present
+            {
+                warn!(
+                    "Moderator tag {} is still on its homeserver; keeping its moderation",
+                    event.uri
+                );
+                return Ok(());
+            }
             // A moderator's tag on a listing or a user is never indexed as a
             // tag: removing it only lifts the moderation marker.
             let released = handlers::listing::release_moderation(&user_id, tag_id).await?;
@@ -150,4 +164,19 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
         other => debug!("DEL event type not handled for resource: {other:?}"),
     }
     Ok(())
+}
+
+async fn tag_has_moderation_markers(
+    tagger_id: &PubkyId,
+    tag_id: &str,
+) -> Result<bool, EventProcessorError> {
+    if !ModeratedListing::listings_of_tag(tagger_id, tag_id)
+        .await?
+        .is_empty()
+    {
+        return Ok(true);
+    }
+    Ok(!ModeratedUser::users_of_tag(tagger_id, tag_id)
+        .await?
+        .is_empty())
 }

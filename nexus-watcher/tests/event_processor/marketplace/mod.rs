@@ -1,5 +1,6 @@
 mod deliverable;
 mod drop;
+mod homeserver_binding;
 mod listing;
 mod moderation;
 mod review;
