@@ -191,8 +191,9 @@ impl ReviewDetails {
     }
 
     /// The other verified reviews by this reviewer, in this role, that carry
-    /// the same attested order `(attestor, order_ref)`: a legacy record and
-    /// its order-scoped twin. Returns `(review_id, order_scoped)` pairs.
+    /// the same attested order `(attestor, order_ref)` for the same listing:
+    /// a legacy record and its order-scoped twin. Returns
+    /// `(review_id, order_scoped)` pairs.
     async fn order_twins(&self) -> GraphResult<Vec<(String, bool)>> {
         let (Some(attestor_id), Some(order_ref)) = (&self.attestor_id, &self.order_ref) else {
             return Ok(Vec::new());
@@ -203,6 +204,8 @@ impl ReviewDetails {
             self.role.as_str(),
             attestor_id,
             order_ref,
+            &self.listing_owner_id,
+            &self.listing_id,
         ))
         .await?;
         Ok(rows
@@ -240,12 +243,13 @@ impl ReviewDetails {
         Ok(())
     }
 
-    /// Counts a verified review once per attested order (specs `.14`
-    /// counting rule): an order-scoped record supersedes every legacy record
-    /// carrying the same `(attestor, order_ref)` in the same role, and a
-    /// legacy record that arrives after its scoped twin is superseded at
-    /// once. Superseded records stay indexed but leave the aggregates and the
-    /// review streams. Unverified records are never part of this.
+    /// Counts a verified review once per attested order and item (specs
+    /// `.14` counting rule): an order-scoped record supersedes every legacy
+    /// record carrying the same `(attestor, order_ref)` in the same role for
+    /// the same listing, and a legacy record that arrives after its scoped
+    /// twin is superseded at once. Superseded records stay indexed but leave
+    /// the aggregates and the review streams. Unverified records are never
+    /// part of this.
     ///
     /// `prior` is the record's indexed state before this write. An edit that
     /// drops or changes a scoped record's attested order (say, its

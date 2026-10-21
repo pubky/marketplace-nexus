@@ -1655,20 +1655,25 @@ const REPUTATION_RETURN: &str = "
 const REPUTATION_NOT_EXCLUDED: &str = "coalesce(r.moderation, '') <> 'excluded'";
 
 /// The reviewer's other verified review edges in one role that carry the
-/// same attested order `(attestor_id, order_ref)`: a legacy record and its
-/// order-scoped twin embed the same attestation.
+/// same attested order `(attestor_id, order_ref)` for the same listing: a
+/// legacy record and its order-scoped twin embed the same attestation. Item
+/// reviews of the other listings of one order share the order but are not
+/// twins.
 pub fn review_order_twins(
     reviewer_id: &str,
     review_id: &str,
     role: &str,
     attestor_id: &str,
     order_ref: &str,
+    listing_owner_id: &str,
+    listing_id: &str,
 ) -> Query {
     Query::new(
         "review_order_twins",
         "MATCH (:User {id: $reviewer_id})-[t:REVIEWED]->(:User)
         WHERE t.review_id <> $review_id AND t.verified AND t.role = $role
             AND t.attestor_id = $attestor_id AND t.order_ref = $order_ref
+            AND t.listing_owner_id = $listing_owner_id AND t.listing_id = $listing_id
         RETURN t.review_id AS review_id, coalesce(t.order_scoped, false) AS order_scoped",
     )
     .param("reviewer_id", reviewer_id.to_string())
@@ -1676,6 +1681,8 @@ pub fn review_order_twins(
     .param("role", role.to_string())
     .param("attestor_id", attestor_id.to_string())
     .param("order_ref", order_ref.to_string())
+    .param("listing_owner_id", listing_owner_id.to_string())
+    .param("listing_id", listing_id.to_string())
 }
 
 /// Aggregates every `REVIEWED` edge pointing at a subject in one role into
