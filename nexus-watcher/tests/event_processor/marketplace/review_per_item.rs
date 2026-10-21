@@ -1,15 +1,16 @@
-use super::moderation::seller_profile;
+use super::moderation::{moderator_keypair, seller_profile};
 use super::utils::{
     attestor_pubky, sign_attestation, test_attestation_claims, test_attestor_key, test_listing,
     test_review, test_shop,
 };
-use crate::event_processor::utils::watcher::WatcherTest;
+use crate::event_processor::utils::watcher::{HomeserverHashIdPath, WatcherTest};
 use anyhow::Result;
+use chrono::Utc;
 use nexus_common::models::marketplace::{ReputationSummary, ReviewDetails};
 use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::{
-    traits::HasPath, PubkyAppListingCondition, PubkyAppMarketplaceReview, PubkyAppReviewRole,
-    PubkyAppShop,
+    marketplace_review_uri_builder, traits::HasPath, PubkyAppListingCondition,
+    PubkyAppMarketplaceReview, PubkyAppReviewRole, PubkyAppShop, PubkyAppTag,
 };
 
 /// A seller with a shop and two listings, A and B.
@@ -202,6 +203,190 @@ async fn only_the_same_items_scoped_record_supersedes_a_legacy_review_in_any_arr
         test.cleanup_user(&buyer_kp).await?;
     }
 
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// An order-scoped item review carrying the order's seller rating.
+#[allow(clippy::too_many_arguments)]
+fn rated_item(
+    market: &Market,
+    buyer_id: &str,
+    listing_id: &str,
+    order_seed: char,
+    overall: i64,
+    shipping: i64,
+    communication: i64,
+    updated_at: &str,
+) -> PubkyAppMarketplaceReview {
+    let mut review = item_review(market, buyer_id, listing_id, order_seed, overall, true);
+    review.ratings.shipping = Some(shipping);
+    review.ratings.communication = Some(communication);
+    review.updated_at = updated_at.to_string();
+    review
+}
+
+async fn assert_seller_fields(seller_id: &str, count: u64, shipping: f64, communication: f64) {
+    let seller = summary_of_seller(seller_id).await;
+    assert_eq!(seller.count, count, "every item review counts its stars");
+    assert_eq!(seller.avg_shipping, Some(shipping));
+    assert_eq!(seller.avg_communication, Some(communication));
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn seller_fields_count_once_per_order_and_move_when_an_item_review_is_deleted() -> Result<()>
+{
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewSellerFields").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(
+            &buyer_kp,
+            &seller_profile("Watcher:ReviewSellerFields:Buyer"),
+        )
+        .await?;
+    let other_kp = Keypair::random();
+    let other_id = test
+        .create_user(
+            &other_kp,
+            &seller_profile("Watcher:ReviewSellerFields:Other"),
+        )
+        .await?;
+
+    // One order of two items. Item B's copy of the seller rating is the
+    // latest, so it is the one that counts.
+    let item_a = rated_item(
+        &market,
+        &buyer_id,
+        &market.listing_a,
+        'd',
+        4,
+        5,
+        5,
+        "2026-08-20T12:00:00Z",
+    );
+    let (item_a_id, item_a_path) = test.create_review(&buyer_kp, &item_a).await?;
+    let item_b = rated_item(
+        &market,
+        &buyer_id,
+        &market.listing_b,
+        'd',
+        2,
+        2,
+        1,
+        "2026-08-20T13:00:00Z",
+    );
+    let (item_b_id, item_b_path) = test.create_review(&buyer_kp, &item_b).await?;
+    // Another buyer's one-item order.
+    let other = rated_item(
+        &market,
+        &other_id,
+        &market.listing_a,
+        'e',
+        5,
+        4,
+        3,
+        "2026-08-20T12:00:00Z",
+    );
+    let (_other_id, other_path) = test.create_review(&other_kp, &other).await?;
+
+    assert_seller_fields(&market.seller_id, 3, 3.0, 2.0).await;
+    // A listing holds one review per order, so its averages use every copy.
+    let listing_a = ReputationSummary::get_by_listing(&market.seller_id, &market.listing_a)
+        .await?
+        .expect("the listing aggregate exists");
+    assert_eq!(listing_a.avg_shipping, Some(4.5));
+
+    // Deleting item B's review moves the order's seller rating to item A.
+    test.del(&buyer_kp, &item_b_path).await?;
+    assert_seller_fields(&market.seller_id, 2, 4.5, 4.0).await;
+
+    // A later copy takes it back.
+    let mut item_b_again = item_b.clone();
+    item_b_again.ratings.shipping = Some(1);
+    item_b_again.updated_at = "2026-08-20T14:00:00Z".to_string();
+    let (item_b_again_id, _path) = test.create_review(&buyer_kp, &item_b_again).await?;
+    assert_eq!(item_b_again_id, item_b_id);
+    assert_seller_fields(&market.seller_id, 3, 2.5, 2.0).await;
+
+    // An edit of item A that is now the latest moves it again.
+    let mut item_a_edit = item_a.clone();
+    item_a_edit.revision = 2;
+    item_a_edit.ratings.shipping = Some(3);
+    item_a_edit.updated_at = "2026-08-20T15:00:00Z".to_string();
+    let (item_a_edit_id, _path) = test.create_review(&buyer_kp, &item_a_edit).await?;
+    assert_eq!(item_a_edit_id, item_a_id);
+    assert_seller_fields(&market.seller_id, 3, 3.5, 4.0).await;
+
+    // A copy moderation excludes never carries the seller rating.
+    let moderator_kp = moderator_keypair().await;
+    test.create_user(
+        &moderator_kp,
+        &seller_profile("Watcher:ReviewSellerFields:Moderator"),
+    )
+    .await?;
+    let exclusion = PubkyAppTag {
+        uri: marketplace_review_uri_builder(buyer_id.clone(), item_a_id.clone()),
+        label: "review_fraud".to_string(),
+        created_at: Utc::now().timestamp_millis(),
+    };
+    test.put(&moderator_kp, &exclusion.hs_path(), &exclusion)
+        .await?;
+    assert_seller_fields(&market.seller_id, 2, 2.5, 2.0).await;
+    test.del(&moderator_kp, &exclusion.hs_path()).await?;
+    assert_seller_fields(&market.seller_id, 3, 3.5, 4.0).await;
+
+    test.del(&buyer_kp, &item_a_path).await?;
+    test.del(&buyer_kp, &item_b_path).await?;
+    test.del(&other_kp, &other_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&other_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn copies_updated_at_the_same_time_count_the_lowest_review_id() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewSellerTie").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &seller_profile("Watcher:ReviewSellerTie:Buyer"))
+        .await?;
+    let same_time = "2026-08-20T12:00:00Z";
+    let item_a = rated_item(
+        &market,
+        &buyer_id,
+        &market.listing_a,
+        'f',
+        5,
+        5,
+        4,
+        same_time,
+    );
+    let item_b = rated_item(
+        &market,
+        &buyer_id,
+        &market.listing_b,
+        'f',
+        5,
+        1,
+        2,
+        same_time,
+    );
+    let (item_a_id, item_a_path) = test.create_review(&buyer_kp, &item_a).await?;
+    let (item_b_id, item_b_path) = test.create_review(&buyer_kp, &item_b).await?;
+
+    let (shipping, communication) = if item_a_id < item_b_id {
+        (5.0, 4.0)
+    } else {
+        (1.0, 2.0)
+    };
+    assert_seller_fields(&market.seller_id, 2, shipping, communication).await;
+
+    test.del(&buyer_kp, &item_a_path).await?;
+    test.del(&buyer_kp, &item_b_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
     Ok(())
 }

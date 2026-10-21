@@ -299,6 +299,53 @@ impl ReviewDetails {
         Ok(())
     }
 
+    /// The attested order `(attestor_id, order_ref, role)` a verified review
+    /// belongs to: its seller fields count once per order.
+    pub fn order_key(&self) -> Option<(&str, &str, PubkyAppReviewRole)> {
+        if !self.verified {
+            return None;
+        }
+        match (&self.attestor_id, &self.order_ref) {
+            (Some(attestor_id), Some(order_ref)) => Some((attestor_id, order_ref, self.role)),
+            _ => None,
+        }
+    }
+
+    /// Settles which copy of an attested order's seller fields counts (see
+    /// [`queries::put::resolve_seller_fields`]).
+    pub async fn resolve_seller_fields(
+        attestor_id: &str,
+        order_ref: &str,
+        role: PubkyAppReviewRole,
+    ) -> GraphResult<()> {
+        exec_single_row(queries::put::resolve_seller_fields(
+            attestor_id,
+            order_ref,
+            role.as_str(),
+        ))
+        .await
+    }
+
+    /// Every attested order with a verified review in the graph.
+    pub async fn order_keys() -> GraphResult<Vec<(String, String, PubkyAppReviewRole)>> {
+        let rows = fetch_all_rows_from_graph(queries::get::review_order_keys()).await?;
+        let mut keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            let role: String = row.get("role")?;
+            let role = match role.as_str() {
+                "buyer_reviewing_seller" => PubkyAppReviewRole::BuyerReviewingSeller,
+                "seller_reviewing_buyer" => PubkyAppReviewRole::SellerReviewingBuyer,
+                _ => continue,
+            };
+            if let (Some(attestor_id), Some(order_ref)) =
+                (row.get("attestor_id")?, row.get("order_ref")?)
+            {
+                keys.push((attestor_id, order_ref, role));
+            }
+        }
+        Ok(keys)
+    }
+
     /// The ids of every review the reviewer has in the graph.
     pub async fn ids_of_reviewer(reviewer_id: &str) -> GraphResult<Vec<String>> {
         let rows =

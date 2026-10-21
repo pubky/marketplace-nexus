@@ -69,6 +69,8 @@ pub async fn sync_put(
 
     // ONE COUNT PER ATTESTED ORDER: a scoped record supersedes its legacy twin
     details.resolve_order_twins(prior.as_ref()).await?;
+    // ...and the order's seller fields count on one of its item reviews
+    settle_seller_fields(&details, prior.as_ref()).await?;
 
     // AGGREGATES: recompute the affected scopes from the graph
     recompute_reputation(&details).await?;
@@ -85,6 +87,7 @@ pub async fn del(user_id: PubkyId, review_id: String) -> Result<(), EventProcess
 
     details.delete().await?;
     details.restore_order_twins().await?;
+    settle_seller_fields(&details, None).await?;
     recompute_reputation(&details).await?;
 
     Ok(())
@@ -214,11 +217,33 @@ async fn refresh_moderation(
 ) -> Result<bool, EventProcessorError> {
     match ReviewDetails::refresh_moderation(reviewer_id, review_id, releasing).await? {
         Some(details) => {
+            settle_seller_fields(&details, None).await?;
             recompute_reputation(&details).await?;
             Ok(true)
         }
         None => Ok(false),
     }
+}
+
+/// Settles which item review of the review's attested order carries the
+/// order's counted seller fields, and of the order the record had before an
+/// edit when that differs. Run after anything that changes whether a copy
+/// counts (a write, a deletion, supersession, moderation).
+async fn settle_seller_fields(
+    details: &ReviewDetails,
+    prior: Option<&ReviewDetails>,
+) -> Result<(), EventProcessorError> {
+    let key = details.order_key();
+    if let Some((attestor_id, order_ref, role)) = key {
+        ReviewDetails::resolve_seller_fields(attestor_id, order_ref, role).await?;
+    }
+    if let Some(prior_key) = prior.and_then(ReviewDetails::order_key) {
+        if Some(prior_key) != key {
+            let (attestor_id, order_ref, role) = prior_key;
+            ReviewDetails::resolve_seller_fields(attestor_id, order_ref, role).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Recomputes the subject-scoped aggregate and, for buyer reviews, the

@@ -42,6 +42,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE INDEX postKindIndex IF NOT EXISTS FOR (p:Post) ON (p.kind)",
         "CREATE INDEX taggedLabelIndex IF NOT EXISTS FOR ()-[r:TAGGED]-() ON (r.label)",
         "CREATE INDEX taggedTimestampIndex IF NOT EXISTS FOR ()-[r:TAGGED]-() ON (r.indexed_at)",
+        "CREATE INDEX reviewedOrderRefIndex IF NOT EXISTS FOR ()-[r:REVIEWED]-() ON (r.order_ref)",
         "CREATE INDEX fileIdIndex IF NOT EXISTS FOR (f:File) ON (f.owner_id, f.id)",
         "CREATE INDEX homeserverIdIndex IF NOT EXISTS FOR (hs:Homeserver) ON (hs.id)",
         "CREATE INDEX shopOwnerIdIndex IF NOT EXISTS FOR (s:Shop) ON (s.owner_id)",

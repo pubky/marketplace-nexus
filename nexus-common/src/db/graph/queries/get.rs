@@ -1070,6 +1070,29 @@ pub fn review_moderation(
     .param("releasing_tag_id", releasing_tag_id)
 }
 
+/// The distinct attested orders `(attestor_id, order_ref, role)` of the
+/// verified review edges.
+pub fn review_order_keys() -> Query {
+    Query::new(
+        "review_order_keys",
+        "MATCH (:User)-[r:REVIEWED]->(:User)
+         WHERE r.verified AND r.attestor_id IS NOT NULL AND r.order_ref IS NOT NULL
+         RETURN DISTINCT r.attestor_id AS attestor_id, r.order_ref AS order_ref, r.role AS role",
+    )
+}
+
+/// The distinct review scopes whose aggregates exist: `(subject_id, role)`
+/// and, for buyer reviews, `(listing_owner_id, listing_id)`.
+pub fn review_aggregate_scopes() -> Query {
+    Query::new(
+        "review_aggregate_scopes",
+        "MATCH (:User)-[r:REVIEWED]->(subject:User)
+         RETURN DISTINCT subject.id AS subject_id, r.role AS role,
+             CASE WHEN r.role = 'buyer_reviewing_seller' THEN r.listing_owner_id END AS listing_owner_id,
+             CASE WHEN r.role = 'buyer_reviewing_seller' THEN r.listing_id END AS listing_id",
+    )
+}
+
 /// The ids of every user who has a review in the graph.
 pub fn reviewer_ids() -> Query {
     Query::new(
@@ -1631,8 +1654,12 @@ pub fn get_tag_by_tagger_and_id(tagger_id: &str, tag_id: &str) -> Query {
 
 /// The aggregate projection shared by the reputation queries. Averages skip
 /// null sub-ratings (Cypher `avg` ignores nulls); the attestor list carries
-/// one entry per verified review for per-attestor counting in Rust.
-const REPUTATION_RETURN: &str = "
+/// one entry per verified review for per-attestor counting in Rust. The
+/// seller fields (shipping, communication) are averaged over the reviews
+/// matching `seller_fields`, a Cypher condition on `r`.
+fn reputation_return(seller_fields: &str) -> String {
+    format!(
+        "
         RETURN count(r) AS total,
             sum(CASE WHEN r.verified THEN 1 ELSE 0 END) AS verified_count,
             avg(toFloat(r.rating_overall)) AS average,
@@ -1642,13 +1669,22 @@ const REPUTATION_RETURN: &str = "
             sum(CASE WHEN r.rating_overall = 4 THEN 1 ELSE 0 END) AS stars_4,
             sum(CASE WHEN r.rating_overall = 5 THEN 1 ELSE 0 END) AS stars_5,
             avg(toFloat(r.rating_item_accuracy)) AS avg_item_accuracy,
-            avg(toFloat(r.rating_shipping)) AS avg_shipping,
-            avg(toFloat(r.rating_communication)) AS avg_communication,
+            avg(CASE WHEN {seller_fields} THEN toFloat(r.rating_shipping) END) AS avg_shipping,
+            avg(CASE WHEN {seller_fields} THEN toFloat(r.rating_communication) END) AS avg_communication,
             sum(CASE WHEN r.has_response THEN 1 ELSE 0 END) AS response_count,
             sum(CASE WHEN r.edited_late THEN 1 ELSE 0 END) AS edited_late_count,
             [x IN collect(CASE WHEN r.verified THEN r.attestor_id ELSE null END) WHERE x IS NOT NULL] AS attestors,
             max(r.created_at) AS last_reviewed_at
-        ";
+        "
+    )
+}
+
+/// A seller's shipping and communication ratings are written on every item
+/// review of an order and count once per `(iss, order_ref, role)`: only on
+/// the copy flagged `seller_fields_counted` (see
+/// [`crate::db::graph::queries::put::resolve_seller_fields`]). An edge
+/// without the flag counts its own.
+const SELLER_FIELDS_ONCE_PER_ORDER: &str = "coalesce(r.seller_fields_counted, true)";
 
 /// The aggregates leave out reviews the moderator excluded (see
 /// [`crate::models::marketplace::ReviewModerationState::Excluded`]).
@@ -1687,13 +1723,15 @@ pub fn review_order_twins(
 
 /// Aggregates every `REVIEWED` edge pointing at a subject in one role into
 /// the reputation summary row, leaving out legacy records superseded by
-/// their order-scoped twin and reviews moderation excluded.
+/// their order-scoped twin and reviews moderation excluded. Seller fields
+/// count once per attested order.
 pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
     let cypher = format!(
         "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
         WHERE r.role = $role AND coalesce(r.superseded, false) = false
             AND {REPUTATION_NOT_EXCLUDED}
-        {REPUTATION_RETURN}"
+        {}",
+        reputation_return(SELLER_FIELDS_ONCE_PER_ORDER)
     );
     Query::new("subject_reputation", &cypher)
         .param("subject_id", subject_id.to_string())
@@ -1701,16 +1739,18 @@ pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
 }
 
 /// Aggregates the buyer reviews of one listing into the reputation summary
-/// row, with the same exclusions as [`subject_reputation`]. For
-/// `buyer_reviewing_seller` reviews the subject is the listing owner, which
-/// anchors the scan.
+/// row, with the same exclusions as [`subject_reputation`]. One order has one
+/// review per listing, so every counted review's seller fields count here.
+/// For `buyer_reviewing_seller` reviews the subject is the listing owner,
+/// which anchors the scan.
 pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
     let cypher = format!(
         "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
         WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id
             AND coalesce(r.superseded, false) = false
             AND {REPUTATION_NOT_EXCLUDED}
-        {REPUTATION_RETURN}"
+        {}",
+        reputation_return("true")
     );
     Query::new("listing_reputation", &cypher)
         .param("listing_owner_id", listing_owner_id.to_string())
