@@ -9,8 +9,9 @@ use nexus_common::db::PubkyConnector;
 use nexus_common::models::homeserver::Homeserver;
 use opentelemetry::trace::{FutureExt, Span, TraceContextExt, Tracer};
 use opentelemetry::{global, Context, KeyValue};
-use pubky::Method;
+use pubky::{Method, PublicKey};
 use pubky_app_specs::PubkyId;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,6 +154,7 @@ impl EventProcessor {
     /// # Parameters
     /// - `lines`: A vector of strings representing event lines retrieved from the homeserver.
     pub async fn process_event_lines(&self, lines: Vec<String>) -> Result<(), EventProcessorError> {
+        let mut hosting_by_user: HashMap<PubkyId, UserHosting> = HashMap::new();
         for line in &lines {
             let id = self.homeserver.id.clone();
 
@@ -173,6 +175,26 @@ impl EventProcessor {
                     .unwrap_or(None);
 
                 if let Some(event) = maybe_event {
+                    let user_id = &event.parsed_uri.user_id;
+                    let hosting = match hosting_by_user.get(user_id) {
+                        Some(hosting) => *hosting,
+                        None => {
+                            let hosting = self.user_hosting(user_id).await?;
+                            hosting_by_user.insert(user_id.clone(), hosting);
+                            hosting
+                        }
+                    };
+                    if hosting != UserHosting::Here {
+                        warn!(
+                            homeserver = %id,
+                            user_id = %user_id,
+                            hosting = ?hosting,
+                            "Skipping event of a user this homeserver does not host: {}",
+                            event.uri
+                        );
+                        continue;
+                    }
+
                     let tracer = global::tracer(self.tracer_name.clone());
                     let mut span = tracer.start(event.parsed_uri.resource.to_string());
                     span.set_attribute(KeyValue::new("event.uri", event.uri.clone()));
@@ -195,6 +217,22 @@ impl EventProcessor {
         Ok(())
     }
 
+    /// Where the user's own Pkarr record says they are hosted, relative to this homeserver.
+    ///
+    /// A homeserver's event feed is only authoritative for the users it hosts: any homeserver
+    /// can list a line for any user's path, so a line for a user hosted elsewhere is not theirs.
+    async fn user_hosting(&self, user_id: &PubkyId) -> Result<UserHosting, EventProcessorError> {
+        let Ok(user_pk) = user_id.parse::<PublicKey>() else {
+            return Ok(UserHosting::Unresolved);
+        };
+        let pubky = PubkyConnector::get()?;
+        let resolved = pubky.get_homeserver_of(&user_pk).await.map(|hs| hs.z32());
+        Ok(UserHosting::classify(
+            resolved.as_deref(),
+            self.homeserver.id.as_ref(),
+        ))
+    }
+
     /// Processes an event and track the fail event it if necessary
     /// # Parameters:
     /// - `event`: The event to be processed
@@ -208,6 +246,28 @@ impl EventProcessor {
             }
         }
         Ok(())
+    }
+}
+
+/// A user's homeserver, as their Pkarr record publishes it, relative to the polled homeserver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserHosting {
+    /// The user's record names the polled homeserver.
+    Here,
+    /// The user's record names another homeserver.
+    Elsewhere,
+    /// No homeserver could be resolved for the user. Their records can't be fetched either, so
+    /// their PUTs could not be applied; a DEL is not taken on the polled homeserver's word.
+    Unresolved,
+}
+
+impl UserHosting {
+    pub fn classify(resolved_homeserver: Option<&str>, polled_homeserver: &str) -> Self {
+        match resolved_homeserver {
+            Some(hs) if hs == polled_homeserver => UserHosting::Here,
+            Some(_) => UserHosting::Elsewhere,
+            None => UserHosting::Unresolved,
+        }
     }
 }
 
@@ -240,7 +300,23 @@ fn extract_retry_event_info(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventProcessor, HomeserverPollBackoff};
+    use super::{EventProcessor, HomeserverPollBackoff, UserHosting};
+
+    #[test]
+    fn events_are_only_applied_for_users_hosted_on_the_polled_homeserver() {
+        assert_eq!(
+            UserHosting::classify(Some("polled"), "polled"),
+            UserHosting::Here
+        );
+        assert_eq!(
+            UserHosting::classify(Some("other"), "polled"),
+            UserHosting::Elsewhere
+        );
+        assert_eq!(
+            UserHosting::classify(None, "polled"),
+            UserHosting::Unresolved
+        );
+    }
 
     #[test]
     fn recognizes_plain_text_events_rate_limit_response() {

@@ -349,8 +349,14 @@ pub async fn listing_record_on_homeserver(
     listing_id: &str,
 ) -> Result<HomeserverRecord, EventProcessorError> {
     let uri = listing_uri_builder(owner_id.to_string(), listing_id.to_string());
+    record_on_homeserver(&uri).await
+}
+
+/// Asks the homeserver the record's owner publishes whether the record at `uri` exists, with
+/// the same definitive-answer rule as [listing_record_on_homeserver].
+pub async fn record_on_homeserver(uri: &str) -> Result<HomeserverRecord, EventProcessorError> {
     let pubky = PubkyConnector::get()?;
-    match pubky.public_storage().get(&uri).await {
+    match pubky.public_storage().get(uri).await {
         Ok(_) => Ok(HomeserverRecord::Present),
         Err(e) if is_homeserver_not_found(&e) => Ok(HomeserverRecord::Gone),
         Err(e) => Err(e.into()),
