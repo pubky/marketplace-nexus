@@ -4246,8 +4246,8 @@ dependencies = [
 
 [[package]]
 name = "pubky-app-specs"
-version = "0.6.2-marketplace.14"
-source = "git+https://github.com/BitcoinErrorLog/pubky-app-specs.git?rev=30643e602e8979630f9b486db76972e60fdbd134#30643e602e8979630f9b486db76972e60fdbd134"
+version = "0.6.2-marketplace.15"
+source = "git+https://github.com/BitcoinErrorLog/pubky-app-specs.git?rev=695c0f7af3ac02e1b726d8a82eee17f114d2da59#695c0f7af3ac02e1b726d8a82eee17f114d2da59"
 dependencies = [
  "base32",
  "blake3",
