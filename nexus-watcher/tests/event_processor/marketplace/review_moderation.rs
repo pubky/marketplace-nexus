@@ -9,6 +9,8 @@ use crate::event_processor::utils::watcher::{
 };
 use anyhow::Result;
 use chrono::Utc;
+use nexus_common::db::kv::put_field_if_exists;
+use nexus_common::db::RedisOps;
 use nexus_common::models::event::EventProcessorError;
 use nexus_common::models::marketplace::{
     ExcludedReviewer, ModeratedReview, ModeratedUser, ReputationSummary, ReviewDetails,
@@ -679,6 +681,42 @@ async fn a_rederivation_during_a_release_does_not_bring_the_moderation_back() ->
     }
 
     test.del(&buyer_kp, &review_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// A re-derivation reads the indexed review before it writes the moderation.
+/// The review deleted in between must stay deleted.
+#[tokio_shared_rt::test(shared)]
+async fn a_moderation_write_after_the_review_is_deleted_does_not_index_it_again() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewDeleteRace").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &seller_profile("Watcher:ReviewDeleteRace:Buyer"))
+        .await?;
+    let review = buyer_review(&market, &buyer_id, 'd', 4, "Deleted while re-derived.");
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+    assert!(ReviewDetails::get_from_index(&buyer_id, &review_id)
+        .await?
+        .is_some());
+
+    test.del(&buyer_kp, &review_path).await?;
+    // The write a re-derivation that read the review before the deletion makes.
+    let written = put_field_if_exists(
+        &ReviewDetails::prefix().await,
+        &format!("{buyer_id}:{review_id}"),
+        "moderation",
+        &moderation(ReviewModerationState::Excluded, EXCLUDE_LABEL),
+    )
+    .await?;
+    assert!(!written);
+    assert!(ReviewDetails::get_from_index(&buyer_id, &review_id)
+        .await?
+        .is_none());
+    assert_counted(&market, 0, 0.0).await;
+
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
     Ok(())

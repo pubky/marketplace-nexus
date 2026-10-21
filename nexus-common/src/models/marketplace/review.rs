@@ -1,5 +1,5 @@
 use super::{ReviewModeration, ReviewResponseDetails};
-use crate::db::kv::{RedisResult, SortOrder};
+use crate::db::kv::{put_field_if_exists, RedisResult, SortOrder};
 use crate::db::{
     exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, queries, GraphResult,
     OperationOutcome, RedisOps,
@@ -324,7 +324,8 @@ impl ReviewDetails {
     /// [`ReviewModeration::get`]) and stores it on the edge and the details
     /// JSON. Returns the updated details when the moderation changed, `None`
     /// when it did not or the review is not indexed (its ingest reads the
-    /// markers).
+    /// markers). Only the JSON's `moderation` field is written, and only while
+    /// the review is still indexed: a review deleted meanwhile stays deleted.
     pub async fn refresh_moderation(
         reviewer_id: &str,
         review_id: &str,
@@ -342,10 +343,17 @@ impl ReviewDetails {
             moderation.as_ref(),
         ))
         .await?;
+        let indexed = put_field_if_exists(
+            &Self::prefix().await,
+            &[reviewer_id, review_id].join(":"),
+            "moderation",
+            &moderation,
+        )
+        .await?;
+        if !indexed {
+            return Ok(None);
+        }
         details.moderation = moderation;
-        details
-            .put_index_json(&[reviewer_id, review_id], None, None)
-            .await?;
         Ok(Some(details))
     }
 
