@@ -528,3 +528,78 @@ async fn the_one_shot_recompute_recounts_reviews_indexed_before_per_item_countin
     test.cleanup_user(&market.seller_kp).await?;
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn an_empty_text_item_review_counts_like_any_other_and_oversized_text_is_rejected(
+) -> Result<()> {
+    use pubky_app_specs::traits::{HasIdPath, HashId};
+
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewEmptyText").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &seller_profile("Watcher:ReviewEmptyText:Buyer"))
+        .await?;
+
+    // Item A: a rating with no text at all (0 characters).
+    let mut empty = item_review(&market, &buyer_id, &market.listing_a, 'f', 4, true);
+    empty.text = String::new();
+    let (empty_id, empty_path) = test.create_review(&buyer_kp, &empty).await?;
+    let indexed = ReviewDetails::get_from_index(&buyer_id, &empty_id)
+        .await?
+        .expect("an empty-text review is indexed");
+    assert_eq!(indexed.text, "");
+    assert!(indexed.verified);
+    assert!(indexed.order_scoped);
+    assert!(!indexed.superseded);
+    assert_eq!(summary_of_seller(&market.seller_id).await.count, 1);
+    let listing_a = ReputationSummary::get_by_listing(&market.seller_id, &market.listing_a)
+        .await?
+        .expect("the listing aggregate exists");
+    assert_eq!((listing_a.count, listing_a.avg), (1, 4.0));
+
+    // Item B of the same order with 5,001 characters: specs refuses it, so
+    // nothing is indexed and no aggregate moves.
+    let mut oversized = item_review(&market, &buyer_id, &market.listing_b, 'f', 2, true);
+    oversized.text = "a".repeat(5_001);
+    let oversized_id = oversized.create_id();
+    oversized.review_id = oversized_id.clone();
+    let oversized_path: ResourcePath =
+        PubkyAppMarketplaceReview::create_path(&oversized_id).parse()?;
+    let _ = test.put(&buyer_kp, &oversized_path, &oversized).await;
+    assert!(
+        ReviewDetails::get_from_index(&buyer_id, &oversized_id)
+            .await?
+            .is_none(),
+        "5,001 characters stay rejected"
+    );
+    assert_eq!(summary_of_seller(&market.seller_id).await.count, 1);
+    assert!(
+        ReputationSummary::get_by_listing(&market.seller_id, &market.listing_b)
+            .await?
+            .is_none(),
+        "the rejected review is not counted for its listing"
+    );
+
+    // The same review with exactly 5,000 characters is accepted and counted
+    // per item next to the empty-text one.
+    let mut longest = item_review(&market, &buyer_id, &market.listing_b, 'f', 2, true);
+    longest.text = "a".repeat(5_000);
+    let (longest_id, longest_path) = test.create_review(&buyer_kp, &longest).await?;
+    let indexed = ReviewDetails::get_from_index(&buyer_id, &longest_id)
+        .await?
+        .expect("5,000 characters are accepted");
+    assert_eq!(indexed.text.chars().count(), 5_000);
+    let seller = summary_of_seller(&market.seller_id).await;
+    assert_eq!((seller.count, seller.avg), (2, 3.0));
+    let listing_b = ReputationSummary::get_by_listing(&market.seller_id, &market.listing_b)
+        .await?
+        .expect("the listing aggregate exists");
+    assert_eq!((listing_b.count, listing_b.avg), (1, 2.0));
+
+    test.del(&buyer_kp, &empty_path).await?;
+    test.del(&buyer_kp, &longest_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
