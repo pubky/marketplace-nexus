@@ -96,7 +96,7 @@ mod tests {
     use super::*;
 
     const FIXTURE_REDIS: &str = "redis://user:pass@host:6379/0";
-    const FIXTURE_BOLT: &str = "bolt://neo4j.railway.internal:7687";
+    const FIXTURE_BOLT: &str = "bolt://neo4j.internal:7687";
 
     const RESERVE_SCRUB_MIGRATION_CONFIG_TOML: &str = r#"
 name = "nexusd.migration"
@@ -112,7 +112,7 @@ files_path = "/data/static/files"
 redis = "redis://user:pass@host:6379/0"
 
 [stack.db.neo4j]
-uri = "bolt://neo4j.railway.internal:7687"
+uri = "bolt://neo4j.internal:7687"
 password = "fixture-neo4j-password"
 "#;
 

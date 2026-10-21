@@ -8,7 +8,7 @@ Scope: this document covers the dedicated Pubky Marketplace ("Shop") Nexus fork 
 
 On first boot, the watcher starts from cursor `0000000000000`.
 
-The start cursor is not a CLI argument, not a Railway env var, and not present in `WatcherConfig`. It comes from the `Homeserver` model default:
+The start cursor is not a CLI argument, not a deployment env var, and not present in `WatcherConfig`. It comes from the `Homeserver` model default:
 
 - `nexus-common/src/models/homeserver.rs:32-38` defines `Homeserver::new(id)` with `cursor: "0000000000000"`.
 - `nexus-watcher/src/service/mod.rs:74-77` calls `Homeserver::persist_if_unknown(config_hs)` before the event loop starts.
@@ -23,10 +23,8 @@ On every poll, the watcher uses the persisted cursor:
 - `nexus-watcher/src/service/processor.rs:130-135` handles `cursor: ...` lines from the homeserver by creating `Homeserver::try_from_cursor(id, cursor)` and writing that value back to Redis.
 - `nexus-common/src/models/homeserver.rs:84-93` reads Redis first and falls back to the graph only when no Redis record exists; the graph fallback uses `Homeserver::new`, so it also falls back to cursor zero.
 
-The Railway entrypoint exposes only homeserver id and replay tuning:
+The deployment configuration exposes only homeserver id and replay tuning, in `[watcher]` of `config.toml` (`homeserver`, `events_limit`, `watcher_sleep`):
 
-- `entrypoint-railway.sh:3-16` reads `NEXUS_HOMESERVER`, `NEXUS_EVENTS_LIMIT`, and `NEXUS_WATCHER_SLEEP`.
-- `entrypoint-railway.sh:31-39` writes those values into `[watcher]` in `/data/config.toml`.
 - `nexus-common/src/config/watcher.rs:34-50` defines `WatcherConfig`; there is no cursor, tail, or start-position field.
 - `nexusd/src/cli.rs:35-68` exposes `api`, `watcher`, and `run` with only `--config-dir`; there is no cursor flag.
 
@@ -39,7 +37,7 @@ No. This fork currently supports only "resume from the Redis cursor if already p
 The smallest production-grade change would be:
 
 1. Add an optional `initial_cursor: Option<String>` or `start_cursor: Option<String>` to `WatcherConfig` in `nexus-common/src/config/watcher.rs`.
-2. Add `NEXUS_INITIAL_CURSOR` to `entrypoint-railway.sh` and write it into `[watcher]` only when set.
+2. Expose it in the deployment's `[watcher]` configuration, written only when set.
 3. In `NexusWatcher::start` (`nexus-watcher/src/service/mod.rs:70-80`), before or inside `Homeserver::persist_if_unknown`, check whether `Homeserver::get_from_index(&config_hs).await?` already exists. If not, persist `Homeserver::try_from_cursor(config_hs.clone(), initial_cursor)?.put_to_index().await?` instead of letting `Homeserver::new` seed cursor zero.
 4. Keep the persisted cursor key the same: the `Homeserver` Redis JSON entry keyed by the homeserver id (`Homeserver:<homeserver_pubky>`), written by `Homeserver::put_to_index()` in `nexus-common/src/models/homeserver.rs:75-81`.
 
@@ -216,7 +214,7 @@ curl "https://homeserver.pubky.app/events/?cursor=0000000000000&limit=1"
 
 That confirms first-page behavior and the returned `cursor:` line, but it is not a count. Counting exactly requires walking pages until empty, which is effectively the replay. If the homeserver has an administrative count metric or a documented tail cursor endpoint, use that instead; it is not referenced in this repo.
 
-Using the observed Railway staging replay throughput from `docs/railway-deploy.md:57-64` (100-160 events/minute), estimated cold replay wall time is:
+Using the observed staging replay throughput from `docs/operations.md` (100-160 events/minute), estimated cold replay wall time is:
 
 | Production event count | At 160 events/min | At 100 events/min |
 | ---: | ---: | ---: |
@@ -224,7 +222,7 @@ Using the observed Railway staging replay throughput from `docs/railway-deploy.m
 | 1,000,000 | ~104.2 hours / 4.3 days | ~166.7 hours / 6.9 days |
 | 3,000,000 | ~312.5 hours / 13.0 days | ~500.0 hours / 20.8 days |
 
-The staging note also matters qualitatively: each PUT fetches the public record, and the event stream has no path filter (`docs/railway-deploy.md:47-56`), so marketplace-only replay is not currently possible.
+The staging note also matters qualitatively: each PUT fetches the public record, and the event stream has no path filter (`docs/operations.md`), so marketplace-only replay is not currently possible.
 
 ## 5. Recommendation
 
@@ -237,26 +235,34 @@ Rationale:
 - The existing review backfill cannot compensate for tail-start because it scans indexed users, and tail-start initially has no complete indexed user set.
 - A targeted seller-backfill script could work, but no such script exists in this repo. It would need to discover sellers from Shop's production data source, fetch each seller profile/shop/listings/drops/reviews/tags in dependency order, and preserve the same validation paths. That is more operational risk than a slow cold replay.
 
-### Production Railway service config
+### Production service config
 
 Set the production service to a fresh Neo4j volume and fresh Redis volume unless intentionally resuming an already verified replay.
 
-Required:
+Required, in `config.toml`:
 
 ```toml
-NEXUS_HOMESERVER=8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty
-NEXUS_TESTNET=false
-NEXUS_NEO4J_URI=bolt://neo4j.railway.internal:7687
-NEXUS_NEO4J_PASSWORD=<secret>
-NEXUS_REDIS_URL=${{Redis.REDIS_URL}}
-PORT=8080
+[watcher]
+testnet = false
+homeserver = "8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty"
+
+[api]
+public_addr = "0.0.0.0:8080"
+
+[stack.db]
+redis = "<redis url>"
+
+[stack.db.neo4j]
+uri = "<neo4j bolt uri>"
+password = "<secret>"
 ```
 
-Recommended replay tuning, matching the existing Railway entrypoint knobs:
+Recommended replay tuning:
 
 ```toml
-NEXUS_EVENTS_LIMIT=1000
-NEXUS_WATCHER_SLEEP=500
+[watcher]
+events_limit = 1000
+watcher_sleep = 500
 ```
 
 Homeserver URL for operator verification: `https://homeserver.pubky.app`.
@@ -278,7 +284,7 @@ Before pointing Shop at the production marketplace Nexus URL:
 
 1. Health:
    - `GET https://<production-marketplace-nexus>/v0/info` returns 200.
-   - Railway logs show `Processing N event lines` and `Received cursor for the next request`.
+   - The service log shows `Processing N event lines` and `Received cursor for the next request`.
    - Redis contains the production homeserver cursor under the `Homeserver:<production_homeserver_pubky>` JSON key.
 2. Empty-read readiness:
    - `GET https://<production-marketplace-nexus>/v0/stream/listings` returns 200 with an empty list or a valid listing stream, not 500.
@@ -299,5 +305,5 @@ Before pointing Shop at the production marketplace Nexus URL:
 
 - No `upstream` remote exists in this checkout, so direct `git merge-base HEAD upstream/main` comparison could not be performed. The upstream-safety conclusion is reasoned from this fork's README, current dependency fork, and event dispatch/fallback code.
 - I did not make any production homeserver requests. The replay-size request examples are operator instructions only.
-- I did not find a tracked `status.md` file in this repo. The review backfill behavior was verified from `docs/railway-deploy.md`, `README.md`, `nexusd/src/migrations/migrations_list/review_backfill_1787905961.rs`, `nexus-watcher/src/events/handlers/review.rs`, and `nexus-common/src/db/reindex.rs`.
+- I did not find a tracked `status.md` file in this repo. The review backfill behavior was verified from `docs/operations.md`, `README.md`, `nexusd/src/migrations/migrations_list/review_backfill_1787905961.rs`, `nexus-watcher/src/events/handlers/review.rs`, and `nexus-common/src/db/reindex.rs`.
 - Only `docs/production-cutover.md` was created; no other files were modified.

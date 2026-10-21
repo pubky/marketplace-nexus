@@ -112,14 +112,14 @@ mod tests {
         assert_eq!(c.stack.db.neo4j.uri, "bolt://localhost:7687");
     }
 
-    /// Railway `/data/config.toml` (entrypoint-railway.sh) and the reserve-scrub
-    /// `~/.pubky-nexus/migrations/config.toml` layout (docs/railway-deploy.md).
+    /// A generated `/data/config.toml` and the reserve-scrub
+    /// `~/.pubky-nexus/migrations/config.toml` layout (docs/operations.md).
     /// Redis userinfo is the fake fixture `redis://user:pass@host:6379/0`, never a
     /// production URL.
     const FIXTURE_REDIS: &str = "redis://user:pass@host:6379/0";
-    const FIXTURE_BOLT: &str = "bolt://neo4j.railway.internal:7687";
+    const FIXTURE_BOLT: &str = "bolt://neo4j.internal:7687";
 
-    const RAILWAY_DATA_CONFIG_TOML: &str = r#"
+    const GENERATED_DATA_CONFIG_TOML: &str = r#"
 [api]
 name = "nexusd.api"
 public_ip = "0.0.0.0"
@@ -145,7 +145,7 @@ files_path = "/data/static/files"
 redis = "redis://user:pass@host:6379/0"
 
 [stack.db.neo4j]
-uri = "bolt://neo4j.railway.internal:7687"
+uri = "bolt://neo4j.internal:7687"
 password = "fixture-neo4j-password"
 "#;
 
@@ -163,7 +163,7 @@ files_path = "/data/static/files"
 redis = "redis://user:pass@host:6379/0"
 
 [stack.db.neo4j]
-uri = "bolt://neo4j.railway.internal:7687"
+uri = "bolt://neo4j.internal:7687"
 password = "fixture-neo4j-password"
 "#;
 
@@ -229,14 +229,14 @@ password = "fixture-neo4j-password"
     }
 
     #[test]
-    fn railway_config_without_allowed_homeservers_allows_all() {
-        let daemon = DaemonConfig::try_from_str(RAILWAY_DATA_CONFIG_TOML).expect("parses");
+    fn generated_config_without_allowed_homeservers_allows_all() {
+        let daemon = DaemonConfig::try_from_str(GENERATED_DATA_CONFIG_TOML).expect("parses");
         assert!(daemon.stack.allowed_homeservers.is_empty());
     }
 
     #[test]
-    fn railway_config_reads_allowed_homeservers() {
-        let toml = RAILWAY_DATA_CONFIG_TOML.replace(
+    fn generated_config_reads_allowed_homeservers() {
+        let toml = GENERATED_DATA_CONFIG_TOML.replace(
             "files_path = \"/data/static/files\"",
             "files_path = \"/data/static/files\"\nallowed_homeservers = [\"8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty\"]",
         );
@@ -252,7 +252,7 @@ password = "fixture-neo4j-password"
             ["8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty"]
         );
 
-        let bad = RAILWAY_DATA_CONFIG_TOML.replace(
+        let bad = GENERATED_DATA_CONFIG_TOML.replace(
             "files_path = \"/data/static/files\"",
             "files_path = \"/data/static/files\"\nallowed_homeservers = [\"not-a-pubky\"]",
         );
@@ -261,8 +261,8 @@ password = "fixture-neo4j-password"
 
     #[test]
     fn production_toml_shapes_round_trip_raw_urls_and_redact_display() {
-        let daemon = DaemonConfig::try_from_str(RAILWAY_DATA_CONFIG_TOML)
-            .expect("Railway /data/config.toml shape parses");
+        let daemon = DaemonConfig::try_from_str(GENERATED_DATA_CONFIG_TOML)
+            .expect("generated /data/config.toml shape parses");
         assert_eq!(
             daemon.api.public_addr,
             SocketAddr::from(([0, 0, 0, 0], 8080))
