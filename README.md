@@ -43,6 +43,13 @@ hosting is out of scope for it.
   and by `attestors=`, sort by `newest|value|rating_desc|rating_asc`, and
   return the counted `matched` figures; reach and tags see the follows and
   tags between indexed users only.
+- **Attestor profile and annotations**: an attestor's profile (operator,
+  keys with their validity windows) and its per-order annotations
+  (refunded, returned) are indexed only when their proof verifies against
+  the attestor pubky, and served verbatim, proof included, so clients can
+  verify them offline: `GET /v0/marketplace/attestor/{attestor_id}/profile`
+  and `GET /v0/marketplace/attestor/{attestor_id}/annotations?order_refs=…`
+  (one entry per requested `order_ref`, `null` where none is indexed).
 - Marketplace tag aggregation endpoints for listings and shops.
 - The index stays deliberately **lossy**: variants, shipping options,
   attributes, digital-lock details, and any live stock/order state are

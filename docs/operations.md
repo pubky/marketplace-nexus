@@ -94,6 +94,22 @@ PUT costs at least one content fetch from the homeserver), i.e. a full cold
 replay takes on the order of half a day. Progress can be tracked in the
 service log by the "cursor for the next request" lines.
 
+### Attestor records: the attestor's homeserver must be polled
+
+The attestor publishes its profile
+(`/pub/pubky.app/marketplace/v1/attestor/profile`) and one annotation per
+attested order (`/pub/pubky.app/marketplace/v1/attestor/annotations/{order_ref}`)
+on its own homeserver. Like every record, they are indexed only from a
+homeserver the watcher polls: with `[stack] allowed_homeservers` set to the
+deployment's own homeserver, an attestor whose account lives on any other
+homeserver is never indexed, and `/v0/marketplace/attestor/...` answers 404 and
+`null` entries for it.
+
+There is no backfill for these records. A watcher older than the release that
+indexes them skips their events, so the release must be live before the
+attestor starts publishing; a record published earlier is indexed only when the
+attestor publishes it again.
+
 ## Running the backfill migrations
 
 One-shot migrations (see the runbook in `README.md`):
