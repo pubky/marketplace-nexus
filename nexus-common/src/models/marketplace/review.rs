@@ -1,4 +1,6 @@
-use super::{ReviewModeration, ReviewResponseDetails};
+use super::{
+    AttestorWindow, CountedReview, ReputationBucket, ReviewModeration, ReviewResponseDetails,
+};
 use crate::db::kv::{RedisResult, SortOrder};
 use crate::db::{
     exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, queries, GraphResult,
@@ -12,6 +14,7 @@ use pubky_app_specs::{
     PubkyAppReviewRole, PubkyId,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use utoipa::ToSchema;
 
 pub const REVIEW_SUBJECT_KEY_PARTS: [&str; 2] = ["Reviews", "Subject"];
@@ -564,6 +567,17 @@ impl ReviewStream {
             })
             .collect();
 
+        let views = Self::hydrate(&review_keys).await?;
+        Ok((!views.is_empty()).then_some(Self(views)))
+    }
+
+    /// Reads the indexed details of `(reviewer_id, review_id)` reviews, in
+    /// order, with their responses joined. Reviews missing from the index
+    /// are skipped.
+    async fn hydrate(review_keys: &[(String, String)]) -> ModelResult<Vec<ReviewView>> {
+        if review_keys.is_empty() {
+            return Ok(Vec::new());
+        }
         let review_key_slices: Vec<Vec<&str>> = review_keys
             .iter()
             .map(|(reviewer, review_id)| vec![reviewer.as_str(), review_id.as_str()])
@@ -578,7 +592,7 @@ impl ReviewStream {
                 .collect();
 
         if reviews.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         // Responses live under [responder == subject, review_id].
@@ -591,17 +605,332 @@ impl ReviewStream {
         let responses =
             ReviewResponseDetails::try_from_index_multiple_json(&response_key_refs).await?;
 
-        let views = reviews
+        Ok(reviews
             .into_iter()
             .zip(responses)
             .map(|(review, response)| ReviewView {
                 review: review.public(),
                 response,
             })
-            .collect();
-
-        Ok(Some(Self(views)))
+            .collect())
     }
+
+    /// Retrieves a page of a scope's reviews under `filter`, sorted by
+    /// `filter.sort`, with the counted figures of every match (not only the
+    /// page) in `matched`. Reads the scope from the graph: a scope holds one
+    /// seller's (or one listing's) reviews, so matching, sorting and counting
+    /// run over the whole scope in memory.
+    pub async fn get_filtered(
+        scope: &ReviewStreamScope,
+        filter: &ReviewStreamFilter,
+        pagination: Pagination,
+    ) -> ModelResult<FilteredReviewStream> {
+        let query = queries::get::filtered_review_rows(
+            scope,
+            &filter.reviewers,
+            pagination.start,
+            pagination.end,
+        );
+        let mut rows = Vec::new();
+        for row in fetch_all_rows_from_graph(query).await? {
+            rows.push(FilteredReviewRow {
+                reviewer_id: row.get("reviewer_id")?,
+                review_id: row.get("review_id")?,
+                indexed_at: row.get("indexed_at")?,
+                rating_overall: row.get("rating_overall")?,
+                price_weight: row.get("price_weight")?,
+                attestor_id: row.get("attestor_id")?,
+                order_ref: row.get("order_ref")?,
+                iat: row.get("iat")?,
+                counted: row.get("counted")?,
+            });
+        }
+        let (page, matched) = filter.apply(rows, pagination.skip, pagination.limit);
+        let reviews = Self::hydrate(&page).await?;
+        Ok(FilteredReviewStream { reviews, matched })
+    }
+}
+
+/// The scope a filtered review stream reads: the reviews about a subject in
+/// one role, or the buyer reviews of one listing.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReviewStreamScope {
+    Subject {
+        subject_id: String,
+        role: PubkyAppReviewRole,
+    },
+    Listing {
+        listing_owner_id: String,
+        listing_id: String,
+    },
+}
+
+/// The viewer's social reach a filtered review stream keeps reviewers from.
+#[derive(Deserialize, Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewReach {
+    /// Reviewers the viewer follows.
+    Following,
+    /// Reviewers the viewer follows who follow the viewer back.
+    Friends,
+    /// Reviewers within `depth` follow hops of the viewer.
+    Wot,
+}
+
+/// The review stream orders.
+#[derive(Deserialize, Serialize, ToSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSort {
+    /// Newest indexed first (the unfiltered stream's order).
+    #[default]
+    Newest,
+    /// Highest price weight first; reviews without one last.
+    Value,
+    /// Highest `ratings.overall` first.
+    RatingDesc,
+    /// Lowest `ratings.overall` first.
+    RatingAsc,
+}
+
+/// Most labels `tagged_by_viewer` may carry.
+pub const MAX_TAGGED_BY_VIEWER_LABELS: usize = 5;
+/// The follow hops `reach=wot` takes without `depth`.
+pub const DEFAULT_WOT_DEPTH: u8 = 2;
+/// The deepest `reach=wot` traversal.
+pub const MAX_WOT_DEPTH: u8 = 3;
+
+/// Which reviewers a filtered review stream keeps, relative to the viewer.
+/// The graph only holds follows and tags between indexed users.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReviewerFilter {
+    pub viewer_id: Option<String>,
+    pub reach: Option<ReviewReach>,
+    /// Follow hops for [`ReviewReach::Wot`].
+    pub depth: u8,
+    /// Labels of the viewer's own tags on reviewers (any label matches);
+    /// empty keeps every reviewer.
+    pub tagged_by_viewer: Vec<String>,
+}
+
+impl ReviewerFilter {
+    /// True when the viewer's follows or tags narrow the reviewers.
+    pub fn uses_viewer(&self) -> bool {
+        self.reach.is_some() || !self.tagged_by_viewer.is_empty()
+    }
+}
+
+/// A filtered, sorted review stream request.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReviewStreamFilter {
+    pub reviewers: ReviewerFilter,
+    /// Keeps only reviews whose attestation one of these windows covers.
+    pub attestors: Option<Vec<AttestorWindow>>,
+    pub sort: ReviewSort,
+}
+
+/// The raw review stream parameters, before validation.
+#[derive(Clone, Debug, Default)]
+pub struct ReviewStreamParams<'a> {
+    pub viewer_id: Option<&'a str>,
+    pub reach: Option<ReviewReach>,
+    pub depth: Option<&'a str>,
+    pub tagged_by_viewer: Option<&'a str>,
+    pub attestors: Option<&'a str>,
+    pub sort: Option<ReviewSort>,
+}
+
+impl ReviewStreamFilter {
+    /// Validates the parameters. `Ok(None)` when none is given: the plain
+    /// stream. `reach` and `tagged_by_viewer` need `viewer_id`; `depth`
+    /// (1-3, default 2) needs `reach=wot`; `tagged_by_viewer` takes 1-5
+    /// comma-separated labels, compared as tag labels are stored (trimmed,
+    /// lowercase).
+    pub fn parse(params: ReviewStreamParams) -> Result<Option<Self>, String> {
+        let ReviewStreamParams {
+            viewer_id,
+            reach,
+            depth,
+            tagged_by_viewer,
+            attestors,
+            sort,
+        } = params;
+        if viewer_id.is_none()
+            && reach.is_none()
+            && depth.is_none()
+            && tagged_by_viewer.is_none()
+            && attestors.is_none()
+            && sort.is_none()
+        {
+            return Ok(None);
+        }
+
+        let viewer_id = viewer_id
+            .map(|viewer_id| {
+                PubkyId::try_from(viewer_id)
+                    .map(|_| viewer_id.to_string())
+                    .map_err(|_| "viewer_id must be a pubky".to_string())
+            })
+            .transpose()?;
+        let depth = match (depth, reach) {
+            (None, _) => DEFAULT_WOT_DEPTH,
+            (Some(depth), Some(ReviewReach::Wot)) => depth
+                .parse::<u8>()
+                .ok()
+                .filter(|depth| (1..=MAX_WOT_DEPTH).contains(depth))
+                .ok_or_else(|| format!("depth must be between 1 and {MAX_WOT_DEPTH}"))?,
+            (Some(_), _) => return Err("depth applies to reach=wot only".to_string()),
+        };
+        let tagged_by_viewer = match tagged_by_viewer {
+            None => Vec::new(),
+            Some(labels) => {
+                let labels: Vec<String> = labels
+                    .split(',')
+                    .map(|label| label.trim().to_lowercase())
+                    .filter(|label| !label.is_empty())
+                    .collect();
+                if labels.is_empty() || labels.len() > MAX_TAGGED_BY_VIEWER_LABELS {
+                    return Err(format!(
+                        "tagged_by_viewer takes 1 to {MAX_TAGGED_BY_VIEWER_LABELS} labels"
+                    ));
+                }
+                labels
+            }
+        };
+        let reviewers = ReviewerFilter {
+            viewer_id,
+            reach,
+            depth,
+            tagged_by_viewer,
+        };
+        if reviewers.uses_viewer() && reviewers.viewer_id.is_none() {
+            return Err("reach and tagged_by_viewer need viewer_id".to_string());
+        }
+        let attestors = attestors.map(AttestorWindow::parse_list).transpose()?;
+        Ok(Some(ReviewStreamFilter {
+            reviewers,
+            attestors,
+            sort: sort.unwrap_or_default(),
+        }))
+    }
+
+    /// Keeps the rows the attestor windows cover, sorts them, and returns the
+    /// `(reviewer_id, review_id)` keys of the page with the figures of the
+    /// counted matches.
+    fn apply(
+        &self,
+        rows: Vec<FilteredReviewRow>,
+        skip: Option<usize>,
+        limit: Option<usize>,
+    ) -> (Vec<(String, String)>, ReviewMatch) {
+        let mut rows: Vec<FilteredReviewRow> = match &self.attestors {
+            None => rows,
+            Some(windows) => rows
+                .into_iter()
+                .filter(|row| match (&row.attestor_id, row.iat) {
+                    (Some(attestor_id), Some(iat)) => windows
+                        .iter()
+                        .any(|window| window.covers_attestation(attestor_id, iat)),
+                    _ => false,
+                })
+                .collect(),
+        };
+
+        let counted: Vec<CountedReview> = rows.iter().filter_map(|row| row.counted()).collect();
+        let matched = ReviewMatch::from_bucket(&ReputationBucket::compute(&counted, false));
+
+        rows.sort_by(|a, b| self.sort.compare(a, b));
+        let page = rows
+            .into_iter()
+            .skip(skip.unwrap_or(0))
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|row| (row.reviewer_id, row.review_id))
+            .collect();
+        (page, matched)
+    }
+}
+
+impl ReviewSort {
+    fn compare(self, a: &FilteredReviewRow, b: &FilteredReviewRow) -> Ordering {
+        let newest = (b.indexed_at, &b.reviewer_id, &b.review_id).cmp(&(
+            a.indexed_at,
+            &a.reviewer_id,
+            &a.review_id,
+        ));
+        match self {
+            ReviewSort::Newest => newest,
+            ReviewSort::Value => b.price_weight.cmp(&a.price_weight).then(newest),
+            ReviewSort::RatingDesc => b.rating_overall.cmp(&a.rating_overall).then(newest),
+            ReviewSort::RatingAsc => a.rating_overall.cmp(&b.rating_overall).then(newest),
+        }
+    }
+}
+
+/// One review of a filtered stream's scope, as the graph returns it.
+#[derive(Clone, Debug, PartialEq)]
+struct FilteredReviewRow {
+    reviewer_id: String,
+    review_id: String,
+    indexed_at: i64,
+    rating_overall: i64,
+    price_weight: Option<i64>,
+    attestor_id: Option<String>,
+    order_ref: Option<String>,
+    iat: Option<i64>,
+    /// Verified with an `iat`, and not excluded by moderation.
+    counted: bool,
+}
+
+impl FilteredReviewRow {
+    fn counted(&self) -> Option<CountedReview> {
+        let (true, Some(attestor_id), Some(order_ref), Some(iat)) =
+            (self.counted, &self.attestor_id, &self.order_ref, self.iat)
+        else {
+            return None;
+        };
+        Some(CountedReview {
+            reviewer_id: self.reviewer_id.clone(),
+            attestor_id: attestor_id.clone(),
+            order_ref: order_ref.clone(),
+            rating_overall: self.rating_overall,
+            price_weight: self
+                .price_weight
+                .and_then(|weight| u8::try_from(weight).ok())
+                .unwrap_or(1),
+            iat,
+            seller_fields_counted: false,
+            rating_shipping: None,
+            rating_communication: None,
+        })
+    }
+}
+
+/// The counted figures of a filtered stream's matches (counting rules v2,
+/// as [`ReputationBucket`]): distinct buyers, distinct attested orders
+/// `(attestor, order_ref)`, and the mean over buyers of each buyer's mean
+/// `ratings.overall` (`null` when nothing counts). Unverified and excluded
+/// reviews are listed but never counted.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq)]
+pub struct ReviewMatch {
+    pub buyers: u64,
+    pub orders: u64,
+    pub avg: Option<f64>,
+}
+
+impl ReviewMatch {
+    fn from_bucket(bucket: &ReputationBucket) -> Self {
+        ReviewMatch {
+            buyers: bucket.buyers,
+            orders: bucket.orders,
+            avg: (bucket.buyers > 0).then(|| bucket.sum_buyer_means / bucket.buyers as f64),
+        }
+    }
+}
+
+/// A filtered review stream page: the page and the figures of every match.
+#[derive(Serialize, Deserialize, ToSchema, Debug)]
+pub struct FilteredReviewStream {
+    pub reviews: Vec<ReviewView>,
+    pub matched: ReviewMatch,
 }
 
 /// The review role stored on a `REVIEWED` edge.
@@ -625,4 +954,195 @@ fn is_edited_late(created_at: &str, updated_at: &str) -> bool {
         return false;
     };
     (updated - created).num_seconds() > REVIEW_EDIT_WINDOW_SECONDS
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    const ATTESTOR: &str = "8um71us3fyw6h8wbcxb5ar3rwusy1a6u49956ikzojg3gcwd1dty";
+
+    fn params<'a>() -> ReviewStreamParams<'a> {
+        ReviewStreamParams::default()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        reviewer: &str,
+        review: &str,
+        indexed_at: i64,
+        rating: i64,
+        weight: Option<i64>,
+        order: Option<&str>,
+        iat: Option<i64>,
+        counted: bool,
+    ) -> FilteredReviewRow {
+        FilteredReviewRow {
+            reviewer_id: reviewer.to_string(),
+            review_id: review.to_string(),
+            indexed_at,
+            rating_overall: rating,
+            price_weight: weight,
+            attestor_id: order.map(|_| ATTESTOR.to_string()),
+            order_ref: order.map(str::to_string),
+            iat,
+            counted,
+        }
+    }
+
+    fn rows() -> Vec<FilteredReviewRow> {
+        vec![
+            row("b1", "r1", 100, 5, Some(1), Some("o1"), Some(1_000), true),
+            row("b1", "r2", 300, 3, Some(4), Some("o2"), Some(3_000), true),
+            row("b2", "r3", 200, 1, Some(2), Some("o3"), Some(2_000), true),
+            row("b3", "r4", 400, 4, None, None, None, false),
+            // Verified but excluded by moderation: listed, never counted.
+            row("b4", "r5", 50, 2, Some(5), Some("o5"), Some(500), false),
+        ]
+    }
+
+    fn ids(page: &[(String, String)]) -> Vec<&str> {
+        page.iter().map(|(_, review)| review.as_str()).collect()
+    }
+
+    #[test]
+    fn no_parameter_keeps_the_plain_stream() {
+        assert_eq!(ReviewStreamFilter::parse(params()), Ok(None));
+    }
+
+    #[test]
+    fn parameters_validate() {
+        let viewer = Some(ATTESTOR);
+        let filter = ReviewStreamFilter::parse(ReviewStreamParams {
+            viewer_id: viewer,
+            reach: Some(ReviewReach::Wot),
+            tagged_by_viewer: Some(" Seller , trusted,,"),
+            ..params()
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(filter.reviewers.depth, DEFAULT_WOT_DEPTH);
+        assert_eq!(filter.reviewers.tagged_by_viewer, ["seller", "trusted"]);
+        assert_eq!(filter.sort, ReviewSort::Newest);
+
+        let sort_only = ReviewStreamFilter::parse(ReviewStreamParams {
+            sort: Some(ReviewSort::Value),
+            ..params()
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!sort_only.reviewers.uses_viewer());
+
+        for invalid in [
+            ReviewStreamParams {
+                reach: Some(ReviewReach::Following),
+                ..params()
+            },
+            ReviewStreamParams {
+                tagged_by_viewer: Some("seller"),
+                ..params()
+            },
+            ReviewStreamParams {
+                viewer_id: Some("not-a-pubky"),
+                ..params()
+            },
+            ReviewStreamParams {
+                viewer_id: viewer,
+                reach: Some(ReviewReach::Wot),
+                depth: Some("4"),
+                ..params()
+            },
+            ReviewStreamParams {
+                viewer_id: viewer,
+                reach: Some(ReviewReach::Following),
+                depth: Some("1"),
+                ..params()
+            },
+            ReviewStreamParams {
+                viewer_id: viewer,
+                tagged_by_viewer: Some(" , "),
+                ..params()
+            },
+            ReviewStreamParams {
+                viewer_id: viewer,
+                tagged_by_viewer: Some("a,b,c,d,e,f"),
+                ..params()
+            },
+            ReviewStreamParams {
+                attestors: Some(""),
+                ..params()
+            },
+        ] {
+            assert!(
+                ReviewStreamFilter::parse(invalid.clone()).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_sort_orders_the_matches_with_newest_ties() {
+        let order = |sort| {
+            let filter = ReviewStreamFilter {
+                sort,
+                ..Default::default()
+            };
+            let (page, _) = filter.apply(rows(), None, None);
+            ids(&page).join(",")
+        };
+        assert_eq!(order(ReviewSort::Newest), "r4,r2,r3,r1,r5");
+        assert_eq!(order(ReviewSort::Value), "r5,r2,r3,r1,r4");
+        assert_eq!(order(ReviewSort::RatingDesc), "r1,r4,r2,r5,r3");
+        assert_eq!(order(ReviewSort::RatingAsc), "r3,r5,r2,r4,r1");
+    }
+
+    #[test]
+    fn matched_counts_every_counted_match_and_pages_do_not_change_it() {
+        let filter = ReviewStreamFilter::default();
+        let (page, matched) = filter.apply(rows(), Some(1), Some(2));
+        assert_eq!(ids(&page), ["r2", "r3"]);
+        // b1: (5 + 3) / 2, b2: 1; the unverified and excluded rows don't count.
+        assert_eq!(
+            matched,
+            ReviewMatch {
+                buyers: 2,
+                orders: 3,
+                avg: Some((4.0 + 1.0) / 2.0)
+            }
+        );
+    }
+
+    #[test]
+    fn attestor_windows_keep_only_covered_reviews() {
+        let filter = ReviewStreamFilter {
+            attestors: Some(AttestorWindow::parse_list(&format!("{ATTESTOR}:400:2500")).unwrap()),
+            ..Default::default()
+        };
+        let (page, matched) = filter.apply(rows(), None, None);
+        // r5 is covered and listed, but excluded from the counts.
+        assert_eq!(ids(&page), ["r3", "r1", "r5"]);
+        assert_eq!(
+            matched,
+            ReviewMatch {
+                buyers: 2,
+                orders: 2,
+                avg: Some(3.0)
+            }
+        );
+
+        let nothing = ReviewStreamFilter {
+            attestors: Some(AttestorWindow::parse_list(&format!("{ATTESTOR}:9000:")).unwrap()),
+            ..Default::default()
+        };
+        let (page, matched) = nothing.apply(rows(), None, None);
+        assert!(page.is_empty());
+        assert_eq!(
+            matched,
+            ReviewMatch {
+                buyers: 0,
+                orders: 0,
+                avg: None
+            }
+        );
+    }
 }

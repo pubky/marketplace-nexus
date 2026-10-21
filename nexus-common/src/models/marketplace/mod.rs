@@ -23,7 +23,10 @@ pub use reputation::{
     ScopedReputationSummary, MAX_ATTESTOR_WINDOWS, REPUTATION_LISTING_KEY, REPUTATION_SUBJECT_KEY,
 };
 pub use review::{
-    ReviewDetails, ReviewStream, ReviewView, REVIEW_LISTING_KEY_PARTS, REVIEW_SUBJECT_KEY_PARTS,
+    FilteredReviewStream, ReviewDetails, ReviewMatch, ReviewReach, ReviewSort, ReviewStream,
+    ReviewStreamFilter, ReviewStreamParams, ReviewStreamScope, ReviewView, ReviewerFilter,
+    DEFAULT_WOT_DEPTH, MAX_TAGGED_BY_VIEWER_LABELS, MAX_WOT_DEPTH, REVIEW_LISTING_KEY_PARTS,
+    REVIEW_SUBJECT_KEY_PARTS,
 };
 pub use review_response::ReviewResponseDetails;
 pub use search::{ListingsByTagSearch, TAG_GLOBAL_LISTING_TIMELINE};

@@ -270,9 +270,14 @@ impl AttestorWindow {
     }
 
     fn covers(&self, review: &CountedReview) -> bool {
-        review.attestor_id == self.attestor_id
-            && self.from.is_none_or(|from| review.iat >= from)
-            && self.until.is_none_or(|until| review.iat < until)
+        self.covers_attestation(&review.attestor_id, review.iat)
+    }
+
+    /// True when this entry names `attestor_id` and its window holds `iat`.
+    pub fn covers_attestation(&self, attestor_id: &str, iat: i64) -> bool {
+        attestor_id == self.attestor_id
+            && self.from.is_none_or(|from| iat >= from)
+            && self.until.is_none_or(|until| iat < until)
     }
 }
 
