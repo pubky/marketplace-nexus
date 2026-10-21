@@ -101,6 +101,7 @@ mod tests {
                 "moderated",
             ]
         );
+        assert_eq!(c.watcher.review_exclude_tags, vec!["review_fraud"]);
 
         assert_eq!(c.stack.log_level, Level::Info);
         assert_eq!(
@@ -226,6 +227,22 @@ password = "fixture-neo4j-password"
         assert_eq!(uri_display, FIXTURE_BOLT);
         assert!(uri_debug.contains(FIXTURE_BOLT));
         assert!(!uri_debug.contains("user:pass"));
+    }
+
+    #[test]
+    fn review_exclude_tags_default_to_review_fraud_when_omitted() {
+        let daemon = DaemonConfig::try_from_str(GENERATED_DATA_CONFIG_TOML).expect("parses");
+        assert_eq!(daemon.watcher.review_exclude_tags, vec!["review_fraud"]);
+
+        let toml = GENERATED_DATA_CONFIG_TOML.replace(
+            "moderated_tags = []",
+            "moderated_tags = []\nreview_exclude_tags = [\"review_fraud\", \"fake_review\"]",
+        );
+        let daemon = DaemonConfig::try_from_str(&toml).expect("parses");
+        assert_eq!(
+            daemon.watcher.review_exclude_tags,
+            vec!["review_fraud", "fake_review"]
+        );
     }
 
     #[test]

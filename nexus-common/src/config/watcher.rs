@@ -29,6 +29,12 @@ pub const MODERATED_TAGS: [&str; 7] = [
     "il_adult_nu_sex_act",
     "moderated",
 ];
+/// Default for [WatcherConfig::review_exclude_tags]
+pub const REVIEW_EXCLUDE_TAGS: [&str; 1] = ["review_fraud"];
+
+fn default_review_exclude_tags() -> Vec<String> {
+    REVIEW_EXCLUDE_TAGS.iter().map(|s| s.to_string()).collect()
+}
 
 /// Configuration settings for the Nexus Watcher service
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -49,6 +55,10 @@ pub struct WatcherConfig {
     // Moderation
     pub moderation_id: PubkyId,
     pub moderated_tags: Vec<String>,
+    /// Labels that, placed by the moderator on a marketplace review, leave it
+    /// out of the aggregates, and on a user, leave out every review they wrote
+    #[serde(default = "default_review_exclude_tags")]
+    pub review_exclude_tags: Vec<String>,
 }
 
 impl Default for WatcherConfig {
@@ -71,6 +81,7 @@ impl Default for WatcherConfig {
             watcher_sleep: DEFAULT_WATCHER_SLEEP,
             moderation_id,
             moderated_tags: MODERATED_TAGS.iter().map(|s| s.to_string()).collect(),
+            review_exclude_tags: default_review_exclude_tags(),
         }
     }
 }

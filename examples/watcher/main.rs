@@ -48,6 +48,7 @@ async fn main() -> Result<(), DynError> {
                 stack,
                 moderation_id,
                 moderated_tags: Vec::new(),
+                review_exclude_tags: Vec::new(),
             };
             NexusWatcherBuilder(config).start(None).await?;
         }
