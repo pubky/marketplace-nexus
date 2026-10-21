@@ -1,5 +1,6 @@
 use super::{
-    ListingDetails, ListingSaleFormat, ListingsByTagSearch, ReputationSnippet, ReputationSummary,
+    ListingDetails, ListingSaleFormat, ListingsByTagSearch, ReputationBucket, ReputationSnippet,
+    ReputationSummary,
 };
 use crate::db::kv::{RedisResult, SortOrder};
 use crate::db::{get_neo4j_graph, queries, GraphError, GraphResult, RedisOps};
@@ -130,6 +131,23 @@ pub struct ListingStreamEntry {
     /// Listing-scoped reputation (buyer reviews of this listing).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listing_reputation: Option<ReputationSnippet>,
+}
+
+/// The listing detail response: the listing with its reputation snippets
+/// and, with the `attestors=` parameter, the exact figures of the seller's
+/// and the listing's counted reviews inside the given attestor windows.
+#[derive(Serialize, Deserialize, ToSchema, Debug, PartialEq)]
+pub struct ListingDetailView {
+    #[serde(flatten)]
+    pub entry: ListingStreamEntry,
+    /// The seller's counted reviews (buyer-reviewing-seller role) inside
+    /// the `attestors=` windows. Present only with the parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_reputation: Option<ReputationBucket>,
+    /// The listing's counted buyer reviews inside the `attestors=` windows.
+    /// Present only with the parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scoped_listing_reputation: Option<ReputationBucket>,
 }
 
 impl Deref for ListingStreamEntry {
