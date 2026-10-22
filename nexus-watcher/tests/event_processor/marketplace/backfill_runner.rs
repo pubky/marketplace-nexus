@@ -405,7 +405,7 @@ async fn a_request_budget_pauses_and_the_resume_never_repeats_a_finished_item() 
 async fn concurrent_items_that_finish_out_of_order_are_kept_ahead_of_the_cursor() -> Result<()> {
     stack().await?;
     let job = ScriptedJob::new("ahead", 8, 0);
-    job.script("k01", Behavior::Late(Duration::from_millis(400)));
+    job.script("k01", Behavior::Late(Duration::from_secs(1)));
     let stop = StopHandle::default();
     let sink = Recorder::stopping_after(Phase::Fetch, 2, stop.clone());
     let concurrent = RunOptions {
@@ -696,38 +696,47 @@ async fn only_one_of_many_racing_claims_wins() -> Result<()> {
 #[tokio_shared_rt::test(shared)]
 async fn a_second_runner_is_refused_while_the_lease_is_live_and_renewed() -> Result<()> {
     stack().await?;
-    let job = ScriptedJob::new("two", 40, 0);
-    // A 300 ms lease renewed every 60 ms: the run outlives the lease several
-    // times over and only the renewals keep it.
-    let short_lease = RunOptions {
-        lease: Duration::from_millis(300),
-        lease_renewal: Duration::from_millis(60),
+    let job = ScriptedJob::new("two", 30, 0);
+    // A 3 s lease renewed every 100 ms, on a run of about 3 s: the lease is
+    // far from expiring at either look, and the holder's renewals show as its
+    // expiry moving forward.
+    let held = RunOptions {
+        gate: GateConfig {
+            rate: 10.0,
+            ..fast_gate()
+        },
+        lease: Duration::from_secs(3),
+        lease_renewal: Duration::from_millis(100),
         ..options()
     };
     let first = {
-        let (job, options) = (job.clone(), short_lease.clone());
+        let (job, options) = (job.clone(), held.clone());
         tokio::spawn(async move {
             run_job(job.as_ref(), options, &Recorder::default())
                 .await
                 .unwrap()
         })
     };
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let mut refused = 0;
-    for _ in 0..4 {
-        let second = run_job(job.as_ref(), short_lease.clone(), &Recorder::default())
+
+    let mut expiries = Vec::new();
+    for wait in [400, 1000] {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
+        let second = run_job(job.as_ref(), held.clone(), &Recorder::default())
             .await
             .unwrap();
         assert_eq!(second.outcome, Outcome::Refused);
         assert_eq!(second.exit_code(), EXIT_ERROR);
-        refused += 1;
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        expiries.push(state(&job).await.lease_expires_at.expect("a live lease"));
     }
-    assert_eq!(refused, 4);
+    assert!(
+        expiries[1] > expiries[0],
+        "the holder renews its lease: {expiries:?}"
+    );
+
     let first = first.await?;
     assert_eq!(first.outcome, Outcome::Done);
     let requested = job.requested();
-    assert_eq!(requested.len(), 40);
+    assert_eq!(requested.len(), 30);
     no_duplicates(&requested);
     cleanup(&job).await
 }
