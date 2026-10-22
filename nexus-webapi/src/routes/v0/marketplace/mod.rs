@@ -1,13 +1,14 @@
 use crate::routes::v0::endpoints::{
-    DROP_ROUTE, LISTING_MODERATION_ROUTE, LISTING_REVIEWS_ROUTE, LISTING_ROUTE,
-    LISTING_TAGGERS_ROUTE, LISTING_TAGS_ROUTE, SHOP_REPUTATION_ROUTE, SHOP_REVIEWS_ROUTE,
-    SHOP_ROUTE, SHOP_TAGGERS_ROUTE, SHOP_TAGS_ROUTE,
+    ATTESTOR_ANNOTATIONS_ROUTE, ATTESTOR_PROFILE_ROUTE, DROP_ROUTE, LISTING_MODERATION_ROUTE,
+    LISTING_REVIEWS_ROUTE, LISTING_ROUTE, LISTING_TAGGERS_ROUTE, LISTING_TAGS_ROUTE,
+    SHOP_REPUTATION_ROUTE, SHOP_REVIEWS_ROUTE, SHOP_ROUTE, SHOP_TAGGERS_ROUTE, SHOP_TAGS_ROUTE,
 };
 use crate::routes::AppState;
 use axum::routing::get;
 use axum::Router;
 use utoipa::OpenApi;
 
+mod attestor;
 mod drop;
 mod listing;
 mod reviews;
@@ -30,6 +31,14 @@ pub fn routes() -> Router<AppState> {
         .route(LISTING_TAGGERS_ROUTE, get(tags::listing_taggers_handler))
         .route(LISTING_REVIEWS_ROUTE, get(reviews::listing_reviews_handler))
         .route(DROP_ROUTE, get(drop::drop_details_handler))
+        .route(
+            ATTESTOR_PROFILE_ROUTE,
+            get(attestor::attestor_profile_handler),
+        )
+        .route(
+            ATTESTOR_ANNOTATIONS_ROUTE,
+            get(attestor::attestor_annotations_handler),
+        )
 }
 
 #[derive(OpenApi)]
@@ -43,6 +52,7 @@ impl MarketplaceApiDoc {
         combined.merge(drop::DropDetailsApiDoc::openapi());
         combined.merge(tags::MarketplaceTagsApiDoc::openapi());
         combined.merge(reviews::MarketplaceReviewsApiDoc::openapi());
+        combined.merge(attestor::AttestorApiDoc::openapi());
         combined
     }
 }

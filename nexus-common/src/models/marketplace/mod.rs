@@ -1,3 +1,4 @@
+mod attestor;
 mod drop;
 mod listing;
 mod moderation;
@@ -9,6 +10,9 @@ mod shop;
 mod stream;
 mod view;
 
+pub use attestor::{
+    AttestorAnnotationDetails, AttestorKeyWindow, AttestorProfileDetails, MAX_ANNOTATION_BATCH,
+};
 pub use drop::{
     DropDetails, DropStream, DropStreamBucket, DropStreamFilters, DROP_PER_OWNER_KEY_PARTS,
     DROP_STARTS_KEY_PARTS,

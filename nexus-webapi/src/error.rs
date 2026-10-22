@@ -40,6 +40,8 @@ pub enum Error {
     DropNotFound { owner_id: String, drop_id: String },
     #[error("No indexed reviews for subject: {subject_id}")]
     ReputationNotFound { subject_id: String },
+    #[error("Attestor profile not found: {attestor_id}")]
+    AttestorProfileNotFound { attestor_id: String },
     // Add other custom errors here
 }
 
@@ -113,6 +115,7 @@ impl IntoResponse for Error {
             Error::ListingNotFound { .. } => StatusCode::NOT_FOUND,
             Error::DropNotFound { .. } => StatusCode::NOT_FOUND,
             Error::ReputationNotFound { .. } => StatusCode::NOT_FOUND,
+            Error::AttestorProfileNotFound { .. } => StatusCode::NOT_FOUND,
             // Map other errors to appropriate status codes
         };
 
@@ -149,6 +152,9 @@ impl IntoResponse for Error {
             }
             Error::ReputationNotFound { subject_id } => {
                 error!("No indexed reviews for subject: {}", subject_id)
+            }
+            Error::AttestorProfileNotFound { attestor_id } => {
+                error!("Attestor profile not found: {}", attestor_id)
             }
             Error::InternalServerError { source } => error!("Internal server error: {:?}", source),
         };

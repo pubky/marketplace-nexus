@@ -1,3 +1,4 @@
+pub mod attestor;
 pub mod bookmark;
 pub mod drop;
 pub mod file;

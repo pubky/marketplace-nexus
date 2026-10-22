@@ -43,6 +43,10 @@ pub const LISTING_REVIEWS_ROUTE: &str = concatcp!(LISTING_ROUTE, "/reviews");
 pub const LISTING_MODERATION_ROUTE: &str = concatcp!(LISTING_ROUTE, "/moderation");
 const DROP_PREFIX: &str = concatcp!(VERSION_ROUTE, "/drop");
 pub const DROP_ROUTE: &str = concatcp!(DROP_PREFIX, "/{owner_id}/{drop_id}");
+const ATTESTOR_PREFIX: &str = concatcp!(VERSION_ROUTE, "/marketplace/attestor");
+pub const ATTESTOR_ROUTE: &str = concatcp!(ATTESTOR_PREFIX, "/{attestor_id}");
+pub const ATTESTOR_PROFILE_ROUTE: &str = concatcp!(ATTESTOR_ROUTE, "/profile");
+pub const ATTESTOR_ANNOTATIONS_ROUTE: &str = concatcp!(ATTESTOR_ROUTE, "/annotations");
 
 // -- STREAM endpoints --
 const STREAM_PREFIX: &str = concatcp!(VERSION_ROUTE, "/stream");

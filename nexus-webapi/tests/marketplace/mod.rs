@@ -1,3 +1,4 @@
+mod attestor;
 mod drops;
 mod review_filters;
 mod reviews;

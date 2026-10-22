@@ -51,6 +51,14 @@ pub async fn handle_put_event(
     if matches!(resource, Resource::Listing(_)) {
         handlers::listing::validate_public_listing_blob(&blob)?;
     }
+    // Attestor records verify against the URI's owner, which `from_resource` doesn't see.
+    if matches!(
+        resource,
+        Resource::AttestorProfile | Resource::AttestorAnnotation(_)
+    ) {
+        let user_id = event.parsed_uri.user_id.clone();
+        return handlers::attestor::sync_put(&event.uri, &blob, user_id).await;
+    }
 
     // Use the new importer from pubky-app-specs
     let pubky_object =
@@ -165,6 +173,10 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
         }
         Resource::ReviewResponse(review_id) => {
             handlers::review_response::del(user_id, review_id.clone()).await?
+        }
+        Resource::AttestorProfile => handlers::attestor::del_profile(user_id).await?,
+        Resource::AttestorAnnotation(order_ref) => {
+            handlers::attestor::del_annotation(user_id, order_ref.clone()).await?
         }
         other => debug!("DEL event type not handled for resource: {other:?}"),
     }
