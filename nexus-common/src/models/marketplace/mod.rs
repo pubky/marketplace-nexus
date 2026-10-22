@@ -14,7 +14,10 @@ pub use drop::{
     DROP_STARTS_KEY_PARTS,
 };
 pub use listing::{ListingDetails, ListingSaleFormat};
-pub use moderation::{ListingModerationState, ModeratedListing, ModeratedUser};
+pub use moderation::{
+    ExcludedReviewer, ListingModerationState, ModeratedListing, ModeratedReview, ModeratedUser,
+    ReviewModeration, ReviewModerationState,
+};
 pub use reputation::{
     ReputationSnippet, ReputationSummary, REPUTATION_LISTING_KEY, REPUTATION_SUBJECT_KEY,
 };

@@ -1,7 +1,9 @@
 use handlers::listing::HomeserverRecord;
 use nexus_common::db::PubkyConnector;
 use nexus_common::models::event::{Event, EventProcessorError, EventType};
-use nexus_common::models::marketplace::{ModeratedListing, ModeratedUser};
+use nexus_common::models::marketplace::{
+    ExcludedReviewer, ModeratedListing, ModeratedReview, ModeratedUser,
+};
 use pubky_app_specs::{PubkyAppObject, PubkyId, Resource};
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -72,8 +74,9 @@ pub async fn handle_put_event(
             handlers::bookmark::sync_put(user_id, bookmark, bookmark_id).await?
         }
         (PubkyAppObject::Tag(tag), Resource::Tag(tag_id)) => {
-            if moderation.should_delete(&tag, user_id.clone()).await {
-                Moderation::apply_moderation(tag, &user_id, &tag_id, event.files_path.clone())
+            if moderation.is_moderation(&tag, &user_id) {
+                moderation
+                    .apply_moderation(tag, &user_id, &tag_id, event.files_path.clone())
                     .await?
             } else {
                 handlers::tag::sync_put(tag, user_id, tag_id).await?
@@ -138,10 +141,12 @@ pub async fn handle_del_event(event: &Event) -> Result<(), EventProcessorError> 
                 );
                 return Ok(());
             }
-            // A moderator's tag on a listing or a user is never indexed as a
-            // tag: removing it only lifts the moderation marker.
+            // A moderator's tag on a listing, a user or a review is never
+            // indexed as a tag: removing it only lifts the moderation marker.
             let released = handlers::listing::release_moderation(&user_id, tag_id).await?;
             let released = handlers::user::release_moderation(&user_id, tag_id).await? || released;
+            let released =
+                handlers::review::release_moderation(&user_id, tag_id).await? || released;
             match handlers::tag::del(user_id, tag_id.clone()).await {
                 Err(EventProcessorError::SkipIndexing) if released => {}
                 other => other?,
@@ -176,7 +181,19 @@ async fn tag_has_moderation_markers(
     {
         return Ok(true);
     }
-    Ok(!ModeratedUser::users_of_tag(tagger_id, tag_id)
+    if !ModeratedUser::users_of_tag(tagger_id, tag_id)
+        .await?
+        .is_empty()
+    {
+        return Ok(true);
+    }
+    if !ModeratedReview::reviews_of_tag(tagger_id, tag_id)
+        .await?
+        .is_empty()
+    {
+        return Ok(true);
+    }
+    Ok(!ExcludedReviewer::users_of_tag(tagger_id, tag_id)
         .await?
         .is_empty())
 }

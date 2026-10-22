@@ -1013,6 +1013,80 @@ pub fn moderated_users_of_tag(moderator_id: &str, tag_id: &str) -> Query {
     .param("tag_id", tag_id)
 }
 
+/// The reviews marked by one moderator tag record (`reviewer_id`, `review_id`).
+pub fn moderated_reviews_of_tag(moderator_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "moderated_reviews_of_tag",
+        "MATCH (marker:ModeratedReview {moderator_id: $moderator_id, tag_id: $tag_id})
+         RETURN marker.reviewer_id AS reviewer_id, marker.review_id AS review_id",
+    )
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+}
+
+/// The users whose reviews one moderator tag record excludes (`user_id`).
+pub fn excluded_reviewers_of_tag(moderator_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "excluded_reviewers_of_tag",
+        "MATCH (marker:ExcludedReviewer {moderator_id: $moderator_id, tag_id: $tag_id})
+         RETURN marker.user_id AS user_id",
+    )
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+}
+
+/// The moderation that applies to one review (`state`, `reason`), or no row.
+/// Markers on the review, review-exclusion markers on its reviewer and
+/// moderation markers hiding its reviewer all apply; `excluded` wins over
+/// `text_hidden`, then the lowest tag id. Markers whose tag is being released
+/// (`releasing`) are left out, and so are rows without a state, a reason and a
+/// tag id: a marker deleted between the match and the property reads comes
+/// back with every property null and is no marker.
+pub fn review_moderation(reviewer_id: &str, review_id: &str) -> Query {
+    Query::new(
+        "review_moderation",
+        "CALL () {
+            MATCH (m:ModeratedReview {reviewer_id: $reviewer_id, review_id: $review_id})
+            RETURN m.state AS state, m.label AS reason, m.tag_id AS tag_id, m.releasing AS releasing
+            UNION ALL
+            MATCH (m:ExcludedReviewer {user_id: $reviewer_id})
+            RETURN 'excluded' AS state, m.label AS reason, m.tag_id AS tag_id, m.releasing AS releasing
+            UNION ALL
+            MATCH (m:ModeratedUser {user_id: $reviewer_id})
+            RETURN 'text_hidden' AS state, m.label AS reason, m.tag_id AS tag_id, m.releasing AS releasing
+         }
+         WITH state, reason, tag_id, releasing
+         WHERE releasing IS NULL
+           AND state IS NOT NULL AND reason IS NOT NULL AND tag_id IS NOT NULL
+         RETURN state, reason
+         ORDER BY CASE state WHEN 'excluded' THEN 0 ELSE 1 END, tag_id, reason
+         LIMIT 1",
+    )
+    .param("reviewer_id", reviewer_id)
+    .param("review_id", review_id)
+}
+
+/// The ids of every user who has a review in the graph.
+pub fn reviewer_ids() -> Query {
+    Query::new(
+        "reviewer_ids",
+        "MATCH (reviewer:User)-[:REVIEWED]->(:User)
+         RETURN DISTINCT reviewer.id AS reviewer_id
+         ORDER BY reviewer_id",
+    )
+}
+
+/// The ids of every review a reviewer has in the graph.
+pub fn review_ids_of_reviewer(reviewer_id: &str) -> Query {
+    Query::new(
+        "review_ids_of_reviewer",
+        "MATCH (:User {id: $reviewer_id})-[r:REVIEWED]->(:User)
+         RETURN r.review_id AS review_id
+         ORDER BY r.review_id",
+    )
+    .param("reviewer_id", reviewer_id)
+}
+
 /// The ids of every listing a seller has in the graph.
 pub fn listing_ids_of_owner(owner_id: &str) -> Query {
     Query::new(
@@ -1572,6 +1646,10 @@ const REPUTATION_RETURN: &str = "
             max(r.created_at) AS last_reviewed_at
         ";
 
+/// The aggregates leave out reviews the moderator excluded (see
+/// [`crate::models::marketplace::ReviewModerationState::Excluded`]).
+const REPUTATION_NOT_EXCLUDED: &str = "coalesce(r.moderation, '') <> 'excluded'";
+
 /// The reviewer's other verified review edges in one role that carry the
 /// same attested order `(attestor_id, order_ref)`: a legacy record and its
 /// order-scoped twin embed the same attestation.
@@ -1598,11 +1676,12 @@ pub fn review_order_twins(
 
 /// Aggregates every `REVIEWED` edge pointing at a subject in one role into
 /// the reputation summary row, leaving out legacy records superseded by
-/// their order-scoped twin.
+/// their order-scoped twin and reviews moderation excluded.
 pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
     let cypher = format!(
         "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
         WHERE r.role = $role AND coalesce(r.superseded, false) = false
+            AND {REPUTATION_NOT_EXCLUDED}
         {REPUTATION_RETURN}"
     );
     Query::new("subject_reputation", &cypher)
@@ -1611,13 +1690,15 @@ pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
 }
 
 /// Aggregates the buyer reviews of one listing into the reputation summary
-/// row. For `buyer_reviewing_seller` reviews the subject is the listing
-/// owner, which anchors the scan.
+/// row, with the same exclusions as [`subject_reputation`]. For
+/// `buyer_reviewing_seller` reviews the subject is the listing owner, which
+/// anchors the scan.
 pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
     let cypher = format!(
         "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
         WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id
             AND coalesce(r.superseded, false) = false
+            AND {REPUTATION_NOT_EXCLUDED}
         {REPUTATION_RETURN}"
     );
     Query::new("listing_reputation", &cypher)

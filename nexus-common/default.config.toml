@@ -35,6 +35,9 @@ moderated_tags = [
     "il_adult_nu_sex_act",
     "moderated",
 ]
+# Tags that, placed by the moderator on a marketplace review, leave it out of
+# the aggregates, and on a user, leave out every review the user wrote
+review_exclude_tags = ["review_fraud"]
 
 
 [stack]

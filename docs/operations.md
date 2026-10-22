@@ -13,6 +13,11 @@ team deploys it through
 - `[watcher] homeserver`: the homeserver the index follows.
 - `[watcher] moderation_id`, `[watcher] moderated_tags`: see below. There is no
   safe default for the moderator key.
+- `[watcher] review_exclude_tags`: labels that, placed by the moderator on a
+  marketplace review, leave it out of every review aggregate (text withheld),
+  and on a user's profile, leave out every review that user wrote (the user,
+  shop and listings stay). Defaults to `review_fraud` when omitted; an empty
+  list turns review exclusion off.
 - `[watcher] events_limit`, `watcher_sleep`: replay tuning (events per poll,
   milliseconds between polls).
 - `[stack] allowed_homeservers`: optional list of z-base-32 ids; when set, the
@@ -45,9 +50,17 @@ What the moderator's tags do on this index:
 | a marketplace listing | the listing leaves the graph, the details cache and every stream; stays out across a reindex (`ModeratedListing` marker) |
 | a user's profile | the user, their shop and every listing leave the index; the shop and listings stay out across a reindex, and a listing or shop the seller publishes later is not indexed (`ModeratedUser` marker) |
 | a post, file or tag | removed, as on pubky.app |
+| a marketplace review, with a `moderated_tags` label | the review's `moderation` is `{state: "text_hidden", reason: <label>}`: its text is withheld, its ratings still count (`ModeratedReview` marker) |
+| a marketplace review, with a `review_exclude_tags` label | `moderation` is `{state: "excluded", reason: <label>}`: text withheld and the review leaves every aggregate (`ModeratedReview` marker) |
+| a user's profile, with a `review_exclude_tags` label | every review the user wrote, and any they write later, is `excluded`; the user is not hidden (`ExcludedReviewer` marker) |
+
+A moderated user's reviews (a `moderated_tags` label on their profile) are
+`text_hidden`, ratings kept. Review moderation deletes nothing: the review
+stays indexed and listed, and holds across edits and a reindex in any event
+order.
 
 Removing the moderator's tag restores what it hid, from the seller's
-homeserver. `GET /v0/listing/{seller_id}/{listing_id}/moderation` reports
+homeserver (a review's moderation is lifted in place). `GET /v0/listing/{seller_id}/{listing_id}/moderation` reports
 whether a listing is moderated, through the listing's own marker or its
 seller's, for a listing the index holds or not; the transaction service reads
 it before it sells, takes a bid on, or takes an offer on a listing.
@@ -83,7 +96,7 @@ service log by the "cursor for the next request" lines.
 
 ## Running the backfill migrations
 
-Two one-shot migrations exist (see the runbook in `README.md`):
+One-shot migrations (see the runbook in `README.md`):
 
 - `ListingAuctionTermsReindex1787256279` re-reads auction listings that
   predate the auction-term fields.
@@ -92,6 +105,11 @@ Two one-shot migrations exist (see the runbook in `README.md`):
   indexed user's reviews directory on their homeserver and running the
   normal ingest (attestation verification and reputation recompute
   included).
+- `ReviewModerationRecompute1792579958` re-derives every indexed review's
+  `moderation` from the moderation markers and recomputes the aggregates that
+  changed, so the reviews of users moderated before review moderation shipped
+  have their text hidden. It needs only the databases; run it once after the
+  release that adds review moderation.
 
 Run them where the databases are reachable, for example inside the `nexusd`
 container:

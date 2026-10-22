@@ -30,6 +30,8 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE CONSTRAINT uniqueTagCleanupId IF NOT EXISTS FOR (c:TagCleanup) REQUIRE c.id IS UNIQUE",
         "CREATE CONSTRAINT uniqueModeratedListingTag IF NOT EXISTS FOR (m:ModeratedListing) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
         "CREATE CONSTRAINT uniqueModeratedUserTag IF NOT EXISTS FOR (m:ModeratedUser) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
+        "CREATE CONSTRAINT uniqueModeratedReviewTag IF NOT EXISTS FOR (m:ModeratedReview) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
+        "CREATE CONSTRAINT uniqueExcludedReviewerTag IF NOT EXISTS FOR (m:ExcludedReviewer) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
     ];
 
     // Create indexes
@@ -57,6 +59,8 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE INDEX tagCleanupTargetIndex IF NOT EXISTS FOR (c:TagCleanup) ON (c.target)",
         "CREATE INDEX moderatedListingTargetIndex IF NOT EXISTS FOR (m:ModeratedListing) ON (m.owner_id, m.listing_id)",
         "CREATE INDEX moderatedUserTargetIndex IF NOT EXISTS FOR (m:ModeratedUser) ON (m.user_id)",
+        "CREATE INDEX moderatedReviewTargetIndex IF NOT EXISTS FOR (m:ModeratedReview) ON (m.reviewer_id, m.review_id)",
+        "CREATE INDEX excludedReviewerTargetIndex IF NOT EXISTS FOR (m:ExcludedReviewer) ON (m.user_id)",
     ];
 
     let queries = constraints.iter().chain(indexes.iter());

@@ -160,9 +160,208 @@ impl ModeratedUser {
         Ok(users)
     }
 
+    /// Flags the marker of one moderator tag record as being released: review
+    /// moderation stops applying it, the shop and listings stay hidden until
+    /// [`Self::delete`].
+    pub async fn mark_releasing(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::put::mark_moderated_user_releasing(
+            moderator_id,
+            tag_id,
+        ))
+        .await
+    }
+
     /// Removes the marker written by one moderator tag record.
     pub async fn delete(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
         exec_single_row(queries::del::delete_moderated_user(moderator_id, tag_id)).await
+    }
+}
+
+/// Moderation marker on one marketplace review.
+///
+/// Written when the configured moderator tags a review URI with a moderated
+/// label (the review's text is hidden) or a review-exclusion label (the review
+/// leaves the aggregates). Like the listing marker it is keyed by the
+/// moderator's tag record and is a standalone node that references the review
+/// only by `(reviewer_id, review_id)`: it holds whether the tag event is
+/// replayed before or after the review, and across edits of the review.
+/// Nothing is deleted; the review's `moderation` is derived from the markers.
+pub struct ModeratedReview;
+
+impl ModeratedReview {
+    /// Records (or refreshes) the marker written by one moderator tag.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put(
+        reviewer_id: &str,
+        review_id: &str,
+        uri: &str,
+        moderator_id: &str,
+        tag_id: &str,
+        label: &str,
+        state: ReviewModerationState,
+        moderated_at: i64,
+    ) -> GraphResult<()> {
+        exec_single_row(queries::put::put_moderated_review(
+            reviewer_id,
+            review_id,
+            uri,
+            moderator_id,
+            tag_id,
+            label,
+            state.as_str(),
+            moderated_at,
+        ))
+        .await
+    }
+
+    /// The `(reviewer_id, review_id)` pairs marked by one moderator tag record.
+    pub async fn reviews_of_tag(
+        moderator_id: &str,
+        tag_id: &str,
+    ) -> GraphResult<Vec<(String, String)>> {
+        let rows =
+            fetch_all_rows_from_graph(queries::get::moderated_reviews_of_tag(moderator_id, tag_id))
+                .await?;
+        let mut reviews = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let (Some(reviewer_id), Some(review_id)) =
+                (row.get("reviewer_id")?, row.get("review_id")?)
+            {
+                reviews.push((reviewer_id, review_id));
+            }
+        }
+        Ok(reviews)
+    }
+
+    /// Flags the marker of one moderator tag record as being released: review
+    /// moderation stops applying it.
+    pub async fn mark_releasing(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::put::mark_moderated_review_releasing(
+            moderator_id,
+            tag_id,
+        ))
+        .await
+    }
+
+    /// Removes the marker written by one moderator tag record.
+    pub async fn delete(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::del::delete_moderated_review(moderator_id, tag_id)).await
+    }
+}
+
+/// Moderation marker excluding every review a user wrote from the aggregates
+/// (a fraud ring), written when the configured moderator tags the user's
+/// profile URI with a review-exclusion label. It does not hide the user, their
+/// shop or their listings. Keyed by the moderator's tag record and standalone,
+/// like the other markers, so it also holds for reviews indexed after it.
+pub struct ExcludedReviewer;
+
+impl ExcludedReviewer {
+    /// Records (or refreshes) the marker written by one moderator tag.
+    pub async fn put(
+        user_id: &str,
+        uri: &str,
+        moderator_id: &str,
+        tag_id: &str,
+        label: &str,
+        moderated_at: i64,
+    ) -> GraphResult<()> {
+        exec_single_row(queries::put::put_excluded_reviewer(
+            user_id,
+            uri,
+            moderator_id,
+            tag_id,
+            label,
+            moderated_at,
+        ))
+        .await
+    }
+
+    /// The ids of the users whose reviews one moderator tag record excludes.
+    pub async fn users_of_tag(moderator_id: &str, tag_id: &str) -> GraphResult<Vec<String>> {
+        let rows = fetch_all_rows_from_graph(queries::get::excluded_reviewers_of_tag(
+            moderator_id,
+            tag_id,
+        ))
+        .await?;
+        let mut users = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(user_id) = row.get("user_id")? {
+                users.push(user_id);
+            }
+        }
+        Ok(users)
+    }
+
+    /// Flags the marker of one moderator tag record as being released: review
+    /// moderation stops applying it.
+    pub async fn mark_releasing(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::put::mark_excluded_reviewer_releasing(
+            moderator_id,
+            tag_id,
+        ))
+        .await
+    }
+
+    /// Removes the marker written by one moderator tag record.
+    pub async fn delete(moderator_id: &str, tag_id: &str) -> GraphResult<()> {
+        exec_single_row(queries::del::delete_excluded_reviewer(moderator_id, tag_id)).await
+    }
+}
+
+/// What moderation does to a review.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewModerationState {
+    /// The review's text is withheld; its ratings still count.
+    TextHidden,
+    /// The review is left out of every aggregate and its text is withheld.
+    Excluded,
+}
+
+impl ReviewModerationState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TextHidden => "text_hidden",
+            Self::Excluded => "excluded",
+        }
+    }
+
+    fn from_graph(value: &str) -> Option<Self> {
+        match value {
+            "text_hidden" => Some(Self::TextHidden),
+            "excluded" => Some(Self::Excluded),
+            _ => None,
+        }
+    }
+}
+
+/// The moderation applied to a review: its state and the moderator's label as
+/// the reason.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct ReviewModeration {
+    pub state: ReviewModerationState,
+    /// The moderator tag's label, e.g. `hatespeech` or `review_fraud`.
+    pub reason: String,
+}
+
+impl ReviewModeration {
+    /// Derives a review's moderation from the markers that apply to it: a
+    /// marker on the review, a review-exclusion marker on its reviewer, or a
+    /// moderation marker hiding its reviewer (which hides the text, ratings
+    /// kept). Exclusion wins over hidden text; among markers of one state the
+    /// lowest tag id gives the reason, so a replay picks the same one.
+    /// Markers flagged as being released are left out, in every process, from
+    /// the moment the release starts.
+    pub async fn get(reviewer_id: &str, review_id: &str) -> GraphResult<Option<Self>> {
+        let row =
+            fetch_row_from_graph(queries::get::review_moderation(reviewer_id, review_id)).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let state: String = row.get("state")?;
+        let reason: String = row.get("reason")?;
+        Ok(ReviewModerationState::from_graph(&state).map(|state| Self { state, reason }))
     }
 }
 

@@ -5,8 +5,8 @@ use crate::{Error, Result};
 use axum::extract::{Path, Query};
 use axum::Json;
 use nexus_common::models::marketplace::{
-    ReputationSnippet, ReputationSummary, ReviewDetails, ReviewResponseDetails, ReviewStream,
-    ReviewView,
+    ReputationSnippet, ReputationSummary, ReviewDetails, ReviewModeration, ReviewModerationState,
+    ReviewResponseDetails, ReviewStream, ReviewView,
 };
 use nexus_common::types::Pagination;
 use pubky_app_specs::PubkyAppReviewRole;
@@ -41,7 +41,12 @@ Every entry carries a `verified` flag: true iff the review's embedded purchase a
 compact JWS, its Ed25519 signature verified against the self-certifying `iss` pubky, and its claims bind
 to the review (reviewer/subject/listing/role). Verification proves WHICH key signed — `attestor_id` names
 it — never that the signer is legitimate; clients apply their own attestor trust list at display time.
-Unverified reviews are included and must be labeled as such (ratified D5)."#,
+Unverified reviews are included and must be labeled as such (ratified D5).
+
+Every entry also carries `moderation`: `null`, or `{state, reason}` when Pubky Market's configured
+moderator acted on the review. `text_hidden` withholds the text (returned empty) and keeps the ratings in
+the aggregates; `excluded` withholds the text and leaves the review out of every aggregate. `reason` is
+the moderator's label (e.g. `hatespeech`, `review_fraud`)."#,
     tag = "Marketplace",
     params(
         ("seller_id" = String, Path, description = "Subject Pubky ID (the reviewed user)"),
@@ -113,7 +118,7 @@ pub async fn shop_reputation_handler(
     get,
     path = LISTING_REVIEWS_ROUTE,
     description = "Paged buyer reviews of one listing, newest-indexed first, with seller responses joined. \
-Same verification semantics as the subject review stream.",
+Same verification and moderation semantics as the subject review stream.",
     tag = "Marketplace",
     params(
         ("seller_id" = String, Path, description = "Seller Pubky ID"),
@@ -147,6 +152,8 @@ pub async fn listing_reviews_handler(
         ReviewStream,
         ReviewView,
         ReviewDetails,
+        ReviewModeration,
+        ReviewModerationState,
         ReviewResponseDetails,
         ReputationSummary,
         ReputationSnippet,

@@ -1,5 +1,5 @@
 use super::listing::{self, is_homeserver_not_found, ModerationChecks};
-use super::shop;
+use super::{review, shop};
 use crate::events::EventProcessorError;
 
 use nexus_common::db::queries::get::user_is_safe_to_delete;
@@ -98,11 +98,13 @@ pub async fn del(user_id: PubkyId) -> Result<(), EventProcessorError> {
 }
 
 /// Hides a user, their shop and all their listings because the configured
-/// moderator tagged the user's profile with a moderated label.
+/// moderator tagged the user's profile with a moderated label, and hides the
+/// text of every review they wrote (their ratings still count).
 ///
 /// The marker is recorded first: it is what keeps the shop and the listings
-/// out when their events arrive later or are replayed again, and what the
-/// transaction service reads to refuse sales (see [`ModeratedUser`]). Then
+/// out when their events arrive later or are replayed again, what hides the
+/// text of reviews indexed later, and what the transaction service reads to
+/// refuse sales (see [`ModeratedUser`]). Then the user's reviews are marked,
 /// every listing and the shop are removed from the graph, the details cache
 /// and every stream, and the user profile is removed as a moderated profile
 /// always was. Every step is idempotent, so a failure after the marker is
@@ -124,6 +126,7 @@ pub async fn moderate(
         chrono::Utc::now().timestamp_millis(),
     )
     .await?;
+    review::refresh_reviewer_moderation(&user_id).await?;
     remove_marketplace_content(&user_id).await?;
     del(user_id).await
 }
@@ -141,9 +144,12 @@ async fn remove_marketplace_content(user_id: &PubkyId) -> Result<(), EventProces
 ///
 /// A user no other marker hides gets their profile, shop and listings indexed
 /// again from their homeserver (a record the user has deleted stays gone, and
-/// a listing hidden by its own moderator tag stays hidden). The marker is
-/// removed only after that, so a failed fetch leaves the marker in place and
-/// the retried tag deletion starts over.
+/// a listing hidden by its own moderator tag stays hidden), and the text of
+/// their reviews shown again unless another marker hides it. The marker is
+/// first flagged as being released, which review moderation skips everywhere
+/// (see [`review::release_moderation`]), and removed only after that, so a
+/// failed fetch leaves the marker in place and the retried tag deletion starts
+/// over.
 pub async fn release_moderation(
     moderator_id: &PubkyId,
     tag_id: &str,
@@ -152,6 +158,7 @@ pub async fn release_moderation(
     if users.is_empty() {
         return Ok(false);
     }
+    ModeratedUser::mark_releasing(moderator_id, tag_id).await?;
 
     for user in users {
         let user_id = PubkyId::try_from(user.as_str()).map_err(EventProcessorError::generic)?;
@@ -161,6 +168,7 @@ pub async fn release_moderation(
             info!("Moderation tag removed; restoring user {user}");
             restore_from_homeserver(&user_id).await?;
         }
+        review::refresh_reviewer_moderation(&user).await?;
         ModeratedUser::delete(moderator_id, tag_id).await?;
         settle_after_release(&user_id, hidden_by_another_tag).await?;
     }

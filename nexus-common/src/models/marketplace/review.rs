@@ -1,5 +1,5 @@
-use super::ReviewResponseDetails;
-use crate::db::kv::{RedisResult, SortOrder};
+use super::{ReviewModeration, ReviewResponseDetails};
+use crate::db::kv::{put_field_if_exists, RedisResult, SortOrder};
 use crate::db::{
     exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, queries, GraphResult,
     OperationOutcome, RedisOps,
@@ -69,6 +69,11 @@ pub struct ReviewDetails {
     /// out of aggregates and review streams.
     #[serde(default)]
     pub superseded: bool,
+    /// The configured moderator's action on the review, if any. Review
+    /// streams withhold the text of a moderated review (`text` is empty);
+    /// an `excluded` review is also left out of every aggregate.
+    #[serde(default)]
+    pub moderation: Option<ReviewModeration>,
     pub created_at: String,
     pub updated_at: String,
     pub revision: i64,
@@ -112,6 +117,7 @@ impl ReviewDetails {
             edited_late: is_edited_late(&review.created_at, &review.updated_at),
             order_scoped: review.is_order_scoped(),
             superseded: false,
+            moderation: None,
             created_at: review.created_at.clone(),
             updated_at: review.updated_at.clone(),
             revision: review.revision,
@@ -289,6 +295,77 @@ impl ReviewDetails {
         Ok(())
     }
 
+    /// The ids of every review the reviewer has in the graph.
+    pub async fn ids_of_reviewer(reviewer_id: &str) -> GraphResult<Vec<String>> {
+        let rows =
+            fetch_all_rows_from_graph(queries::get::review_ids_of_reviewer(reviewer_id)).await?;
+        let mut review_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(review_id) = row.get("review_id")? {
+                review_ids.push(review_id);
+            }
+        }
+        Ok(review_ids)
+    }
+
+    /// The ids of every user who has a review in the graph.
+    pub async fn reviewer_ids() -> GraphResult<Vec<String>> {
+        let rows = fetch_all_rows_from_graph(queries::get::reviewer_ids()).await?;
+        let mut reviewer_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(reviewer_id) = row.get("reviewer_id")? {
+                reviewer_ids.push(reviewer_id);
+            }
+        }
+        Ok(reviewer_ids)
+    }
+
+    /// Re-derives an indexed review's moderation from the markers (see
+    /// [`ReviewModeration::get`]) and stores it on the edge and the details
+    /// JSON. Returns the updated details when the moderation changed, `None`
+    /// when it did not or the review is not indexed (its ingest reads the
+    /// markers). Only the JSON's `moderation` field is written, and only while
+    /// the review is still indexed: a review deleted meanwhile stays deleted.
+    pub async fn refresh_moderation(
+        reviewer_id: &str,
+        review_id: &str,
+    ) -> ModelResult<Option<Self>> {
+        let Some(mut details) = Self::get_from_index(reviewer_id, review_id).await? else {
+            return Ok(None);
+        };
+        let moderation = ReviewModeration::get(reviewer_id, review_id).await?;
+        if details.moderation == moderation {
+            return Ok(None);
+        }
+        exec_single_row(queries::put::set_review_moderation(
+            reviewer_id,
+            review_id,
+            moderation.as_ref(),
+        ))
+        .await?;
+        let indexed = put_field_if_exists(
+            &Self::prefix().await,
+            &[reviewer_id, review_id].join(":"),
+            "moderation",
+            &moderation,
+        )
+        .await?;
+        if !indexed {
+            return Ok(None);
+        }
+        details.moderation = moderation;
+        Ok(Some(details))
+    }
+
+    /// The review as review streams serve it: a moderated review's text is
+    /// withheld.
+    fn public(mut self) -> Self {
+        if self.moderation.is_some() {
+            self.text = String::new();
+        }
+        self
+    }
+
     /// Removes the review from the graph and every Redis index.
     pub async fn delete(&self) -> ModelResult<()> {
         exec_single_row(queries::del::delete_review(
@@ -410,7 +487,10 @@ impl ReviewStream {
         let views = reviews
             .into_iter()
             .zip(responses)
-            .map(|(review, response)| ReviewView { review, response })
+            .map(|(review, response)| ReviewView {
+                review: review.public(),
+                response,
+            })
             .collect();
 
         Ok(Some(Self(views)))
