@@ -249,6 +249,37 @@ pub async fn modify_json_field_once(
     Ok(applied == 1)
 }
 
+/// Sets one top-level `field` of an existing JSON document. The existence
+/// check and the write run in one Lua script, so a document deleted
+/// concurrently is never re-created with stale content. Returns whether the
+/// document existed.
+pub async fn put_field_if_exists<T: Serialize + Send + Sync>(
+    prefix: &str,
+    key: &str,
+    field: &str,
+    value: &T,
+) -> RedisResult<bool> {
+    let mut redis_conn = get_redis_conn().await?;
+    let index_key = format!("{prefix}:{key}");
+    let script = Script::new(
+        r#"
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return 0
+        end
+        redis.call('JSON.SET', KEYS[1], ARGV[1], ARGV[2])
+        return 1
+    "#,
+    );
+    let written: i64 = script
+        .key(&index_key)
+        .arg(format!("$.{field}"))
+        .arg(to_json_value(value)?.to_string())
+        .invoke_async(&mut redis_conn)
+        .await?;
+    debug!("Set field {field} of key {index_key} if it exists: {written}");
+    Ok(written == 1)
+}
+
 /// Handles storing a boolean value in Redis with an optional expiration.
 ///
 /// This function sets a key in Redis to either `1` or `0`, depending on the boolean value provided.

@@ -467,7 +467,7 @@ pub fn put_moderated_listing(
 /// Records that a moderator tag hides a user's shop and listings. Like the
 /// listing marker it is its own node, keyed by the moderator's tag record, and
 /// is not connected to the user: it can be written before the user, the shop
-/// or any listing is indexed.
+/// or any listing is indexed. Placing the tag again clears `releasing`.
 pub fn put_moderated_user(
     user_id: &str,
     uri: &str,
@@ -482,7 +482,8 @@ pub fn put_moderated_user(
          SET marker.user_id = $user_id,
              marker.uri = $uri,
              marker.label = $label,
-             marker.moderated_at = $moderated_at",
+             marker.moderated_at = $moderated_at
+         REMOVE marker.releasing",
     )
     .param("user_id", user_id)
     .param("uri", uri)
@@ -495,7 +496,7 @@ pub fn put_moderated_user(
 /// Records that a moderator tag moderates a review (`state` is `text_hidden`
 /// or `excluded`). Its own node, keyed by the moderator's tag record and not
 /// connected to the review edge: it can be written before the review is
-/// indexed and outlives edits of it.
+/// indexed and outlives edits of it. Placing the tag again clears `releasing`.
 #[allow(clippy::too_many_arguments)]
 pub fn put_moderated_review(
     reviewer_id: &str,
@@ -515,7 +516,8 @@ pub fn put_moderated_review(
              marker.uri = $uri,
              marker.label = $label,
              marker.state = $state,
-             marker.moderated_at = $moderated_at",
+             marker.moderated_at = $moderated_at
+         REMOVE marker.releasing",
     )
     .param("reviewer_id", reviewer_id)
     .param("review_id", review_id)
@@ -529,6 +531,7 @@ pub fn put_moderated_review(
 
 /// Records that a moderator tag excludes every review a user wrote. Its own
 /// node, keyed by the moderator's tag record and not connected to the user.
+/// Placing the tag again clears `releasing`.
 pub fn put_excluded_reviewer(
     user_id: &str,
     uri: &str,
@@ -543,7 +546,8 @@ pub fn put_excluded_reviewer(
          SET marker.user_id = $user_id,
              marker.uri = $uri,
              marker.label = $label,
-             marker.moderated_at = $moderated_at",
+             marker.moderated_at = $moderated_at
+         REMOVE marker.releasing",
     )
     .param("user_id", user_id)
     .param("uri", uri)
@@ -551,6 +555,44 @@ pub fn put_excluded_reviewer(
     .param("tag_id", tag_id)
     .param("label", label)
     .param("moderated_at", moderated_at)
+}
+
+/// Flags the `ModeratedUser` marker of one moderator tag as being released:
+/// review moderation no longer applies it (see
+/// [`crate::db::graph::queries::get::review_moderation`]), while the user's
+/// shop and listings stay hidden until the marker is deleted.
+pub fn mark_moderated_user_releasing(moderator_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "mark_moderated_user_releasing",
+        "MATCH (marker:ModeratedUser {moderator_id: $moderator_id, tag_id: $tag_id})
+         SET marker.releasing = true",
+    )
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+}
+
+/// Flags the `ModeratedReview` marker of one moderator tag as being released:
+/// review moderation no longer applies it.
+pub fn mark_moderated_review_releasing(moderator_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "mark_moderated_review_releasing",
+        "MATCH (marker:ModeratedReview {moderator_id: $moderator_id, tag_id: $tag_id})
+         SET marker.releasing = true",
+    )
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
+}
+
+/// Flags the `ExcludedReviewer` marker of one moderator tag as being released:
+/// review moderation no longer applies it.
+pub fn mark_excluded_reviewer_releasing(moderator_id: &str, tag_id: &str) -> Query {
+    Query::new(
+        "mark_excluded_reviewer_releasing",
+        "MATCH (marker:ExcludedReviewer {moderator_id: $moderator_id, tag_id: $tag_id})
+         SET marker.releasing = true",
+    )
+    .param("moderator_id", moderator_id)
+    .param("tag_id", tag_id)
 }
 
 /// Creates or updates a marketplace listing node of a seller.
