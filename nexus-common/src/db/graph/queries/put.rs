@@ -947,11 +947,7 @@ pub fn claim_backfill_run(
 ) -> Query {
     Query::new(
         "claim_backfill_run",
-        "MERGE (b:BackfillRun {job: $job})
-        ON CREATE SET b.status = 'pending', b.cursor = '', b.phase = $first_phase,
-            b.ahead = [], b.items = 0, b.requests = 0, b.refetched = 0, b.gone = 0,
-            b.unreachable = 0, b.failed = 0, b.aggregates = 0, b.revision = 0,
-            b.created_at = timestamp(), b.updated_at = timestamp()
+        "MATCH (b:BackfillRun {job: $job})
         SET b.revision = b.revision + 1
         WITH b
         WHERE (b.status <> 'done' OR $force)
@@ -979,6 +975,24 @@ pub fn claim_backfill_run(
     .param("owner", owner.to_string())
     .param("lease_ms", lease_ms)
     .param("force", force)
+}
+
+/// Creates a job's state node if it does not exist yet, and nothing else: an
+/// existing node is left exactly as it is. The claim is a plain `MATCH` and
+/// lock, like every other write to the node, because a `MERGE` there would
+/// take locks in another order and deadlock against a holder's writes.
+pub fn ensure_backfill_run(job: &str, first_phase: &str) -> Query {
+    Query::new(
+        "ensure_backfill_run",
+        "MERGE (b:BackfillRun {job: $job})
+        ON CREATE SET b.status = 'pending', b.cursor = '', b.phase = $first_phase,
+            b.ahead = [], b.items = 0, b.requests = 0, b.refetched = 0, b.gone = 0,
+            b.unreachable = 0, b.failed = 0, b.aggregates = 0, b.revision = 0,
+            b.created_at = timestamp(), b.updated_at = timestamp()
+        RETURN true AS flag;",
+    )
+    .param("job", job.to_string())
+    .param("first_phase", first_phase.to_string())
 }
 
 /// Extends the lease of the runner that owns the job. Returns no row when

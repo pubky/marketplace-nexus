@@ -1,5 +1,33 @@
-use crate::db::{exec_single_row, fetch_row_from_graph, queries, GraphResult};
+use crate::db::{exec_single_row, fetch_row_from_graph, queries, GraphError, GraphResult};
 use neo4rs::Row;
+use std::future::Future;
+use std::time::Duration;
+
+/// How often a write is tried when the graph answers with a transient error
+/// (a lock deadlock, for instance): the transaction was rolled back, so the
+/// same statement is safe to run again.
+const TRANSIENT_ATTEMPTS: u32 = 6;
+
+async fn retrying<T, F, Fut>(mut attempt: F) -> GraphResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = GraphResult<T>>,
+{
+    let mut tried = 1;
+    loop {
+        match attempt().await {
+            Err(e) if tried < TRANSIENT_ATTEMPTS && is_transient(&e) => {
+                tokio::time::sleep(Duration::from_millis(25 * u64::from(tried))).await;
+                tried += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+fn is_transient(error: &GraphError) -> bool {
+    matches!(error, GraphError::QueryFailed(e) if format!("{e:?}").contains("Neo.TransientError"))
+}
 
 /// Where a throttled-backfill job stands. Stored as `BackfillRun.status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,13 +166,19 @@ impl BackfillRun {
         lease_ms: i64,
         force: bool,
     ) -> GraphResult<BackfillClaim> {
-        let claimed = fetch_row_from_graph(queries::put::claim_backfill_run(
-            job,
-            first_phase,
-            owner,
-            lease_ms,
-            force,
-        ))
+        if Self::get(job).await?.is_none() {
+            retrying(|| exec_single_row(queries::put::ensure_backfill_run(job, first_phase)))
+                .await?;
+        }
+        let claimed = retrying(|| {
+            fetch_row_from_graph(queries::put::claim_backfill_run(
+                job,
+                first_phase,
+                owner,
+                lease_ms,
+                force,
+            ))
+        })
         .await?
         .is_some();
         let state = Self::get(job).await?.ok_or_else(|| {
@@ -161,11 +195,11 @@ impl BackfillRun {
 
     /// Extends the lease. `false` when another runner owns the job now.
     pub async fn renew(job: &str, owner: &str, lease_ms: i64) -> GraphResult<bool> {
-        Ok(
+        Ok(retrying(|| {
             fetch_row_from_graph(queries::put::renew_backfill_lease(job, owner, lease_ms))
-                .await?
-                .is_some(),
-        )
+        })
+        .await?
+        .is_some())
     }
 
     /// Persists the cursor, the finished items ahead of it and counter
@@ -176,15 +210,17 @@ impl BackfillRun {
         progress: &BackfillProgress,
         lease_ms: i64,
     ) -> GraphResult<bool> {
-        Ok(fetch_row_from_graph(queries::put::record_backfill_progress(
-            job,
-            owner,
-            &progress.cursor,
-            &progress.phase,
-            progress.ahead.clone(),
-            progress.delta.as_array(),
-            lease_ms,
-        ))
+        Ok(retrying(|| {
+            fetch_row_from_graph(queries::put::record_backfill_progress(
+                job,
+                owner,
+                &progress.cursor,
+                &progress.phase,
+                progress.ahead.clone(),
+                progress.delta.as_array(),
+                lease_ms,
+            ))
+        })
         .await?
         .is_some())
     }
@@ -197,12 +233,14 @@ impl BackfillRun {
         status: BackfillStatus,
         stop_reason: Option<&str>,
     ) -> GraphResult<bool> {
-        Ok(fetch_row_from_graph(queries::put::finish_backfill_run(
-            job,
-            owner,
-            status.as_str(),
-            stop_reason,
-        ))
+        Ok(retrying(|| {
+            fetch_row_from_graph(queries::put::finish_backfill_run(
+                job,
+                owner,
+                status.as_str(),
+                stop_reason,
+            ))
+        })
         .await?
         .is_some())
     }
