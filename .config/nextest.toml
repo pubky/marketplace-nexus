@@ -1,0 +1,27 @@
+nextest-version = "0.9.70"
+
+# Whole-graph tests run alone.
+#
+# These tests call a production operation that scans or rewrites every row of
+# the shared Neo4j and Redis state: the legacy reserve scrub evicts and rewrites
+# the details cache entry of every listing, the auction terms backfill reindexes
+# every auction listing missing its terms, and the stale listing prune checks
+# and deletes every listing whose record is gone. nextest runs each test in its
+# own process against the same databases, so when one of them overlaps any other
+# listing test it evicts or rewrites that test's rows between its steps and the
+# other test fails once, then passes on a rerun. Occupying every test slot makes
+# them run with nothing else in flight; the rest of the suite still runs in
+# parallel.
+[[profile.default.overrides]]
+filter = '''
+package(nexus-watcher) & (
+    test(=event_processor::marketplace::listing::test_auction_terms_backfill_reindexes_pre_term_rows)
+  | test(=event_processor::marketplace::listing::test_auction_terms_backfill_reports_missing_record_as_gone)
+  | test(=event_processor::marketplace::listing::legacy_reserve_scrub_removes_graph_property_and_rewrites_redis)
+  | test(=event_processor::marketplace::listing::reserve_scrub_does_not_delete_a_republish_after_missing_re_read)
+  | test(=event_processor::marketplace::stale_prune::prune_removes_only_stale_listings_and_cleans_every_index)
+  | test(=event_processor::marketplace::stale_prune::a_prune_interrupted_at_any_phase_is_finished_by_the_next_run)
+  | test(=event_processor::marketplace::stale_prune::a_pending_listing_whose_record_came_back_is_restored_by_the_next_run)
+)
+'''
+threads-required = 'num-test-threads'
