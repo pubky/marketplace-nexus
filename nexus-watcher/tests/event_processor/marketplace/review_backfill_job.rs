@@ -361,6 +361,78 @@ async fn a_review_that_left_its_homeserver_is_counted_gone_and_not_retried() -> 
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn an_unreachable_reviewer_stays_out_of_the_buckets_and_is_not_retried() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let p = published(&mut test, "Watcher:ReviewJob:Unreachable", 961).await?;
+    let attestor_id = attestor_pubky(&test_attestor_key());
+    let counted = seller_summary(&p.market.seller_id).await.unwrap();
+    assert_eq!(counted.buckets[&attestor_id].buyers, 1);
+
+    // A verified review indexed before the `iat` was kept, whose reviewer's
+    // homeserver cannot be reached.
+    let ghost_id = Keypair::random().public_key().to_z32();
+    exec_single_row(
+        Query::new(
+            "test_ghost_reviewer",
+            "MERGE (:User {id: $id, name: 'ghost', indexed_at: 0})",
+        )
+        .param("id", ghost_id.as_str()),
+    )
+    .await?;
+    let mut ghost = indexed(&p.buyer_id, &p.review_id).await.unwrap();
+    ghost.reviewer_id = ghost_id.clone();
+    ghost.review_id = format!("ghost{}", &ghost_id[..8]);
+    ghost.order_ref = Some(format!("{:064x}", 962));
+    ghost.iat = None;
+    ghost.price_weight = None;
+    ghost.put_to_graph().await?;
+    ghost.put_to_index(false).await?;
+    ReputationSummary::recompute_subject(
+        &p.market.seller_id,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+    )
+    .await?;
+    assert_eq!(seller_summary(&p.market.seller_id).await.unwrap().count, 2);
+
+    let job = TrustBucketsJob::new()
+        .run_key(unique("unreachable"))
+        .only_reviewers(vec![ghost_id.clone()]);
+    let report = run(&job, options()).await;
+    assert_eq!(report.outcome, Outcome::Done);
+    assert_eq!(report.exit_code(), EXIT_OK);
+    assert_eq!(report.state.counters.unreachable, 1);
+    assert_eq!(report.state.counters.refetched, 0);
+    assert_eq!(report.state.counters.failed, 0);
+    assert_eq!(report.state.counters.requests, 1);
+
+    // Never over-counted: the unreachable review is no bucketed voice.
+    let after = seller_summary(&p.market.seller_id).await.unwrap();
+    assert_eq!(after.buckets, counted.buckets);
+    assert_eq!(
+        indexed(&ghost_id, &ghost.review_id).await.unwrap().iat,
+        None
+    );
+
+    // Not retried by a resumed or repeated run of the same job.
+    let again = run(&job, options()).await;
+    assert_eq!(again.outcome, Outcome::AlreadyDone);
+    assert_eq!(again.state.counters.requests, 1);
+
+    BackfillRun::delete(job.id()).await?;
+    ghost.delete().await?;
+    exec_single_row(
+        Query::new(
+            "test_delete_ghost_reviewer",
+            "MATCH (u:User {id: $id}) DETACH DELETE u",
+        )
+        .param("id", ghost_id.as_str()),
+    )
+    .await?;
+    test.del(&p.buyer_kp, &p.path).await?;
+    tear_down(&mut test, p).await
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn the_discovery_job_indexes_unseen_reviews_once_and_counts_each_outcome() -> Result<()> {
     let mut test = WatcherTest::setup().await?;
     let market = market(&mut test, "Watcher:ReviewJob:Discovery").await?;
