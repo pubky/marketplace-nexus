@@ -46,6 +46,8 @@ async fn run() -> Result<u8, DynError> {
             },
             DbCommands::PruneStaleListings(args) => prune_stale_listings_command(args).await?,
             DbCommands::Backfill(BackfillCommands::Reviews(args)) => {
+                let builder = MigrationBuilder::default().await?;
+                builder.init_stack().await?;
                 return backfill_reviews_command(args).await;
             }
         },
