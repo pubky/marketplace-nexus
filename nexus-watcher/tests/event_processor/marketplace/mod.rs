@@ -5,6 +5,7 @@ mod listing;
 mod moderation;
 mod review;
 mod review_moderation;
+mod review_per_item;
 mod shop;
 mod stale_prune;
 mod tag;

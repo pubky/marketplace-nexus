@@ -110,6 +110,12 @@ One-shot migrations (see the runbook in `README.md`):
   changed, so the reviews of users moderated before review moderation shipped
   have their text hidden. It needs only the databases; run it once after the
   release that adds review moderation.
+- `ReviewPerItemRecompute1792584000` recounts reviews for per-item reviews:
+  a legacy review that an order-scoped review of another item of the same
+  order superseded counts again, each attested order's seller rating
+  (shipping, communication) counts once, and every review aggregate is
+  recomputed. No record is rewritten. It needs only the databases; run it
+  once after the release that adds per-item reviews.
 
 Run them where the databases are reachable, for example inside the `nexusd`
 container:

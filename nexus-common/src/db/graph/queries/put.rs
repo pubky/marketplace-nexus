@@ -765,6 +765,11 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
             r.edited_late = $edited_late,
             r.moderation = $moderation,
             r.moderation_reason = $moderation_reason,
+            // A review without an attested order counts its own seller
+            // fields; one with an order keeps the flag resolve_seller_fields
+            // settles across the order's copies.
+            r.seller_fields_counted = CASE WHEN $order_keyed
+                THEN coalesce(r.seller_fields_counted, false) ELSE true END,
             r.created_at = $created_at,
             r.updated_at = $updated_at,
             r.revision = $revision
@@ -801,11 +806,56 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
             .as_ref()
             .map(|moderation| moderation.reason.clone()),
     )
+    .param("order_keyed", review.order_key().is_some())
     .param("created_at", review.created_at.to_string())
     .param("updated_at", review.updated_at.to_string())
     .param("revision", review.revision);
 
     Ok(query)
+}
+
+/// Settles which copy of an order's seller fields counts. Every item review
+/// of an order carries the seller rating (shipping, communication); among the
+/// reviewer's verified edges of one `(attestor_id, order_ref, role)` (the
+/// seller rating is one per order and buyer) the one that counts
+/// in the aggregates (not superseded, not excluded) with the latest
+/// `updated_at`, ties to the lowest review id, is flagged
+/// `seller_fields_counted` and every other copy is cleared.
+pub fn resolve_seller_fields(
+    reviewer_id: &str,
+    attestor_id: &str,
+    order_ref: &str,
+    role: &str,
+) -> Query {
+    Query::new(
+        "resolve_seller_fields",
+        "MATCH (:User {id: $reviewer_id})-[r:REVIEWED]->(:User)
+         WHERE r.order_ref = $order_ref AND r.attestor_id = $attestor_id
+             AND r.role = $role AND r.verified
+         WITH r, (coalesce(r.superseded, false) = false
+             AND coalesce(r.moderation, '') <> 'excluded') AS counted
+         ORDER BY counted DESC, datetime(r.updated_at) DESC, r.review_id ASC
+         WITH collect(r) AS copies, collect(counted) AS counted
+         UNWIND range(0, size(copies) - 1) AS position
+         WITH copies[position] AS copy, position = 0 AND counted[0] AS flag
+         SET copy.seller_fields_counted = flag",
+    )
+    .param("reviewer_id", reviewer_id)
+    .param("attestor_id", attestor_id)
+    .param("order_ref", order_ref)
+    .param("role", role)
+}
+
+/// Flags every review edge without an attested order as counting its own
+/// seller fields (one-shot recompute of edges indexed before the flag).
+pub fn flag_unkeyed_seller_fields() -> Query {
+    Query::new(
+        "flag_unkeyed_seller_fields",
+        "MATCH (:User)-[r:REVIEWED]->(:User)
+         WHERE NOT (coalesce(r.verified, false) AND r.attestor_id IS NOT NULL
+             AND r.order_ref IS NOT NULL)
+         SET r.seller_fields_counted = true",
+    )
 }
 
 /// Marks a review edge as superseded by its order-scoped twin (or clears

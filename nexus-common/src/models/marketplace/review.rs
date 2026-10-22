@@ -191,8 +191,9 @@ impl ReviewDetails {
     }
 
     /// The other verified reviews by this reviewer, in this role, that carry
-    /// the same attested order `(attestor, order_ref)`: a legacy record and
-    /// its order-scoped twin. Returns `(review_id, order_scoped)` pairs.
+    /// the same attested order `(attestor, order_ref)` for the same listing:
+    /// a legacy record and its order-scoped twin. Returns
+    /// `(review_id, order_scoped)` pairs.
     async fn order_twins(&self) -> GraphResult<Vec<(String, bool)>> {
         let (Some(attestor_id), Some(order_ref)) = (&self.attestor_id, &self.order_ref) else {
             return Ok(Vec::new());
@@ -203,6 +204,8 @@ impl ReviewDetails {
             self.role.as_str(),
             attestor_id,
             order_ref,
+            &self.listing_owner_id,
+            &self.listing_id,
         ))
         .await?;
         Ok(rows
@@ -240,12 +243,13 @@ impl ReviewDetails {
         Ok(())
     }
 
-    /// Counts a verified review once per attested order (specs `.14`
-    /// counting rule): an order-scoped record supersedes every legacy record
-    /// carrying the same `(attestor, order_ref)` in the same role, and a
-    /// legacy record that arrives after its scoped twin is superseded at
-    /// once. Superseded records stay indexed but leave the aggregates and the
-    /// review streams. Unverified records are never part of this.
+    /// Counts a verified review once per attested order and item (specs
+    /// `.14` counting rule): an order-scoped record supersedes every legacy
+    /// record carrying the same `(attestor, order_ref)` in the same role for
+    /// the same listing, and a legacy record that arrives after its scoped
+    /// twin is superseded at once. Superseded records stay indexed but leave
+    /// the aggregates and the review streams. Unverified records are never
+    /// part of this.
     ///
     /// `prior` is the record's indexed state before this write. An edit that
     /// drops or changes a scoped record's attested order (say, its
@@ -293,6 +297,91 @@ impl ReviewDetails {
             }
         }
         Ok(())
+    }
+
+    /// The reviewer's attested order `(reviewer_id, attestor_id, order_ref,
+    /// role)` a verified review belongs to: its seller fields count once per
+    /// order and buyer.
+    pub fn order_key(&self) -> Option<(&str, &str, &str, PubkyAppReviewRole)> {
+        if !self.verified {
+            return None;
+        }
+        match (&self.attestor_id, &self.order_ref) {
+            (Some(attestor_id), Some(order_ref)) => {
+                Some((&self.reviewer_id, attestor_id, order_ref, self.role))
+            }
+            _ => None,
+        }
+    }
+
+    /// Settles which copy of a reviewer's attested order's seller fields
+    /// counts (see [`queries::put::resolve_seller_fields`]).
+    pub async fn resolve_seller_fields(
+        reviewer_id: &str,
+        attestor_id: &str,
+        order_ref: &str,
+        role: PubkyAppReviewRole,
+    ) -> GraphResult<()> {
+        exec_single_row(queries::put::resolve_seller_fields(
+            reviewer_id,
+            attestor_id,
+            order_ref,
+            role.as_str(),
+        ))
+        .await
+    }
+
+    /// Every reviewer's attested order with a verified review in the graph.
+    pub async fn order_keys() -> GraphResult<Vec<(String, String, String, PubkyAppReviewRole)>> {
+        let rows = fetch_all_rows_from_graph(queries::get::review_order_keys()).await?;
+        let mut keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            let role: String = row.get("role")?;
+            let Some(role) = role_from_graph(&role) else {
+                continue;
+            };
+            if let (Some(attestor_id), Some(order_ref)) =
+                (row.get("attestor_id")?, row.get("order_ref")?)
+            {
+                keys.push((row.get("reviewer_id")?, attestor_id, order_ref, role));
+            }
+        }
+        Ok(keys)
+    }
+
+    /// Every review aggregate scope in the graph: the `(subject_id, role)`
+    /// subject scopes and the `(listing_owner_id, listing_id)` listing scopes.
+    pub async fn aggregate_scopes(
+    ) -> GraphResult<(Vec<(String, PubkyAppReviewRole)>, Vec<(String, String)>)> {
+        let rows = fetch_all_rows_from_graph(queries::get::review_aggregate_scopes()).await?;
+        let mut subjects = std::collections::BTreeSet::new();
+        let mut listings = std::collections::BTreeSet::new();
+        for row in rows {
+            let subject_id: Option<String> = row.get("subject_id")?;
+            let role: String = row.get("role")?;
+            if role_from_graph(&role).is_none() {
+                continue;
+            }
+            if let Some(subject_id) = subject_id {
+                subjects.insert((subject_id, role));
+            }
+            let listing_owner_id: Option<String> = row.get("listing_owner_id")?;
+            let listing_id: Option<String> = row.get("listing_id")?;
+            if let (Some(listing_owner_id), Some(listing_id)) = (listing_owner_id, listing_id) {
+                listings.insert((listing_owner_id, listing_id));
+            }
+        }
+        let subjects = subjects
+            .into_iter()
+            .filter_map(|(subject_id, role)| role_from_graph(&role).map(|role| (subject_id, role)))
+            .collect();
+        Ok((subjects, listings.into_iter().collect()))
+    }
+
+    /// Flags every review edge without an attested order as counting its own
+    /// seller fields.
+    pub async fn flag_unkeyed_seller_fields() -> GraphResult<()> {
+        exec_single_row(queries::put::flag_unkeyed_seller_fields()).await
     }
 
     /// The ids of every review the reviewer has in the graph.
@@ -495,6 +584,16 @@ impl ReviewStream {
 
         Ok(Some(Self(views)))
     }
+}
+
+/// The review role stored on a `REVIEWED` edge.
+fn role_from_graph(role: &str) -> Option<PubkyAppReviewRole> {
+    [
+        PubkyAppReviewRole::BuyerReviewingSeller,
+        PubkyAppReviewRole::SellerReviewingBuyer,
+    ]
+    .into_iter()
+    .find(|candidate| candidate.as_str() == role)
 }
 
 /// True when `updated_at` is more than the marketplace edit window after

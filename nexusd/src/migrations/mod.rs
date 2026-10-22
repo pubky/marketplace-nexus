@@ -14,6 +14,7 @@ use crate::migrations::migrations_list::listing_reserve_scrub_1789805700::Listin
 use crate::migrations::migrations_list::remove_muted_1771718400::RemoveMuted1771718400;
 use crate::migrations::migrations_list::review_backfill_1787905961::ReviewBackfill1787905961;
 use crate::migrations::migrations_list::review_moderation_recompute_1792579958::ReviewModerationRecompute1792579958;
+use crate::migrations::migrations_list::review_per_item_recompute_1792584000::ReviewPerItemRecompute1792584000;
 use crate::migrations::migrations_list::users_by_pk_reindex_1751635096::UsersByPkReindex1751635096;
 /// Registers migrations with the `MigrationManager`
 ///
@@ -49,6 +50,7 @@ pub fn import_migrations(migration_manager: &mut MigrationManager) {
         Box::new(ReviewBackfill1787905961),
         Box::new(ListingReserveScrub1789805700),
         Box::new(ReviewModerationRecompute1792579958),
+        Box::new(ReviewPerItemRecompute1792584000),
     ];
     for migration in migrations {
         migration_manager.register(migration);

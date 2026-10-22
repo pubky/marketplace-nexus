@@ -271,6 +271,7 @@ pub fn test_attestation_claims(
         order_ref: order_ref_seed.to_string().repeat(64),
         completed_on: "2026-08-20".to_string(),
         amount_band: None,
+        price_decade: None,
         iat: 1_787_000_000,
     }
 }
