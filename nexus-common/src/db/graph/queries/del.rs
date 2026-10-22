@@ -259,3 +259,12 @@ pub fn delete_file(owner_id: &str, file_id: &str) -> Query {
     .param("id", file_id.to_string())
     .param("owner_id", owner_id.to_string())
 }
+
+/// Removes a throttled-backfill job's state.
+pub fn delete_backfill_run(job: &str) -> Query {
+    Query::new(
+        "delete_backfill_run",
+        "MATCH (b:BackfillRun {job: $job}) DETACH DELETE b",
+    )
+    .param("job", job.to_string())
+}

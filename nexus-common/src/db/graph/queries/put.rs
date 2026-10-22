@@ -927,3 +927,141 @@ pub fn create_homeserver(homeserver_id: &str) -> Query {
     )
     .param("id", homeserver_id)
 }
+
+/// Claims a throttled-backfill job for one runner, in a single statement.
+///
+/// The row is created on first use. The claim succeeds when the job is not
+/// `done` (or `force` is set) and no runner holds a live lease, that is the
+/// status is not `running` or its lease has expired. The leading write takes
+/// the node's lock, so two runners racing here are serialised and the second
+/// evaluates the conditions against what the first committed: exactly one
+/// claim wins. `force` also resets the cursor, counters and phase. The query
+/// returns no row when the claim is refused. All times are the graph
+/// server's clock.
+pub fn claim_backfill_run(
+    job: &str,
+    first_phase: &str,
+    owner: &str,
+    lease_ms: i64,
+    force: bool,
+) -> Query {
+    Query::new(
+        "claim_backfill_run",
+        "MERGE (b:BackfillRun {job: $job})
+        ON CREATE SET b.status = 'pending', b.cursor = '', b.phase = $first_phase,
+            b.ahead = [], b.items = 0, b.requests = 0, b.refetched = 0, b.gone = 0,
+            b.unreachable = 0, b.failed = 0, b.aggregates = 0, b.revision = 0,
+            b.created_at = timestamp(), b.updated_at = timestamp()
+        SET b.revision = b.revision + 1
+        WITH b
+        WHERE (b.status <> 'done' OR $force)
+          AND (b.status <> 'running' OR b.lease_expires_at IS NULL
+               OR b.lease_expires_at <= timestamp())
+        SET b.status = 'running', b.lease_owner = $owner,
+            b.lease_expires_at = timestamp() + $lease_ms,
+            b.updated_at = timestamp(), b.stop_reason = null,
+            b.started_at = CASE WHEN $force OR b.started_at IS NULL
+                                THEN timestamp() ELSE b.started_at END,
+            b.cursor = CASE WHEN $force THEN '' ELSE b.cursor END,
+            b.phase = CASE WHEN $force THEN $first_phase ELSE b.phase END,
+            b.ahead = CASE WHEN $force THEN [] ELSE b.ahead END,
+            b.items = CASE WHEN $force THEN 0 ELSE b.items END,
+            b.requests = CASE WHEN $force THEN 0 ELSE b.requests END,
+            b.refetched = CASE WHEN $force THEN 0 ELSE b.refetched END,
+            b.gone = CASE WHEN $force THEN 0 ELSE b.gone END,
+            b.unreachable = CASE WHEN $force THEN 0 ELSE b.unreachable END,
+            b.failed = CASE WHEN $force THEN 0 ELSE b.failed END,
+            b.aggregates = CASE WHEN $force THEN 0 ELSE b.aggregates END
+        RETURN true AS flag;",
+    )
+    .param("job", job.to_string())
+    .param("first_phase", first_phase.to_string())
+    .param("owner", owner.to_string())
+    .param("lease_ms", lease_ms)
+    .param("force", force)
+}
+
+/// Extends the lease of the runner that owns the job. Returns no row when
+/// another runner owns it (the lease was lost).
+pub fn renew_backfill_lease(job: &str, owner: &str, lease_ms: i64) -> Query {
+    Query::new(
+        "renew_backfill_lease",
+        "MATCH (b:BackfillRun {job: $job})
+        SET b.revision = b.revision + 1
+        WITH b
+        WHERE b.lease_owner = $owner AND b.status = 'running'
+        SET b.lease_expires_at = timestamp() + $lease_ms
+        RETURN true AS flag;",
+    )
+    .param("job", job.to_string())
+    .param("owner", owner.to_string())
+    .param("lease_ms", lease_ms)
+}
+
+/// One processed item's progress: the keyset cursor, the finished items
+/// ahead of it, and the counter increments, written only while the runner
+/// still owns the job (the lock-taking write makes the ownership check and
+/// the update one step). Returns no row when the lease was lost.
+#[allow(clippy::too_many_arguments)]
+pub fn record_backfill_progress(
+    job: &str,
+    owner: &str,
+    cursor: &str,
+    phase: &str,
+    ahead: Vec<String>,
+    delta: [i64; 7],
+    lease_ms: i64,
+) -> Query {
+    let [items, requests, refetched, gone, unreachable, failed, aggregates] = delta;
+    Query::new(
+        "record_backfill_progress",
+        "MATCH (b:BackfillRun {job: $job})
+        SET b.revision = b.revision + 1
+        WITH b
+        WHERE b.lease_owner = $owner AND b.status = 'running'
+        SET b.cursor = $cursor, b.phase = $phase, b.ahead = $ahead,
+            b.items = b.items + $items, b.requests = b.requests + $requests,
+            b.refetched = b.refetched + $refetched, b.gone = b.gone + $gone,
+            b.unreachable = b.unreachable + $unreachable, b.failed = b.failed + $failed,
+            b.aggregates = b.aggregates + $aggregates,
+            b.updated_at = timestamp(), b.lease_expires_at = timestamp() + $lease_ms
+        RETURN true AS flag;",
+    )
+    .param("job", job.to_string())
+    .param("owner", owner.to_string())
+    .param("cursor", cursor.to_string())
+    .param("phase", phase.to_string())
+    .param("ahead", ahead)
+    .param("items", items)
+    .param("requests", requests)
+    .param("refetched", refetched)
+    .param("gone", gone)
+    .param("unreachable", unreachable)
+    .param("failed", failed)
+    .param("aggregates", aggregates)
+    .param("lease_ms", lease_ms)
+}
+
+/// Ends a run: sets the final status and releases the lease, only while the
+/// runner still owns the job. Returns no row when the lease was lost.
+pub fn finish_backfill_run(
+    job: &str,
+    owner: &str,
+    status: &str,
+    stop_reason: Option<&str>,
+) -> Query {
+    Query::new(
+        "finish_backfill_run",
+        "MATCH (b:BackfillRun {job: $job})
+        SET b.revision = b.revision + 1
+        WITH b
+        WHERE b.lease_owner = $owner AND b.status = 'running'
+        SET b.status = $status, b.stop_reason = $stop_reason,
+            b.lease_owner = null, b.lease_expires_at = null, b.updated_at = timestamp()
+        RETURN true AS flag;",
+    )
+    .param("job", job.to_string())
+    .param("owner", owner.to_string())
+    .param("status", status.to_string())
+    .param("stop_reason", stop_reason.map(str::to_string))
+}

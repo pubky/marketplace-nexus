@@ -1,3 +1,4 @@
+use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
 use crate::events::handlers::listing::is_homeserver_not_found;
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
@@ -6,7 +7,7 @@ use nexus_common::db::{OperationOutcome, PubkyConnector};
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::marketplace::{
     ExcludedReviewer, ModeratedReview, ReputationSummary, ReviewDetails, ReviewModeration,
-    ReviewModerationState,
+    ReviewModerationState, ReviewTouch,
 };
 use nexus_common::models::user::UserDetails;
 use nexus_common::types::DynError;
@@ -25,7 +26,23 @@ use tracing::{debug, info, warn};
 /// review is indexed as unverified and labeled (ratified D5). WHO counts as
 /// a trusted attestor is client policy — the index stores each verified
 /// review's attestor pubky and lets consumers decide display.
+///
+/// The review is marked as touched before anything is written, so a reader
+/// copying records into the index outside the event feed (the throttled
+/// backfill) can tell the feed changed the review after its read began.
 pub async fn sync_put(
+    review: PubkyAppMarketplaceReview,
+    user_id: PubkyId,
+    review_id: String,
+) -> Result<(), EventProcessorError> {
+    ReviewTouch::mark(&user_id, &review_id, false).await?;
+    index_review(review, user_id, review_id).await
+}
+
+/// The ingest [`sync_put`] runs, without marking the review as touched. For
+/// callers that fence their own read against the event feed
+/// ([`ingest_read_review`]); the feed itself goes through [`sync_put`].
+pub async fn index_review(
     review: PubkyAppMarketplaceReview,
     user_id: PubkyId,
     review_id: String,
@@ -79,6 +96,13 @@ pub async fn sync_put(
 }
 
 pub async fn del(user_id: PubkyId, review_id: String) -> Result<(), EventProcessorError> {
+    ReviewTouch::mark(&user_id, &review_id, true).await?;
+    unindex_review(user_id, review_id).await
+}
+
+/// Removes an indexed review, whatever its homeserver says now. Returns
+/// `SkipIndexing` when it is not indexed.
+async fn unindex_review(user_id: PubkyId, review_id: String) -> Result<(), EventProcessorError> {
     debug!("Deleting marketplace review: {}/{}", user_id, review_id);
 
     let Some(details) = ReviewDetails::get_from_index(&user_id, &review_id).await? else {
@@ -422,38 +446,67 @@ pub async fn backfill_unindexed_reviews() -> Result<ReviewBackfill, DynError> {
 /// (cursor-paginated), skip ids the graph already carries, ingest the rest.
 pub async fn backfill_reviews_for_user(user_id: &str) -> Result<ReviewBackfill, DynError> {
     let mut summary = ReviewBackfill::default();
-    backfill_user_reviews(user_id, &mut summary).await?;
-    Ok(summary)
+    match scan_user_reviews(&Unthrottled, user_id, &mut summary).await {
+        Ok(()) => Ok(summary),
+        Err(UserScanError::Failed(e)) => Err(e),
+        Err(UserScanError::Stopped(stop)) => Err(Box::new(stop)),
+    }
 }
 
-async fn backfill_user_reviews(
+/// Why a user's directory scan did not finish.
+#[derive(Debug)]
+pub enum UserScanError {
+    /// The request gate stopped the run mid-scan; the user is unfinished.
+    Stopped(GateStop),
+    /// The scan could not run (graph, client or request construction).
+    Failed(DynError),
+}
+
+/// One user's discovery pass through a request gate. Every LIST page and
+/// every record GET takes a permit from `gate`, and the tallies go to
+/// `summary`, which holds what was done so far when the gate stops the scan.
+pub async fn scan_user_reviews(
+    gate: &dyn RequestGate,
     user_id: &str,
     summary: &mut ReviewBackfill,
-) -> Result<(), DynError> {
-    let indexed: std::collections::HashSet<String> =
-        get_indexed_review_ids(user_id).await?.into_iter().collect();
+) -> Result<(), UserScanError> {
+    let indexed: std::collections::HashSet<String> = get_indexed_review_ids(user_id)
+        .await
+        .map_err(UserScanError::Failed)?
+        .into_iter()
+        .collect();
 
-    let pubky = PubkyConnector::get()?;
+    let pubky = PubkyConnector::get().map_err(|e| UserScanError::Failed(e.into()))?;
     let storage = pubky.public_storage();
     let directory = format!("pubky://{user_id}/pub/pubky.app/marketplace/v1/reviews/");
 
     let mut cursor: Option<String> = None;
     loop {
-        let mut request = storage.list(directory.as_str())?.shallow(true).limit(500);
+        let mut request = storage
+            .list(directory.as_str())
+            .map_err(|e| UserScanError::Failed(e.into()))?
+            .shallow(true)
+            .limit(500);
         if let Some(cursor_value) = &cursor {
             request = request.cursor(cursor_value);
         }
+        let permit = gate.acquire().await.map_err(UserScanError::Stopped)?;
         let entries = match request.send().await {
-            Ok(entries) => entries,
+            Ok(entries) => {
+                permit.succeeded();
+                entries
+            }
             // A user with no reviews directory answers 404. Other LIST
             // failures mean this user's homeserver is unreachable. Neither
             // case may permanently block the one-shot migration.
             Err(e) if is_homeserver_not_found(&e) => {
+                permit.succeeded();
                 debug!("Review directory for user {} is gone", user_id);
                 summary.gone += 1;
                 return Ok(());
             }
             Err(e) => {
+                permit.failed();
                 warn!(
                     "Review directory for user {} is unreachable; skipping: {:?}",
                     user_id, e
@@ -475,15 +528,16 @@ async fn backfill_user_reviews(
                 summary.already_indexed += 1;
                 continue;
             }
-            match ingest_review_from_homeserver(user_id, review_id).await {
-                Ok(true) => summary.indexed += 1,
-                Ok(false) => {
+            match ingest_review_through(gate, user_id, review_id).await {
+                Ok(ReviewIngest::Ingested) => summary.indexed += 1,
+                Ok(_) => {
                     debug!(
                         "Review {}/{} left the homeserver after it was listed; skipping",
                         user_id, review_id
                     );
                     summary.gone += 1;
                 }
+                Err(ReviewIngestError::Stopped(stop)) => return Err(UserScanError::Stopped(stop)),
                 Err(e) => {
                     warn!(
                         "Review backfill could not ingest {}/{}: {:?}",
@@ -501,6 +555,50 @@ async fn backfill_user_reviews(
     }
 }
 
+/// Why reading or ingesting one review record failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ReviewIngestError {
+    /// The request gate stopped before the request was sent.
+    #[error("{0}")]
+    Stopped(GateStop),
+    /// The homeserver could not be reached or did not answer.
+    #[error("homeserver request failed: {0}")]
+    Unreachable(EventProcessorError),
+    /// The homeserver answered with something that is not a review record.
+    #[error("not a valid review record: {0}")]
+    Invalid(EventProcessorError),
+    /// The record was read but the index could not take it.
+    #[error("could not be indexed: {0}")]
+    Index(EventProcessorError),
+}
+
+impl From<ReviewIngestError> for EventProcessorError {
+    fn from(error: ReviewIngestError) -> Self {
+        match error {
+            ReviewIngestError::Stopped(stop) => EventProcessorError::generic(stop.to_string()),
+            ReviewIngestError::Unreachable(e)
+            | ReviewIngestError::Invalid(e)
+            | ReviewIngestError::Index(e) => e,
+        }
+    }
+}
+
+/// How ingesting one review through the fence ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewIngest {
+    /// The record is indexed.
+    Ingested,
+    /// The record is not on the homeserver, or the feed deleted it after it
+    /// was read; nothing is indexed (and nothing stale is left behind).
+    Gone,
+    /// The event feed changed the review after it was read, so the record in
+    /// hand may be stale: read it again.
+    Changed,
+}
+
+/// How often one review is read again because the feed kept changing it.
+const MAX_READS_PER_REVIEW: usize = 3;
+
 /// Fetches one review record from the reviewer's homeserver (the canonical
 /// source) and runs the normal ingest. Returns `false` without indexing when
 /// the record no longer exists on the homeserver.
@@ -508,42 +606,165 @@ pub async fn ingest_review_from_homeserver(
     user_id: &str,
     review_id: &str,
 ) -> Result<bool, EventProcessorError> {
-    let reviewer = PubkyId::try_from(user_id).map_err(EventProcessorError::generic)?;
-    match fetch_review_record(user_id, review_id).await? {
-        Some(review) => {
-            sync_put(review, reviewer, review_id.to_string()).await?;
-            Ok(true)
-        }
-        None => Ok(false),
+    match ingest_review_through(&Unthrottled, user_id, review_id).await? {
+        ReviewIngest::Ingested => Ok(true),
+        ReviewIngest::Gone | ReviewIngest::Changed => Ok(false),
     }
 }
 
-/// Reads one review record from the reviewer's homeserver; `None` when the
-/// record no longer exists there.
-async fn fetch_review_record(
+/// Reads one review from the reviewer's homeserver through `gate` and indexes
+/// it, guarded against the event feed: a review the feed deleted after it was
+/// read is never brought back, and one the feed edited is read again.
+pub async fn ingest_review_through(
+    gate: &dyn RequestGate,
     user_id: &str,
     review_id: &str,
-) -> Result<Option<PubkyAppMarketplaceReview>, EventProcessorError> {
+) -> Result<ReviewIngest, ReviewIngestError> {
+    for _ in 0..MAX_READS_PER_REVIEW {
+        let read = read_review(gate, user_id, review_id).await?;
+        match ingest_read_review(read).await? {
+            ReviewIngest::Changed => continue,
+            ended => return Ok(ended),
+        }
+    }
+    Err(ReviewIngestError::Index(EventProcessorError::generic(
+        format!("review {user_id}/{review_id} changed on each of {MAX_READS_PER_REVIEW} reads"),
+    )))
+}
+
+/// A review record read from its homeserver, with the moment the read began
+/// on the Redis clock. The record may be written to the index only if the
+/// event feed has not touched the review since that moment.
+pub struct ReviewRead {
+    reviewer_id: String,
+    review_id: String,
+    started_ms: i64,
+    /// The record, `None` when the homeserver answered 404.
+    pub record: Option<PubkyAppMarketplaceReview>,
+}
+
+impl ReviewRead {
+    /// The Redis clock reading, in milliseconds, taken before the request.
+    pub fn started_ms(&self) -> i64 {
+        self.started_ms
+    }
+}
+
+/// Step one of a fenced ingest: takes the clock reading, then reads the
+/// record.
+pub async fn read_review(
+    gate: &dyn RequestGate,
+    user_id: &str,
+    review_id: &str,
+) -> Result<ReviewRead, ReviewIngestError> {
+    let started_ms = ReviewTouch::now_ms()
+        .await
+        .map_err(|e| ReviewIngestError::Index(e.into()))?;
+    let record = fetch_review_record(gate, user_id, review_id).await?;
+    Ok(ReviewRead {
+        reviewer_id: user_id.to_string(),
+        review_id: review_id.to_string(),
+        started_ms,
+        record,
+    })
+}
+
+/// Step two of a fenced ingest: indexes the record unless the feed touched
+/// the review since it was read.
+///
+/// The check runs before the write (a deletion or edit seen by then makes the
+/// record stale) and again after it (the feed may have started between the
+/// check and the end of the write: a deletion that began then found the
+/// review half written, so the write is undone; an edit asks for a re-read).
+pub async fn ingest_read_review(read: ReviewRead) -> Result<ReviewIngest, ReviewIngestError> {
+    let Some(review) = read.record.clone() else {
+        return Ok(ReviewIngest::Gone);
+    };
+    let reviewer = PubkyId::try_from(read.reviewer_id.as_str())
+        .map_err(|e| ReviewIngestError::Invalid(EventProcessorError::generic(e)))?;
+    let touched = ReviewTouch::since(&read.reviewer_id, &read.review_id, read.started_ms)
+        .await
+        .map_err(|e| ReviewIngestError::Index(e.into()))?;
+    if let Some(touch) = touched {
+        return Ok(if touch.deleted {
+            ReviewIngest::Gone
+        } else {
+            ReviewIngest::Changed
+        });
+    }
+    index_review(review, reviewer, read.review_id.clone())
+        .await
+        .map_err(ReviewIngestError::Index)?;
+    settle_after_write(&read)
+        .await
+        .map_err(ReviewIngestError::Index)
+}
+
+/// The check after a fenced write (see [`ingest_read_review`]).
+pub async fn settle_after_write(read: &ReviewRead) -> Result<ReviewIngest, EventProcessorError> {
+    let touched = ReviewTouch::since(&read.reviewer_id, &read.review_id, read.started_ms).await?;
+    match touched {
+        None => Ok(ReviewIngest::Ingested),
+        Some(touch) if touch.deleted => {
+            let reviewer = PubkyId::try_from(read.reviewer_id.as_str())
+                .map_err(EventProcessorError::generic)?;
+            match unindex_review(reviewer, read.review_id.clone()).await {
+                Ok(()) | Err(EventProcessorError::SkipIndexing) => Ok(ReviewIngest::Gone),
+                Err(e) => Err(e),
+            }
+        }
+        Some(_) => Ok(ReviewIngest::Changed),
+    }
+}
+
+/// Reads one review record from the reviewer's homeserver through `gate`;
+/// `None` when the record no longer exists there.
+pub async fn fetch_review_record(
+    gate: &dyn RequestGate,
+    user_id: &str,
+    review_id: &str,
+) -> Result<Option<PubkyAppMarketplaceReview>, ReviewIngestError> {
     let uri = marketplace_review_uri_builder(user_id.to_string(), review_id.to_string());
 
-    let pubky = PubkyConnector::get()?;
+    let permit = gate.acquire().await.map_err(ReviewIngestError::Stopped)?;
+    let pubky = match PubkyConnector::get() {
+        Ok(pubky) => pubky,
+        Err(e) => {
+            permit.failed();
+            return Err(ReviewIngestError::Unreachable(e.into()));
+        }
+    };
     let response = match pubky.public_storage().get(&uri).await {
         Ok(response) => response,
-        Err(e) if is_homeserver_not_found(&e) => return Ok(None),
-        Err(e) => return Err(e.into()),
+        Err(e) if is_homeserver_not_found(&e) => {
+            permit.succeeded();
+            return Ok(None);
+        }
+        Err(e) => {
+            permit.failed();
+            return Err(ReviewIngestError::Unreachable(e.into()));
+        }
     };
-    let blob = response
-        .bytes()
-        .await
-        .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
+    let blob = match response.bytes().await {
+        Ok(blob) => {
+            permit.succeeded();
+            blob
+        }
+        Err(e) => {
+            permit.failed();
+            return Err(ReviewIngestError::Unreachable(
+                EventProcessorError::client_error(e.to_string()),
+            ));
+        }
+    };
 
     let resource = Resource::MarketplaceReview(review_id.to_string());
-    let pubky_object =
-        PubkyAppObject::from_resource(&resource, &blob).map_err(EventProcessorError::generic)?;
+    let pubky_object = PubkyAppObject::from_resource(&resource, &blob)
+        .map_err(|e| ReviewIngestError::Invalid(EventProcessorError::generic(e)))?;
     match pubky_object {
         PubkyAppObject::MarketplaceReview(review) => Ok(Some(review)),
-        _ => Err(EventProcessorError::generic(format!(
-            "Expected a marketplace review record at {uri}"
+        _ => Err(ReviewIngestError::Invalid(EventProcessorError::generic(
+            format!("Expected a marketplace review record at {uri}"),
         ))),
     }
 }
@@ -566,6 +787,39 @@ pub struct TrustBucketBackfill {
     pub aggregates: usize,
 }
 
+/// What re-reading one review without `iat` came to.
+#[derive(Debug)]
+pub enum Rebucket {
+    /// Re-read and ingested; the review now carries `iat` and price weight.
+    Refetched,
+    /// The record left the homeserver; the review stays unbucketed.
+    Gone,
+    /// The homeserver could not be reached; the review stays unbucketed.
+    Unreachable(EventProcessorError),
+    /// The homeserver answered with something that is not a review record.
+    Invalid(EventProcessorError),
+    /// The record was read but could not be ingested.
+    Failed(EventProcessorError),
+}
+
+/// Re-reads one verified review without `iat` from its reviewer's homeserver
+/// through `gate` and runs the normal ingest, guarded against the event feed.
+/// Errs only when the gate stops before the request is sent.
+pub async fn rebucket_review(
+    gate: &dyn RequestGate,
+    reviewer_id: &str,
+    review_id: &str,
+) -> Result<Rebucket, GateStop> {
+    match ingest_review_through(gate, reviewer_id, review_id).await {
+        Ok(ReviewIngest::Ingested) => Ok(Rebucket::Refetched),
+        Ok(_) => Ok(Rebucket::Gone),
+        Err(ReviewIngestError::Stopped(stop)) => Err(stop),
+        Err(ReviewIngestError::Unreachable(e)) => Ok(Rebucket::Unreachable(e)),
+        Err(ReviewIngestError::Invalid(e)) => Ok(Rebucket::Invalid(e)),
+        Err(ReviewIngestError::Index(e)) => Ok(Rebucket::Failed(e)),
+    }
+}
+
 /// One-shot backfill for the trust buckets. Verified reviews indexed before
 /// the index kept their attestation's `iat` and price weight are re-read from
 /// the reviewer's homeserver and run through the normal ingest (the index
@@ -576,32 +830,31 @@ pub struct TrustBucketBackfill {
 pub async fn backfill_trust_buckets() -> Result<TrustBucketBackfill, EventProcessorError> {
     let mut summary = TrustBucketBackfill::default();
     for (reviewer_id, review_id) in ReviewDetails::without_attestation_time().await? {
-        let reviewer =
-            PubkyId::try_from(reviewer_id.as_str()).map_err(EventProcessorError::generic)?;
-        match fetch_review_record(&reviewer_id, &review_id).await {
-            Ok(Some(review)) => match sync_put(review, reviewer, review_id.clone()).await {
-                Ok(()) => summary.refetched += 1,
-                Err(e) => {
-                    warn!(
-                        "Trust-bucket backfill could not ingest {}/{}: {:?}",
-                        reviewer_id, review_id, e
-                    );
-                    summary.failed += 1;
-                }
-            },
-            Ok(None) => {
+        match rebucket_review(&Unthrottled, &reviewer_id, &review_id)
+            .await
+            .map_err(|stop| EventProcessorError::generic(stop.to_string()))?
+        {
+            Rebucket::Refetched => summary.refetched += 1,
+            Rebucket::Gone => {
                 debug!(
                     "Review {}/{} left the homeserver; it stays unbucketed",
                     reviewer_id, review_id
                 );
                 summary.gone += 1;
             }
-            Err(e) => {
+            Rebucket::Unreachable(e) | Rebucket::Invalid(e) => {
                 warn!(
                     "Review {}/{} is unreachable; it stays unbucketed until its next edit: {:?}",
                     reviewer_id, review_id, e
                 );
                 summary.unreachable += 1;
+            }
+            Rebucket::Failed(e) => {
+                warn!(
+                    "Trust-bucket backfill could not ingest {}/{}: {:?}",
+                    reviewer_id, review_id, e
+                );
+                summary.failed += 1;
             }
         }
     }

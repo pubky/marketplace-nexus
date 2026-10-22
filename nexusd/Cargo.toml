@@ -23,4 +23,5 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 tokio-shared-rt = { workspace = true }

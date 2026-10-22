@@ -5,22 +5,30 @@ use nexus_watcher::events::handlers::listing::prune_stale_listings;
 use nexus_watcher::service::NexusWatcher;
 use nexus_webapi::mock::MockDb;
 use nexus_webapi::NexusApi;
+use nexusd::backfill::backfill_reviews_command;
 use nexusd::cli::{
-    ApiArgs, Cli, DbCommands, MigrationCommands, NexusCommands, PruneStaleListingsArgs, WatcherArgs,
+    ApiArgs, BackfillCommands, Cli, DbCommands, MigrationCommands, NexusCommands,
+    PruneStaleListingsArgs, WatcherArgs,
 };
 use nexusd::migrations::{import_migrations, MigrationBuilder, MigrationManager};
 use nexusd::prune::{prune_outcome, render_prune_summary};
 use nexusd::DaemonLauncher;
+use std::process::ExitCode;
 
 #[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("Error: {}", redact_connection_url(&format!("{error:?}")));
-        std::process::exit(1);
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("Error: {}", redact_connection_url(&format!("{error:?}")));
+            ExitCode::FAILURE
+        }
     }
 }
 
-async fn run() -> Result<(), DynError> {
+/// Runs the command and returns the process exit code: 0 unless a command
+/// reports another outcome (`db backfill` does).
+async fn run() -> Result<u8, DynError> {
     let cli = Cli::parse();
     let command = Cli::receive_command(cli);
     match command {
@@ -37,6 +45,9 @@ async fn run() -> Result<(), DynError> {
                 }
             },
             DbCommands::PruneStaleListings(args) => prune_stale_listings_command(args).await?,
+            DbCommands::Backfill(BackfillCommands::Reviews(args)) => {
+                return backfill_reviews_command(args).await;
+            }
         },
         NexusCommands::Api(ApiArgs { config_dir }) => {
             NexusApi::start_from_daemon(config_dir, None).await?;
@@ -49,7 +60,7 @@ async fn run() -> Result<(), DynError> {
         }
     }
 
-    Ok(())
+    Ok(0)
 }
 
 async fn prune_stale_listings_command(args: PruneStaleListingsArgs) -> Result<(), DynError> {
