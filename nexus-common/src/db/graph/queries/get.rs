@@ -1803,6 +1803,117 @@ pub fn listing_counting_rows(listing_owner_id: &str, listing_id: &str) -> Query 
         .param("listing_id", listing_id.to_string())
 }
 
+/// The reviews a filtered review stream lists: every review of the scope not
+/// superseded by its order-scoped twin, indexed within `[end, start]` (the
+/// stream's score bounds, either optional), by a reviewer the viewer filter
+/// keeps. `counted` marks the rows the counted figures may use (verified
+/// with an `iat`, not excluded by moderation, as [`review_counting_rows`]),
+/// and `seller_fields_counted` the copy carrying its order's seller rating.
+///
+/// The viewer filter follows pubky.app's post-stream reach: `following`,
+/// `friends` and `wot` (`FOLLOWS*1..depth`) leave out the viewer's own
+/// reviews; `tagged_by_viewer` keeps reviewers the viewer tagged with any of
+/// the labels (wot_domain depth 0: other taggers do not count). An unindexed
+/// viewer matches no reviewer.
+pub fn filtered_review_rows(
+    scope: &crate::models::marketplace::ReviewStreamScope,
+    reviewers: &crate::models::marketplace::ReviewerFilter,
+    start: Option<f64>,
+    end: Option<f64>,
+) -> Query {
+    use crate::models::marketplace::{ReviewReach, ReviewStreamScope};
+
+    let seller_fields = match scope {
+        ReviewStreamScope::Subject { .. } => SELLER_FIELDS_ONCE_PER_ORDER,
+        ReviewStreamScope::Listing { .. } => "true",
+    };
+    let mut cypher = String::new();
+    if reviewers.uses_viewer() {
+        cypher.push_str("MATCH (viewer:User {id: $viewer_id})\n");
+    }
+    match scope {
+        ReviewStreamScope::Subject { .. } => cypher.push_str(
+            "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
+            WHERE r.role = $role",
+        ),
+        ReviewStreamScope::Listing { .. } => cypher.push_str(
+            "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
+            WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
+        ),
+    }
+    cypher.push_str("\n    AND coalesce(r.superseded, false) = false");
+    if start.is_some() {
+        cypher.push_str("\n    AND r.indexed_at <= $start");
+    }
+    if end.is_some() {
+        cypher.push_str("\n    AND r.indexed_at >= $end");
+    }
+    match reviewers.reach {
+        None => {}
+        Some(ReviewReach::Following) => cypher.push_str(
+            "\n    AND reviewer.id <> $viewer_id AND EXISTS { (viewer)-[:FOLLOWS]->(reviewer) }",
+        ),
+        Some(ReviewReach::Friends) => cypher.push_str(
+            "\n    AND reviewer.id <> $viewer_id
+    AND EXISTS { (viewer)-[:FOLLOWS]->(reviewer)-[:FOLLOWS]->(viewer) }",
+        ),
+        Some(ReviewReach::Wot) => cypher.push_str(&format!(
+            "\n    AND reviewer.id <> $viewer_id
+    AND EXISTS {{ (viewer)-[:FOLLOWS*1..{}]->(reviewer) }}",
+            reviewers.depth
+        )),
+    }
+    if !reviewers.tagged_by_viewer.is_empty() {
+        cypher.push_str(
+            "\n    AND EXISTS { (viewer)-[t:TAGGED]->(reviewer) WHERE t.label IN $tagged_labels }",
+        );
+    }
+    cypher.push_str(&format!(
+        "
+        RETURN reviewer.id AS reviewer_id, r.review_id AS review_id,
+            r.indexed_at AS indexed_at, r.rating_overall AS rating_overall,
+            r.price_weight AS price_weight, r.attestor_id AS attestor_id,
+            r.order_ref AS order_ref, r.iat AS iat,
+            (coalesce(r.verified, false) AND r.attestor_id IS NOT NULL
+                AND r.order_ref IS NOT NULL AND r.iat IS NOT NULL
+                AND {REPUTATION_NOT_EXCLUDED}) AS counted,
+            {seller_fields} AS seller_fields_counted,
+            r.rating_shipping AS rating_shipping,
+            r.rating_communication AS rating_communication"
+    ));
+
+    let query = match scope {
+        ReviewStreamScope::Subject { subject_id, role } => {
+            Query::new("filtered_review_rows_subject", &cypher)
+                .param("subject_id", subject_id.to_string())
+                .param("role", role.as_str())
+        }
+        ReviewStreamScope::Listing {
+            listing_owner_id,
+            listing_id,
+        } => Query::new("filtered_review_rows_listing", &cypher)
+            .param("subject_id", listing_owner_id.to_string())
+            .param("listing_id", listing_id.to_string()),
+    };
+    let query = match &reviewers.viewer_id {
+        Some(viewer_id) if reviewers.uses_viewer() => query.param("viewer_id", viewer_id.clone()),
+        _ => query,
+    };
+    let query = match start {
+        Some(start) => query.param("start", start),
+        None => query,
+    };
+    let query = match end {
+        Some(end) => query.param("end", end),
+        None => query,
+    };
+    if reviewers.tagged_by_viewer.is_empty() {
+        query
+    } else {
+        query.param("tagged_labels", reviewers.tagged_by_viewer.clone())
+    }
+}
+
 /// Verified review edges indexed before the edge carried the attestation's
 /// `iat` and price weight: `(reviewer_id, review_id)`.
 pub fn reviews_without_attestation_time() -> Query {

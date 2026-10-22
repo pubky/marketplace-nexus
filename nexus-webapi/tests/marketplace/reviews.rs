@@ -7,7 +7,7 @@ use pubky::Keypair;
 use pubky_app_specs::{PubkyAppListingCondition, PubkyAppReviewRole};
 use serde_json::Value;
 
-const LISTING_ID: &str = "R0AAAAAAAAAAA";
+pub(super) const LISTING_ID: &str = "R0AAAAAAAAAAA";
 
 struct Seeded {
     seller_id: String,
@@ -16,7 +16,7 @@ struct Seeded {
     unverified_reviewer: String,
 }
 
-fn review(
+pub(super) fn review(
     reviewer_id: &str,
     seller_id: &str,
     review_id: &str,

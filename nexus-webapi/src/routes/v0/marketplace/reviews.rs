@@ -5,13 +5,14 @@ use crate::{Error, Result};
 use axum::extract::{Path, Query};
 use axum::Json;
 use nexus_common::models::marketplace::{
-    AttestorWindow, ReputationBucket, ReputationSnippet, ReputationSummary, ReviewDetails,
-    ReviewModeration, ReviewModerationState, ReviewResponseDetails, ReviewStream, ReviewView,
-    ScopedReputationSummary,
+    AttestorWindow, FilteredReviewStream, ReputationBucket, ReputationSnippet, ReputationSummary,
+    ReviewDetails, ReviewMatch, ReviewModeration, ReviewModerationState, ReviewReach,
+    ReviewResponseDetails, ReviewSort, ReviewStream, ReviewStreamFilter, ReviewStreamParams,
+    ReviewStreamScope, ReviewView, ScopedReputationSummary,
 };
 use nexus_common::types::Pagination;
 use pubky_app_specs::PubkyAppReviewRole;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 use utoipa::{OpenApi, ToSchema};
 
@@ -24,6 +25,29 @@ pub struct ReviewStreamQuery {
     /// negotiation contexts only (ratified D8) — clients must not build
     /// public buyer profiles from it.
     pub role: Option<PubkyAppReviewRole>,
+    /// The viewer's pubky; `reach` and `tagged_by_viewer` need it.
+    pub viewer_id: Option<String>,
+    /// Keeps reviewers in the viewer's follow reach.
+    pub reach: Option<ReviewReach>,
+    /// Follow hops for `reach=wot`, 1-3 (default 2).
+    pub depth: Option<String>,
+    /// Keeps reviewers the viewer tagged with any of 1-5 comma-separated labels.
+    pub tagged_by_viewer: Option<String>,
+    /// Keeps reviews whose attestation these windows cover:
+    /// `<pubky>[:<from>:<until>],…`.
+    pub attestors: Option<String>,
+    /// Review order; defaults to `newest`.
+    pub sort: Option<ReviewSort>,
+}
+
+/// A review stream response: the plain page when no filter or sort
+/// parameter is given (the original shape), the filtered page with its
+/// `matched` figures otherwise.
+#[derive(Serialize, Debug, ToSchema)]
+#[serde(untagged)]
+pub enum ReviewStreamResponse {
+    Page(ReviewStream),
+    Filtered(FilteredReviewStream),
 }
 
 #[derive(Deserialize, Debug, ToSchema)]
@@ -40,6 +64,29 @@ impl ReviewStreamQuery {
         self.pagination.skip.get_or_insert(0);
         self.pagination.limit = Some(self.pagination.limit.unwrap_or(10).min(30));
     }
+
+    /// The validated filter, `None` when no filter or sort parameter is given.
+    fn filter(&self) -> Result<Option<ReviewStreamFilter>> {
+        ReviewStreamFilter::parse(ReviewStreamParams {
+            viewer_id: self.viewer_id.as_deref(),
+            reach: self.reach,
+            depth: self.depth.as_deref(),
+            tagged_by_viewer: self.tagged_by_viewer.as_deref(),
+            attestors: self.attestors.as_deref(),
+            sort: self.sort,
+        })
+        .map_err(|message| Error::invalid_input(&message))
+    }
+}
+
+/// Serves the filtered stream of `scope` when `filter` is given.
+async fn filtered_page(
+    scope: ReviewStreamScope,
+    filter: ReviewStreamFilter,
+    pagination: Pagination,
+) -> Result<Json<ReviewStreamResponse>> {
+    let stream = ReviewStream::get_filtered(&scope, &filter, pagination).await?;
+    Ok(Json(ReviewStreamResponse::Filtered(stream)))
 }
 
 #[utoipa::path(
@@ -58,23 +105,50 @@ from the attestation's `price_decade` claim; 1 without it); both are `null` for 
 Every entry also carries `moderation`: `null`, or `{state, reason}` when Pubky Market's configured
 moderator acted on the review. `text_hidden` withholds the text (returned empty) and keeps the ratings in
 the aggregates; `excluded` withholds the text and leaves the review out of every aggregate. `reason` is
-the moderator's label (e.g. `hatespeech`, `review_fraud`)."#,
+the moderator's label (e.g. `hatespeech`, `review_fraud`).
+
+**Filters and sorts.** With any of `viewer_id`, `reach`, `depth`, `tagged_by_viewer`, `attestors` or `sort`,
+the response is `{"reviews": [<entry>…], "matched": {"buyers", "orders", "avg"}}` instead of the bare list.
+- `reach=following|friends|wot` keeps reviewers the viewer follows, follows mutually, or reaches within
+  `depth` (1-3, default 2; `reach=wot` only) follow hops; the viewer's own reviews are left out.
+- `tagged_by_viewer=<1-5 comma-separated labels>` keeps reviewers the viewer tagged with any label (only
+  the viewer's tags count). Both need `viewer_id`, and combine (both must hold).
+- `attestors=<pubky>[:<from>:<until>],…` keeps reviews whose attestation one window covers (as on the
+  reputation routes; unverified reviews drop out).
+- `sort=newest|value|rating_desc|rating_asc`: newest indexed first (default); highest `price_weight` first,
+  reviews without one last; highest or lowest `ratings.overall` first. Ties go newest first.
+- `matched` counts every match, not only the page, by counting rules v2: distinct buyers, distinct attested
+  orders, and `avg`, the mean over buyers of each buyer's mean `overall` (`null` when nothing counts).
+  Unverified and moderation-excluded reviews are listed but never counted. On the seller scope
+  (`buyer_reviewing_seller` reviews about a subject) it also carries the seller rating: `seller_buyers`,
+  the buyers with an order rating shipping or communication, and `seller_avg`, the mean over them of
+  their mean order score ((shipping + communication) / 2, or the one present), `null` when none has one.
+The index holds follows and tags between the users it indexes (its own homeserver's users on a
+homeserver-scoped deployment), so reach and tags see only those.
+400 on a malformed or inconsistent parameter."#,
     tag = "Marketplace",
     params(
         ("seller_id" = String, Path, description = "Subject Pubky ID (the reviewed user)"),
         ("role" = Option<PubkyAppReviewRole>, Query, description = "Review direction; defaults to buyer_reviewing_seller"),
         ("skip" = Option<usize>, Query, description = "Skip N reviews"),
         ("limit" = Option<usize>, Query, description = "Retrieve N reviews"),
+        ("viewer_id" = Option<String>, Query, description = "Viewer Pubky ID; needed by reach and tagged_by_viewer"),
+        ("reach" = Option<ReviewReach>, Query, description = "following, friends or wot"),
+        ("depth" = Option<u8>, Query, description = "Follow hops for reach=wot, 1-3 (default 2)"),
+        ("tagged_by_viewer" = Option<String>, Query, description = "1-5 comma-separated labels of the viewer's tags on reviewers"),
+        ("attestors" = Option<String>, Query, description = "Trusted attestors: <pubky>[:<from>:<until>],…"),
+        ("sort" = Option<ReviewSort>, Query, description = "newest (default), value, rating_desc or rating_asc"),
     ),
     responses(
-        (status = 200, description = "Review page (empty list when none indexed)", body = ReviewStream),
+        (status = 200, description = "Review page: the bare list, or {reviews, matched} with a filter or sort parameter (empty when none matches)", body = ReviewStreamResponse),
+        (status = 400, description = "Malformed or inconsistent filter parameter"),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn shop_reviews_handler(
     Path(seller_id): Path<String>,
     Query(mut query): Query<ReviewStreamQuery>,
-) -> Result<Json<ReviewStream>> {
+) -> Result<Json<ReviewStreamResponse>> {
     debug!("GET {SHOP_REVIEWS_ROUTE} seller_id:{seller_id}");
 
     query.initialize_defaults();
@@ -82,10 +156,15 @@ pub async fn shop_reviews_handler(
         .role
         .unwrap_or(PubkyAppReviewRole::BuyerReviewingSeller);
 
-    match ReviewStream::get_by_subject(&seller_id, role, query.pagination).await? {
-        Some(stream) => Ok(Json(stream)),
-        None => Ok(Json(ReviewStream::default())),
+    if let Some(filter) = query.filter()? {
+        let scope = ReviewStreamScope::Subject {
+            subject_id: seller_id,
+            role,
+        };
+        return filtered_page(scope, filter, query.pagination).await;
     }
+    let stream = ReviewStream::get_by_subject(&seller_id, role, query.pagination).await?;
+    Ok(Json(ReviewStreamResponse::Page(stream.unwrap_or_default())))
 }
 
 #[utoipa::path(
@@ -151,32 +230,64 @@ pub async fn shop_reputation_handler(
 #[utoipa::path(
     get,
     path = LISTING_REVIEWS_ROUTE,
-    description = "Paged buyer reviews of one listing, newest-indexed first, with seller responses joined. \
-Same verification and moderation semantics as the subject review stream.",
+    description = r#"Paged buyer reviews of one listing, newest-indexed first, with seller responses joined.
+Same verification and moderation semantics as the subject review stream.
+
+**Filters and sorts.** With any of `viewer_id`, `reach`, `depth`, `tagged_by_viewer`, `attestors` or `sort`,
+the response is `{"reviews": [<entry>…], "matched": {"buyers", "orders", "avg"}}` instead of the bare list.
+- `reach=following|friends|wot` keeps reviewers the viewer follows, follows mutually, or reaches within
+  `depth` (1-3, default 2; `reach=wot` only) follow hops; the viewer's own reviews are left out.
+- `tagged_by_viewer=<1-5 comma-separated labels>` keeps reviewers the viewer tagged with any label (only
+  the viewer's tags count). Both need `viewer_id`, and combine (both must hold).
+- `attestors=<pubky>[:<from>:<until>],…` keeps reviews whose attestation one window covers (as on the
+  reputation routes; unverified reviews drop out).
+- `sort=newest|value|rating_desc|rating_asc`: newest indexed first (default); highest `price_weight` first,
+  reviews without one last; highest or lowest `ratings.overall` first. Ties go newest first.
+- `matched` counts every match, not only the page, by counting rules v2: distinct buyers, distinct attested
+  orders, and `avg`, the mean over buyers of each buyer's mean `overall` (`null` when nothing counts).
+  Unverified and moderation-excluded reviews are listed but never counted. On the seller scope
+  (`buyer_reviewing_seller` reviews about a subject) it also carries the seller rating: `seller_buyers`,
+  the buyers with an order rating shipping or communication, and `seller_avg`, the mean over them of
+  their mean order score ((shipping + communication) / 2, or the one present), `null` when none has one.
+The index holds follows and tags between the users it indexes (its own homeserver's users on a
+homeserver-scoped deployment), so reach and tags see only those.
+400 on a malformed or inconsistent parameter."#,
     tag = "Marketplace",
     params(
         ("seller_id" = String, Path, description = "Seller Pubky ID"),
         ("listing_id" = String, Path, description = "Listing Crockford32 ID"),
         ("skip" = Option<usize>, Query, description = "Skip N reviews"),
         ("limit" = Option<usize>, Query, description = "Retrieve N reviews"),
+        ("viewer_id" = Option<String>, Query, description = "Viewer Pubky ID; needed by reach and tagged_by_viewer"),
+        ("reach" = Option<ReviewReach>, Query, description = "following, friends or wot"),
+        ("depth" = Option<u8>, Query, description = "Follow hops for reach=wot, 1-3 (default 2)"),
+        ("tagged_by_viewer" = Option<String>, Query, description = "1-5 comma-separated labels of the viewer's tags on reviewers"),
+        ("attestors" = Option<String>, Query, description = "Trusted attestors: <pubky>[:<from>:<until>],…"),
+        ("sort" = Option<ReviewSort>, Query, description = "newest (default), value, rating_desc or rating_asc"),
     ),
     responses(
-        (status = 200, description = "Review page (empty list when none indexed)", body = ReviewStream),
+        (status = 200, description = "Review page: the bare list, or {reviews, matched} with a filter or sort parameter (empty when none matches)", body = ReviewStreamResponse),
+        (status = 400, description = "Malformed or inconsistent filter parameter"),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn listing_reviews_handler(
     Path((seller_id, listing_id)): Path<(String, String)>,
     Query(mut query): Query<ReviewStreamQuery>,
-) -> Result<Json<ReviewStream>> {
+) -> Result<Json<ReviewStreamResponse>> {
     debug!("GET {LISTING_REVIEWS_ROUTE} seller_id:{seller_id}, listing_id:{listing_id}");
 
     query.initialize_defaults();
 
-    match ReviewStream::get_by_listing(&seller_id, &listing_id, query.pagination).await? {
-        Some(stream) => Ok(Json(stream)),
-        None => Ok(Json(ReviewStream::default())),
+    if let Some(filter) = query.filter()? {
+        let scope = ReviewStreamScope::Listing {
+            listing_owner_id: seller_id,
+            listing_id,
+        };
+        return filtered_page(scope, filter, query.pagination).await;
     }
+    let stream = ReviewStream::get_by_listing(&seller_id, &listing_id, query.pagination).await?;
+    Ok(Json(ReviewStreamResponse::Page(stream.unwrap_or_default())))
 }
 
 #[derive(OpenApi)]
@@ -184,6 +295,11 @@ pub async fn listing_reviews_handler(
     paths(shop_reviews_handler, shop_reputation_handler, listing_reviews_handler),
     components(schemas(
         ReviewStream,
+        ReviewStreamResponse,
+        FilteredReviewStream,
+        ReviewMatch,
+        ReviewReach,
+        ReviewSort,
         ReviewView,
         ReviewDetails,
         ReviewModeration,
