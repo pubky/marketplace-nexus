@@ -34,7 +34,10 @@ hosting is out of scope for it.
 - **Review indexing with cryptographic verification at ingest**: purchase
   attestations (compact JWS) are signature-verified before a review counts
   as attested; reputation aggregates served per shop and per listing.
-  Attestor *legitimacy* remains the client's trust-list policy.
+  Attestor *legitimacy* remains the client's trust-list policy: aggregates
+  carry per-attestor buckets (one voice per buyer, price-weighted from the
+  attested `price_decade` claim), and `attestors=<pubky>[:<from>:<until>],…`
+  scopes a figure to the client's trust list and its validity windows.
 - Marketplace tag aggregation endpoints for listings and shops.
 - The index stays deliberately **lossy**: variants, shipping options,
   attributes, digital-lock details, and any live stock/order state are

@@ -761,6 +761,8 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
             r.verified = $verified,
             r.attestor_id = $attestor_id,
             r.order_ref = $order_ref,
+            r.iat = $iat,
+            r.price_weight = $price_weight,
             r.order_scoped = $order_scoped,
             r.edited_late = $edited_late,
             r.moderation = $moderation,
@@ -790,6 +792,8 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
     .param("verified", review.verified)
     .param("attestor_id", review.attestor_id.clone())
     .param("order_ref", review.order_ref.clone())
+    .param("iat", review.iat)
+    .param("price_weight", review.price_weight.map(i64::from))
     .param("order_scoped", review.order_scoped)
     .param("edited_late", review.edited_late)
     .param(

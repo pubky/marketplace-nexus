@@ -1659,6 +1659,7 @@ fn reputation_return(seller_fields: &str) -> String {
         "
         RETURN count(r) AS total,
             sum(CASE WHEN r.verified THEN 1 ELSE 0 END) AS verified_count,
+            sum(CASE WHEN coalesce(r.verified, false) THEN 0 ELSE 1 END) AS unverified_count,
             avg(toFloat(r.rating_overall)) AS average,
             sum(CASE WHEN r.rating_overall = 1 THEN 1 ELSE 0 END) AS stars_1,
             sum(CASE WHEN r.rating_overall = 2 THEN 1 ELSE 0 END) AS stars_2,
@@ -1753,6 +1754,65 @@ pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
     Query::new("listing_reputation", &cypher)
         .param("listing_owner_id", listing_owner_id.to_string())
         .param("listing_id", listing_id.to_string())
+}
+
+/// The rows the per-attestor trust buckets are computed from: every counted
+/// verified review of the scope (not superseded, not excluded) whose
+/// attestation `iat` is indexed. `seller_fields` is the Cypher condition on
+/// `r` under which the review carries its order's seller rating.
+fn review_counting_rows(scope_match: &str, seller_fields: &str) -> String {
+    format!(
+        "{scope_match}
+            AND r.verified AND r.attestor_id IS NOT NULL AND r.order_ref IS NOT NULL
+            AND r.iat IS NOT NULL
+            AND coalesce(r.superseded, false) = false
+            AND {REPUTATION_NOT_EXCLUDED}
+        RETURN reviewer.id AS reviewer_id, r.attestor_id AS attestor_id,
+            r.order_ref AS order_ref, r.rating_overall AS rating_overall,
+            coalesce(r.price_weight, 1) AS price_weight, r.iat AS iat,
+            {seller_fields} AS seller_fields_counted,
+            r.rating_shipping AS rating_shipping,
+            r.rating_communication AS rating_communication
+        ORDER BY r.review_id"
+    )
+}
+
+/// The counted verified reviews about a subject in one role (see
+/// [`review_counting_rows`]).
+pub fn subject_counting_rows(subject_id: &str, role: &str) -> Query {
+    let cypher = review_counting_rows(
+        "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
+        WHERE r.role = $role",
+        SELLER_FIELDS_ONCE_PER_ORDER,
+    );
+    Query::new("subject_counting_rows", &cypher)
+        .param("subject_id", subject_id.to_string())
+        .param("role", role.to_string())
+}
+
+/// The counted verified buyer reviews of one listing (see
+/// [`review_counting_rows`]).
+pub fn listing_counting_rows(listing_owner_id: &str, listing_id: &str) -> Query {
+    let cypher = review_counting_rows(
+        "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $listing_owner_id})
+        WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
+        "true",
+    );
+    Query::new("listing_counting_rows", &cypher)
+        .param("listing_owner_id", listing_owner_id.to_string())
+        .param("listing_id", listing_id.to_string())
+}
+
+/// Verified review edges indexed before the edge carried the attestation's
+/// `iat` and price weight: `(reviewer_id, review_id)`.
+pub fn reviews_without_attestation_time() -> Query {
+    Query::new(
+        "reviews_without_attestation_time",
+        "MATCH (reviewer:User)-[r:REVIEWED]->(:User)
+         WHERE r.verified AND r.iat IS NULL
+         RETURN reviewer.id AS reviewer_id, r.review_id AS review_id
+         ORDER BY reviewer_id, review_id",
+    )
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ mod moderation;
 mod review;
 mod review_moderation;
 mod review_per_item;
+mod review_trust_buckets;
 mod shop;
 mod stale_prune;
 mod tag;

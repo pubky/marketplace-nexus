@@ -1,38 +1,62 @@
 use crate::routes::v0::endpoints::{LISTING_MODERATION_ROUTE, LISTING_ROUTE};
 use crate::{Error, Result};
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::Json;
 use nexus_common::models::marketplace::{
-    ListingDetails, ListingModerationState, ListingSaleFormat, ListingStreamEntry,
-    ReputationSummary,
+    AttestorWindow, ListingDetailView, ListingDetails, ListingModerationState, ListingSaleFormat,
+    ListingStreamEntry, ReputationBucket, ReputationSummary,
 };
 use pubky_app_specs::{
     PubkyAppFulfillmentMethod, PubkyAppListingCondition, PubkyAppListingState, PubkyAppReviewRole,
 };
+use serde::Deserialize;
 use tracing::debug;
-use utoipa::OpenApi;
+use utoipa::{OpenApi, ToSchema};
+
+#[derive(Deserialize, Debug, Default, ToSchema)]
+pub struct ListingDetailsQuery {
+    /// Trusted attestors with optional trust windows:
+    /// `<pubky>[:<from>:<until>],…` (see the route description).
+    pub attestors: Option<String>,
+}
 
 #[utoipa::path(
     get,
     path = LISTING_ROUTE,
     description = "Listing details together with the compact seller and listing reputation objects. \
 Reputation fields are absent (not zero) when no review is indexed for the scope. \
-An `active` auction whose `auction_ends_at` has been reached is served with `state` `ended`.",
+An `active` auction whose `auction_ends_at` has been reached is served with `state` `ended`. \
+With `attestors=<pubky>[:<from>:<until>],…` (at most 20 entries; `from` and `until` are attestation \
+`iat` seconds, window `[from, until)`, either end may be empty; a pubky may repeat for several windows), \
+the response adds `scoped_reputation` (the seller) and `scoped_listing_reputation` (this listing): the \
+exact counting figures of the counted reviews inside any window, one buyer counted once across \
+attestors. Both are present (zero counts when nothing matches) whenever the parameter is given.",
+
     tag = "Marketplace",
     params(
         ("seller_id" = String, Path, description = "Seller Pubky ID"),
-        ("listing_id" = String, Path, description = "Listing Crockford32 ID")
+        ("listing_id" = String, Path, description = "Listing Crockford32 ID"),
+        ("attestors" = Option<String>, Query, description = "Trusted attestors: <pubky>[:<from>:<until>],…"),
     ),
     responses(
-        (status = 200, description = "Listing details", body = ListingStreamEntry),
+        (status = 200, description = "Listing details", body = ListingDetailView),
+        (status = 400, description = "Malformed attestors parameter"),
         (status = 404, description = "Listing not found"),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn listing_details_handler(
     Path((seller_id, listing_id)): Path<(String, String)>,
-) -> Result<Json<ListingStreamEntry>> {
+    Query(query): Query<ListingDetailsQuery>,
+) -> Result<Json<ListingDetailView>> {
     debug!("GET {LISTING_ROUTE} seller_id:{seller_id}, listing_id:{listing_id}");
+
+    let windows = query
+        .attestors
+        .as_deref()
+        .map(AttestorWindow::parse_list)
+        .transpose()
+        .map_err(|message| Error::invalid_input(&message))?;
 
     let Some(details) = ListingDetails::get_by_id(&seller_id, &listing_id).await? else {
         return Err(Error::ListingNotFound {
@@ -46,10 +70,29 @@ pub async fn listing_details_handler(
         ReputationSummary::get_by_listing(&seller_id, &listing_id),
     );
 
-    Ok(Json(ListingStreamEntry {
-        details,
-        reputation: seller_reputation?.map(|summary| summary.snippet()),
-        listing_reputation: listing_reputation?.map(|summary| summary.snippet()),
+    let (scoped_reputation, scoped_listing_reputation) = match &windows {
+        Some(windows) => {
+            let (seller, listing) = tokio::join!(
+                ReputationSummary::scoped_by_subject(
+                    &seller_id,
+                    PubkyAppReviewRole::BuyerReviewingSeller,
+                    windows,
+                ),
+                ReputationSummary::scoped_by_listing(&seller_id, &listing_id, windows),
+            );
+            (Some(seller?), Some(listing?))
+        }
+        None => (None, None),
+    };
+
+    Ok(Json(ListingDetailView {
+        entry: ListingStreamEntry {
+            details,
+            reputation: seller_reputation?.map(|summary| summary.snippet()),
+            listing_reputation: listing_reputation?.map(|summary| summary.snippet()),
+        },
+        scoped_reputation,
+        scoped_listing_reputation,
     }))
 }
 
@@ -86,8 +129,10 @@ pub async fn listing_moderation_handler(
     paths(listing_details_handler, listing_moderation_handler),
     components(schemas(
         ListingDetails,
+        ListingDetailView,
         ListingModerationState,
         ListingStreamEntry,
+        ReputationBucket,
         ListingSaleFormat,
         PubkyAppListingState,
         PubkyAppListingCondition,

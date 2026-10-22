@@ -58,6 +58,15 @@ pub struct ReviewDetails {
     /// The attestor-salted order reference of a verified attestation.
     /// Distinct refs on one living review witness distinct attested orders.
     pub order_ref: Option<String>,
+    /// The `iat` claim (issued at, seconds) of a verified attestation; `null`
+    /// for an unverified review. Attestor trust windows apply to it.
+    #[serde(default)]
+    pub iat: Option<i64>,
+    /// The 1-5 price weight of a verified review, from its attestation's
+    /// `price_decade` claim (specs `price_weight`; 1 without the claim);
+    /// `null` for an unverified review.
+    #[serde(default)]
+    pub price_weight: Option<u8>,
     /// True when `updated_at` moved more than the marketplace's 24h edit
     /// window after `created_at` (see [`REVIEW_EDIT_WINDOW_SECONDS`]).
     pub edited_late: bool,
@@ -88,14 +97,16 @@ impl ReviewDetails {
     /// signature → binding). A failed verification never rejects the record:
     /// unverified reviews are indexed and labeled (ratified D5).
     pub fn from_homeserver(review: &PubkyAppMarketplaceReview, reviewer_id: &PubkyId) -> Self {
-        let (verified, attestor_id, order_ref) =
+        let (verified, attestor_id, order_ref, iat, price_weight) =
             match PubkyAppPurchaseAttestation::verify_for_review(review) {
                 Ok(attestation) => (
                     true,
                     Some(attestation.claims.iss.clone()),
                     Some(attestation.claims.order_ref.clone()),
+                    Some(attestation.claims.iat),
+                    Some(attestation.price_weight()),
                 ),
-                Err(_) => (false, None, None),
+                Err(_) => (false, None, None, None, None),
             };
 
         ReviewDetails {
@@ -114,6 +125,8 @@ impl ReviewDetails {
             verified,
             attestor_id,
             order_ref,
+            iat,
+            price_weight,
             edited_late: is_edited_late(&review.created_at, &review.updated_at),
             order_scoped: review.is_order_scoped(),
             superseded: false,
@@ -395,6 +408,18 @@ impl ReviewDetails {
             }
         }
         Ok(review_ids)
+    }
+
+    /// Verified reviews indexed before the index kept their attestation's
+    /// `iat` and price weight: `(reviewer_id, review_id)` pairs.
+    pub async fn without_attestation_time() -> GraphResult<Vec<(String, String)>> {
+        let rows =
+            fetch_all_rows_from_graph(queries::get::reviews_without_attestation_time()).await?;
+        let mut reviews = Vec::with_capacity(rows.len());
+        for row in rows {
+            reviews.push((row.get("reviewer_id")?, row.get("review_id")?));
+        }
+        Ok(reviews)
     }
 
     /// The ids of every user who has a review in the graph.
