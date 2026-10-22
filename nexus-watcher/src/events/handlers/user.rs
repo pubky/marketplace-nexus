@@ -126,7 +126,7 @@ pub async fn moderate(
         chrono::Utc::now().timestamp_millis(),
     )
     .await?;
-    review::refresh_reviewer_moderation(&user_id, None).await?;
+    review::refresh_reviewer_moderation(&user_id).await?;
     remove_marketplace_content(&user_id).await?;
     del(user_id).await
 }
@@ -146,8 +146,10 @@ async fn remove_marketplace_content(user_id: &PubkyId) -> Result<(), EventProces
 /// again from their homeserver (a record the user has deleted stays gone, and
 /// a listing hidden by its own moderator tag stays hidden), and the text of
 /// their reviews shown again unless another marker hides it. The marker is
-/// removed only after that, so a failed fetch leaves the marker in place and
-/// the retried tag deletion starts over.
+/// first flagged as being released, which review moderation skips everywhere
+/// (see [`review::release_moderation`]), and removed only after that, so a
+/// failed fetch leaves the marker in place and the retried tag deletion starts
+/// over.
 pub async fn release_moderation(
     moderator_id: &PubkyId,
     tag_id: &str,
@@ -156,6 +158,7 @@ pub async fn release_moderation(
     if users.is_empty() {
         return Ok(false);
     }
+    ModeratedUser::mark_releasing(moderator_id, tag_id).await?;
 
     for user in users {
         let user_id = PubkyId::try_from(user.as_str()).map_err(EventProcessorError::generic)?;
@@ -165,7 +168,7 @@ pub async fn release_moderation(
             info!("Moderation tag removed; restoring user {user}");
             restore_from_homeserver(&user_id).await?;
         }
-        review::refresh_reviewer_moderation(&user, Some((moderator_id.as_ref(), tag_id))).await?;
+        review::refresh_reviewer_moderation(&user).await?;
         ModeratedUser::delete(moderator_id, tag_id).await?;
         settle_after_release(&user_id, hidden_by_another_tag).await?;
     }

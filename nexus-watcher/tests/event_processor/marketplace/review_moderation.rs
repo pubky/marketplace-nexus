@@ -9,6 +9,9 @@ use crate::event_processor::utils::watcher::{
 };
 use anyhow::Result;
 use chrono::Utc;
+use nexus_common::db::graph::Query;
+use nexus_common::db::kv::put_field_if_exists;
+use nexus_common::db::{exec_single_row, RedisOps};
 use nexus_common::models::event::EventProcessorError;
 use nexus_common::models::marketplace::{
     ExcludedReviewer, ModeratedReview, ModeratedUser, ReputationSummary, ReviewDetails,
@@ -587,6 +590,209 @@ async fn review_fraud_on_a_user_excludes_every_review_they_wrote_without_hiding_
     test.cleanup_user(&ring_kp).await?;
     test.cleanup_user(&honest_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// A release re-derives the reviews before it removes the marker. Another
+/// process re-deriving them in between (the one-shot recompute next to a live
+/// watcher) must not write the released moderation back: that write would
+/// outlive the marker.
+#[tokio_shared_rt::test(shared)]
+async fn a_rederivation_during_a_release_does_not_bring_the_moderation_back() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewReleaseRace").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(
+            &buyer_kp,
+            &seller_profile("Watcher:ReviewReleaseRace:Buyer"),
+        )
+        .await?;
+    let moderator_kp = moderator_keypair().await;
+    test.create_user(
+        &moderator_kp,
+        &seller_profile("Watcher:ReviewReleaseRace:Moderator"),
+    )
+    .await?;
+    let moderator_id = default_moderation_tests().id;
+
+    let text = "Reviewed while the moderator changes its mind.";
+    let review = buyer_review(&market, &buyer_id, 'b', 3, text);
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+
+    // Moderating the user deletes their profile, so that case comes last.
+    let cases = [
+        (
+            tag_on_user(&buyer_id, EXCLUDE_LABEL),
+            ReviewModerationState::Excluded,
+        ),
+        (
+            tag_on_review(&buyer_id, &review_id, EXCLUDE_LABEL),
+            ReviewModerationState::Excluded,
+        ),
+        (
+            tag_on_review(&buyer_id, &review_id, MODERATED_LABEL),
+            ReviewModerationState::TextHidden,
+        ),
+        (
+            tag_on_user(&buyer_id, MODERATED_LABEL),
+            ReviewModerationState::TextHidden,
+        ),
+    ];
+    for (tag, state) in cases {
+        test.put(&moderator_kp, &tag.hs_path(), &tag).await?;
+        assert_moderation(
+            &market,
+            &buyer_id,
+            &review_id,
+            moderation(state, &tag.label),
+            text,
+        )
+        .await;
+
+        // The release's steps up to the marker removal, with the other
+        // process's re-derivation forced right before that removal.
+        let tag_id = tag.create_id();
+        ModeratedReview::mark_releasing(&moderator_id, &tag_id).await?;
+        ExcludedReviewer::mark_releasing(&moderator_id, &tag_id).await?;
+        ModeratedUser::mark_releasing(&moderator_id, &tag_id).await?;
+        handlers::review::refresh_reviewer_moderation(&buyer_id).await?;
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        handlers::review::refresh_reviewer_moderation(&buyer_id).await?;
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        assert_counted(&market, 1, 3.0).await;
+
+        // The release itself finishes with nothing to bring back.
+        test.del(&moderator_kp, &tag.hs_path()).await?;
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        assert_counted(&market, 1, 3.0).await;
+        assert!(ModeratedReview::reviews_of_tag(&moderator_id, &tag_id)
+            .await?
+            .is_empty());
+        assert!(ExcludedReviewer::users_of_tag(&moderator_id, &tag_id)
+            .await?
+            .is_empty());
+        assert!(!ModeratedUser::is_moderated(&buyer_id).await?);
+    }
+
+    test.del(&buyer_kp, &review_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// A re-derivation reads the indexed review before it writes the moderation.
+/// The review deleted in between must stay deleted.
+#[tokio_shared_rt::test(shared)]
+async fn a_moderation_write_after_the_review_is_deleted_does_not_index_it_again() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewDeleteRace").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &seller_profile("Watcher:ReviewDeleteRace:Buyer"))
+        .await?;
+    let review = buyer_review(&market, &buyer_id, 'd', 4, "Deleted while re-derived.");
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+    assert!(ReviewDetails::get_from_index(&buyer_id, &review_id)
+        .await?
+        .is_some());
+
+    test.del(&buyer_kp, &review_path).await?;
+    // The write a re-derivation that read the review before the deletion makes.
+    let written = put_field_if_exists(
+        &ReviewDetails::prefix().await,
+        &format!("{buyer_id}:{review_id}"),
+        "moderation",
+        &moderation(ReviewModerationState::Excluded, EXCLUDE_LABEL),
+    )
+    .await?;
+    assert!(!written);
+    assert!(ReviewDetails::get_from_index(&buyer_id, &review_id)
+        .await?
+        .is_none());
+    assert_counted(&market, 0, 0.0).await;
+
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// A marker deleted between the query's match and its property reads still
+/// comes back as a row, with every property but its keys read as null. These
+/// are those rows: one marker of each kind that has kept only the keys the
+/// query matches it by, and one that has kept its tag id but lost its label.
+const HOLLOW_MARKERS: [&str; 4] = [
+    "CREATE (:ModeratedReview {reviewer_id: $id, review_id: $review_id})",
+    "CREATE (:ExcludedReviewer {user_id: $id})",
+    "CREATE (:ModeratedUser {user_id: $id})",
+    "CREATE (:ModeratedUser {user_id: $id, tag_id: 'half-deleted'})",
+];
+
+async fn put_hollow_marker(create: &str, id: &str, review_id: &str) -> Result<()> {
+    exec_single_row(
+        Query::new("put_hollow_review_marker", create)
+            .param("id", id)
+            .param("review_id", review_id),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_hollow_markers(id: &str) -> Result<()> {
+    for delete in [
+        "MATCH (m:ModeratedReview {reviewer_id: $id}) DELETE m",
+        "MATCH (m:ExcludedReviewer {user_id: $id}) DELETE m",
+        "MATCH (m:ModeratedUser {user_id: $id}) DELETE m",
+    ] {
+        exec_single_row(Query::new("delete_hollow_review_marker", delete).param("id", id)).await?;
+    }
+    Ok(())
+}
+
+/// Reading a review's moderation beside a marker being deleted must never
+/// fail, and a marker that is gone must not decide the outcome: it applies no
+/// moderation, and it does not outrank the markers still in place.
+#[tokio_shared_rt::test(shared)]
+async fn a_marker_deleted_while_it_is_read_applies_no_moderation_and_fails_nothing() -> Result<()> {
+    let _test = WatcherTest::setup().await?;
+    let reviewer_id = Keypair::random().public_key().z32();
+    let review_id = "hollowreview";
+
+    for create in HOLLOW_MARKERS {
+        put_hollow_marker(create, &reviewer_id, review_id).await?;
+        assert_eq!(
+            ReviewModeration::get(&reviewer_id, review_id).await?,
+            None,
+            "{create}"
+        );
+        delete_hollow_markers(&reviewer_id).await?;
+    }
+
+    // A marker that is gone, an exclusion that sorts before everything else
+    // if it is read, and a marker that is still there.
+    for create in HOLLOW_MARKERS {
+        put_hollow_marker(create, &reviewer_id, review_id).await?;
+    }
+    let moderator_id = default_moderation_tests().id;
+    ModeratedReview::put(
+        &reviewer_id,
+        review_id,
+        &marketplace_review_uri_builder(reviewer_id.clone(), review_id.to_string()),
+        &moderator_id,
+        "hollow-live-tag",
+        MODERATED_LABEL,
+        ReviewModerationState::TextHidden,
+        Utc::now().timestamp_millis(),
+    )
+    .await?;
+    assert_eq!(
+        ReviewModeration::get(&reviewer_id, review_id).await?,
+        moderation(ReviewModerationState::TextHidden, MODERATED_LABEL)
+    );
+
+    ModeratedReview::delete(&moderator_id, "hollow-live-tag").await?;
+    assert_eq!(ReviewModeration::get(&reviewer_id, review_id).await?, None);
+    delete_hollow_markers(&reviewer_id).await?;
     Ok(())
 }
 
