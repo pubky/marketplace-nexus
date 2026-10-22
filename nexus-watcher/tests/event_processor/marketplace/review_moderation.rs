@@ -9,8 +9,9 @@ use crate::event_processor::utils::watcher::{
 };
 use anyhow::Result;
 use chrono::Utc;
+use nexus_common::db::graph::Query;
 use nexus_common::db::kv::put_field_if_exists;
-use nexus_common::db::RedisOps;
+use nexus_common::db::{exec_single_row, RedisOps};
 use nexus_common::models::event::EventProcessorError;
 use nexus_common::models::marketplace::{
     ExcludedReviewer, ModeratedReview, ModeratedUser, ReputationSummary, ReviewDetails,
@@ -713,6 +714,85 @@ async fn a_moderation_write_after_the_review_is_deleted_does_not_index_it_again(
 
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// A marker deleted between the query's match and its property reads still
+/// comes back as a row, with every property but its keys read as null. These
+/// are those rows: one marker of each kind that has kept only the keys the
+/// query matches it by, and one that has kept its tag id but lost its label.
+const HOLLOW_MARKERS: [&str; 4] = [
+    "CREATE (:ModeratedReview {reviewer_id: $id, review_id: $review_id})",
+    "CREATE (:ExcludedReviewer {user_id: $id})",
+    "CREATE (:ModeratedUser {user_id: $id})",
+    "CREATE (:ModeratedUser {user_id: $id, tag_id: 'half-deleted'})",
+];
+
+async fn put_hollow_marker(create: &str, id: &str, review_id: &str) -> Result<()> {
+    exec_single_row(
+        Query::new("put_hollow_review_marker", create)
+            .param("id", id)
+            .param("review_id", review_id),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn delete_hollow_markers(id: &str) -> Result<()> {
+    for delete in [
+        "MATCH (m:ModeratedReview {reviewer_id: $id}) DELETE m",
+        "MATCH (m:ExcludedReviewer {user_id: $id}) DELETE m",
+        "MATCH (m:ModeratedUser {user_id: $id}) DELETE m",
+    ] {
+        exec_single_row(Query::new("delete_hollow_review_marker", delete).param("id", id)).await?;
+    }
+    Ok(())
+}
+
+/// Reading a review's moderation beside a marker being deleted must never
+/// fail, and a marker that is gone must not decide the outcome: it applies no
+/// moderation, and it does not outrank the markers still in place.
+#[tokio_shared_rt::test(shared)]
+async fn a_marker_deleted_while_it_is_read_applies_no_moderation_and_fails_nothing() -> Result<()> {
+    let _test = WatcherTest::setup().await?;
+    let reviewer_id = Keypair::random().public_key().z32();
+    let review_id = "hollowreview";
+
+    for create in HOLLOW_MARKERS {
+        put_hollow_marker(create, &reviewer_id, review_id).await?;
+        assert_eq!(
+            ReviewModeration::get(&reviewer_id, review_id).await?,
+            None,
+            "{create}"
+        );
+        delete_hollow_markers(&reviewer_id).await?;
+    }
+
+    // A marker that is gone, an exclusion that sorts before everything else
+    // if it is read, and a marker that is still there.
+    for create in HOLLOW_MARKERS {
+        put_hollow_marker(create, &reviewer_id, review_id).await?;
+    }
+    let moderator_id = default_moderation_tests().id;
+    ModeratedReview::put(
+        &reviewer_id,
+        review_id,
+        &marketplace_review_uri_builder(reviewer_id.clone(), review_id.to_string()),
+        &moderator_id,
+        "hollow-live-tag",
+        MODERATED_LABEL,
+        ReviewModerationState::TextHidden,
+        Utc::now().timestamp_millis(),
+    )
+    .await?;
+    assert_eq!(
+        ReviewModeration::get(&reviewer_id, review_id).await?,
+        moderation(ReviewModerationState::TextHidden, MODERATED_LABEL)
+    );
+
+    ModeratedReview::delete(&moderator_id, "hollow-live-tag").await?;
+    assert_eq!(ReviewModeration::get(&reviewer_id, review_id).await?, None);
+    delete_hollow_markers(&reviewer_id).await?;
     Ok(())
 }
 

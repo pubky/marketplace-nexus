@@ -1039,7 +1039,9 @@ pub fn excluded_reviewers_of_tag(moderator_id: &str, tag_id: &str) -> Query {
 /// Markers on the review, review-exclusion markers on its reviewer and
 /// moderation markers hiding its reviewer all apply; `excluded` wins over
 /// `text_hidden`, then the lowest tag id. Markers whose tag is being released
-/// (`releasing`) are left out.
+/// (`releasing`) are left out, and so are rows without a state, a reason and a
+/// tag id: a marker deleted between the match and the property reads comes
+/// back with every property null and is no marker.
 pub fn review_moderation(reviewer_id: &str, review_id: &str) -> Query {
     Query::new(
         "review_moderation",
@@ -1055,6 +1057,7 @@ pub fn review_moderation(reviewer_id: &str, review_id: &str) -> Query {
          }
          WITH state, reason, tag_id, releasing
          WHERE releasing IS NULL
+           AND state IS NOT NULL AND reason IS NOT NULL AND tag_id IS NOT NULL
          RETURN state, reason
          ORDER BY CASE state WHEN 'excluded' THEN 0 ELSE 1 END, tag_id, reason
          LIMIT 1",
