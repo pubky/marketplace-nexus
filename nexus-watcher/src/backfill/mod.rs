@@ -9,7 +9,7 @@
 //!   progress after every item, resumes after a stop and refuses to run a
 //!   finished job again.
 //! * [`jobs`]: the two review jobs, built on the same fetch, ingest and
-//!   recompute code the registered migrations use.
+//!   recompute code as the event feed.
 
 pub mod gate;
 pub mod jobs;
