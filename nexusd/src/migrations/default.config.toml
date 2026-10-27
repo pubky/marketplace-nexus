@@ -1,7 +1,9 @@
 # Service name used for tracing, logging, and metrics in OpenTelemetry
 name = "nexusd.migration"
-# List migrations that are in the "backfill_ready" state and should be processed.
-# Add migration IDs here when they are ready for backfilling. Example
+# List multi-staged migrations whose dual_write phase is done and that are ready
+# for backfilling. A listed migration is moved from dual_write to backfill once;
+# one at any other phase is left alone, and a single-staged migration (it starts
+# at backfill) is not affected. Example
 #backfill_ready = ["Xakala1741101644"]
 backfill_ready = []
 

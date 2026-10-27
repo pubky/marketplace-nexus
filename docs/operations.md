@@ -170,11 +170,14 @@ EOF
 nexusd db migration run
 ```
 
-`backfill_ready` is empty in the sample on purpose. Every id listed there is
-moved back to its backfill phase and run again on EVERY `nexusd db migration
-run`, not once: list an id only for the run that should execute it, and remove
-it afterwards. Migrations that are not listed run once, when they are first
-seen, and are then done.
+`backfill_ready` is empty in the sample on purpose. It moves a multi-staged
+migration from `dual_write` to `backfill`, once, and does nothing else: a listed
+id whose stored migration is at any other phase (`backfill`, `cutover`,
+`cleanup` or `done`) is left alone, and an id the database does not know is
+ignored. Each ignored id is logged with its phase, so the log says why nothing
+ran. A single-staged migration starts at `backfill`, so listing one does
+nothing. Migrations that are not listed run once, when they are first seen, and
+are then done.
 
 Both migrations are idempotent. The review backfill treats a missing review
 directory or record (homeserver 404) as gone. If a user's homeserver cannot be
