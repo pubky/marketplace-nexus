@@ -152,7 +152,7 @@ password = "fixture-neo4j-password"
 
     const RESERVE_SCRUB_MIGRATION_CONFIG_TOML: &str = r#"
 name = "nexusd.migration"
-backfill_ready = ["ListingAuctionTermsReindex1787256279", "ReviewBackfill1787905961"]
+backfill_ready = ["ListingAuctionTermsReindex1787256279", "ListingReserveScrub1789805700"]
 testnet = false
 testnet_host = "localhost"
 
@@ -297,7 +297,7 @@ password = "fixture-neo4j-password"
             migration.backfill_ready,
             vec![
                 "ListingAuctionTermsReindex1787256279",
-                "ReviewBackfill1787905961"
+                "ListingReserveScrub1789805700"
             ]
         );
         assert!(!migration.testnet);
