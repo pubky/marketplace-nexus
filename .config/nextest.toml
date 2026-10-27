@@ -25,3 +25,11 @@ package(nexus-watcher) & (
 )
 '''
 threads-required = 'num-test-threads'
+
+# Tests that run the migration manager read every `Migration` node, and the
+# ones that seed `Migration` nodes delete them again. A node deleted between the
+# manager's read and its results being serialised fails the read with a
+# transient `Outdated` error, so these tests run with nothing else in flight.
+[[profile.default.overrides]]
+filter = 'package(nexusd) & binary(/^migration_run/)'
+threads-required = 'num-test-threads'
