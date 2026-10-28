@@ -1926,6 +1926,103 @@ pub fn reviews_without_attestation_time() -> Query {
     )
 }
 
+/// The state of one throttled-backfill job. The clock columns come from the
+/// graph server, so `lease_live` is judged on the same clock that granted it.
+pub fn backfill_run(job: &str) -> Query {
+    Query::new(
+        "backfill_run",
+        "MATCH (b:BackfillRun {job: $job})
+         RETURN b.job AS job, b.status AS status, b.cursor AS cursor, b.phase AS phase,
+                b.ahead AS ahead, b.items AS items, b.requests AS requests,
+                b.refetched AS refetched, b.gone AS gone, b.unreachable AS unreachable,
+                b.failed AS failed, b.aggregates AS aggregates, b.started_at AS started_at,
+                b.updated_at AS updated_at, b.lease_owner AS lease_owner,
+                b.lease_expires_at AS lease_expires_at, b.stop_reason AS stop_reason,
+                (b.status = 'running' AND b.lease_expires_at > timestamp()) AS lease_live",
+    )
+    .param("job", job.to_string())
+}
+
+/// Verified review edges still without the attestation's `iat`, strictly
+/// after the keyset cursor `(after_reviewer, after_review)`, in that order.
+/// `only` restricts the reviewers when `restricted` is set.
+pub fn reviews_without_attestation_time_after(
+    after_reviewer: &str,
+    after_review: &str,
+    limit: i64,
+    restricted: bool,
+    only: Vec<String>,
+) -> Query {
+    Query::new(
+        "reviews_without_attestation_time_after",
+        "MATCH (reviewer:User)-[r:REVIEWED]->(:User)
+         WHERE r.verified AND r.iat IS NULL
+           AND (reviewer.id > $after_reviewer
+                OR (reviewer.id = $after_reviewer AND r.review_id > $after_review))
+           AND (NOT $restricted OR reviewer.id IN $only)
+         RETURN reviewer.id AS reviewer_id, r.review_id AS review_id
+         ORDER BY reviewer_id, review_id
+         LIMIT $limit",
+    )
+    .param("after_reviewer", after_reviewer.to_string())
+    .param("after_review", after_review.to_string())
+    .param("limit", limit)
+    .param("restricted", restricted)
+    .param("only", only)
+}
+
+/// How many reviews [`reviews_without_attestation_time_after`] would walk.
+pub fn count_reviews_without_attestation_time_after(
+    after_reviewer: &str,
+    after_review: &str,
+    restricted: bool,
+    only: Vec<String>,
+) -> Query {
+    Query::new(
+        "count_reviews_without_attestation_time_after",
+        "MATCH (reviewer:User)-[r:REVIEWED]->(:User)
+         WHERE r.verified AND r.iat IS NULL
+           AND (reviewer.id > $after_reviewer
+                OR (reviewer.id = $after_reviewer AND r.review_id > $after_review))
+           AND (NOT $restricted OR reviewer.id IN $only)
+         RETURN count(r) AS total",
+    )
+    .param("after_reviewer", after_reviewer.to_string())
+    .param("after_review", after_review.to_string())
+    .param("restricted", restricted)
+    .param("only", only)
+}
+
+/// Indexed user ids strictly after the keyset cursor, in id order.
+/// `only` restricts the users when `restricted` is set.
+pub fn user_ids_after(after: &str, limit: i64, restricted: bool, only: Vec<String>) -> Query {
+    Query::new(
+        "user_ids_after",
+        "MATCH (u:User)
+         WHERE u.id > $after AND (NOT $restricted OR u.id IN $only)
+         RETURN u.id AS id
+         ORDER BY id
+         LIMIT $limit",
+    )
+    .param("after", after.to_string())
+    .param("limit", limit)
+    .param("restricted", restricted)
+    .param("only", only)
+}
+
+/// How many users [`user_ids_after`] would walk.
+pub fn count_user_ids_after(after: &str, restricted: bool, only: Vec<String>) -> Query {
+    Query::new(
+        "count_user_ids_after",
+        "MATCH (u:User)
+         WHERE u.id > $after AND (NOT $restricted OR u.id IN $only)
+         RETURN count(u) AS total",
+    )
+    .param("after", after.to_string())
+    .param("restricted", restricted)
+    .param("only", only)
+}
+
 #[cfg(test)]
 mod listing_stream_state_tests {
     use super::*;

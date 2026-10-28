@@ -43,7 +43,13 @@ use crate::migrations::migrations_list::users_by_pk_reindex_1751635096::UsersByP
 /// - `migration_manager`: A mutable reference to `MigrationManager` where migrations will be registered.
 ///
 pub fn import_migrations(migration_manager: &mut MigrationManager) {
-    let migrations: Vec<Box<dyn Migration>> = vec![
+    for migration in all_migrations() {
+        migration_manager.register(migration);
+    }
+}
+
+fn all_migrations() -> Vec<Box<dyn Migration>> {
+    vec![
         // Note: Add your migrations here to be picked up by the manager
         Box::new(UsersByPkReindex1751635096),
         Box::new(RemoveMuted1771718400),
@@ -53,8 +59,30 @@ pub fn import_migrations(migration_manager: &mut MigrationManager) {
         Box::new(ReviewModerationRecompute1792579958),
         Box::new(ReviewPerItemRecompute1792584000),
         Box::new(ReviewTrustBucketsBackfill1792587206),
-    ];
-    for migration in migrations {
-        migration_manager.register(migration);
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexus_watcher::backfill::jobs::{DISCOVERY_JOB, TRUST_BUCKETS_JOB};
+
+    /// The throttled review backfills are driven by `nexusd db backfill
+    /// reviews` and never by `migration run`: no registered migration carries
+    /// their ids, so listing those ids in `backfill_ready` cannot start them.
+    #[test]
+    fn the_throttled_backfill_jobs_are_not_registered_migrations() {
+        let ids: Vec<&str> = all_migrations()
+            .iter()
+            .map(|migration| migration.id())
+            .collect();
+        assert!(!ids.is_empty());
+        for job in [TRUST_BUCKETS_JOB, DISCOVERY_JOB] {
+            assert!(!ids.contains(&job), "{job} must not be a migration");
+        }
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "migration ids are unique");
     }
 }

@@ -3199,6 +3199,7 @@ dependencies = [
  "base32",
  "chrono",
  "ed25519-dalek 2.2.0",
+ "futures",
  "httpc-test",
  "neo4rs",
  "nexus-common",
@@ -3252,6 +3253,7 @@ dependencies = [
 name = "nexusd"
 version = "0.4.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "clap",

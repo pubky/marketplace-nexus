@@ -32,6 +32,7 @@ async fn setup_graph_inner() -> GraphResult<()> {
         "CREATE CONSTRAINT uniqueModeratedUserTag IF NOT EXISTS FOR (m:ModeratedUser) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
         "CREATE CONSTRAINT uniqueModeratedReviewTag IF NOT EXISTS FOR (m:ModeratedReview) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
         "CREATE CONSTRAINT uniqueExcludedReviewerTag IF NOT EXISTS FOR (m:ExcludedReviewer) REQUIRE (m.moderator_id, m.tag_id) IS UNIQUE",
+        "CREATE CONSTRAINT uniqueBackfillRunJob IF NOT EXISTS FOR (b:BackfillRun) REQUIRE b.job IS UNIQUE",
     ];
 
     // Create indexes

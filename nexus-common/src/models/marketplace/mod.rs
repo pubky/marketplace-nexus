@@ -5,6 +5,7 @@ mod moderation;
 mod reputation;
 mod review;
 mod review_response;
+mod review_touch;
 mod search;
 mod shop;
 mod stream;
@@ -33,6 +34,7 @@ pub use review::{
     REVIEW_SUBJECT_KEY_PARTS,
 };
 pub use review_response::ReviewResponseDetails;
+pub use review_touch::{ReviewTouch, REVIEW_TOUCH_TTL_SECONDS};
 pub use search::{ListingsByTagSearch, TAG_GLOBAL_LISTING_TIMELINE};
 pub use shop::ShopDetails;
 pub use stream::{

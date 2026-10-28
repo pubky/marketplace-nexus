@@ -152,7 +152,7 @@ container:
 mkdir -p ~/.pubky-nexus/migrations
 cat > ~/.pubky-nexus/migrations/config.toml <<'EOF'
 name = "nexusd.migration"
-backfill_ready = ["ListingAuctionTermsReindex1787256279", "ReviewBackfill1787905961"]
+backfill_ready = []
 testnet = false
 testnet_host = "localhost"
 
@@ -170,6 +170,12 @@ EOF
 nexusd db migration run
 ```
 
+`backfill_ready` is empty in the sample on purpose. Every id listed there is
+moved back to its backfill phase and run again on EVERY `nexusd db migration
+run`, not once: list an id only for the run that should execute it, and remove
+it afterwards. Migrations that are not listed run once, when they are first
+seen, and are then done.
+
 Both migrations are idempotent. The review backfill treats a missing review
 directory or record (homeserver 404) as gone. If a user's homeserver cannot be
 reached while its review directory is listed, that user is logged and counted
@@ -177,3 +183,76 @@ as `unreachable` but skipped so one offline homeserver cannot permanently block
 this migration or the migrations after it. Record-level fetch, parse, and
 ingest failures still fail the migration and are retried on the next run;
 already-indexed reviews are skipped. The watcher does not need to be stopped.
+
+## Running the review backfills at a controlled rate
+
+`ReviewBackfill1787905961` and `ReviewTrustBucketsBackfill1792587206` read from
+every reviewer's homeserver as fast as they can, with no cap and no way to stop
+and continue. On a deployment with many reviewers, run the same work with the
+throttled command instead:
+
+```bash
+nexusd db backfill reviews --job review-trust-buckets --dry-run
+nexusd db backfill reviews --job review-trust-buckets --rate 2 --max-duration 2h
+```
+
+The command reads the same `~/.pubky-nexus/migrations/config.toml` as
+`migration run` and needs the same access. It is not a migration: it is not
+registered with `migration run`, and putting its job ids in `backfill_ready`
+does nothing.
+
+Jobs (`--job`):
+
+- `review-trust-buckets` re-reads each verified review indexed without its
+  attestation `iat` (one request per review), through the normal ingest, then
+  recomputes every review aggregate once. The same work as
+  `ReviewTrustBucketsBackfill1792587206`.
+- `review-discovery` lists each indexed user's reviews directory and ingests
+  the records the graph lacks, the same work as `ReviewBackfill1787905961`.
+
+Flags:
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--rate` | `2` | Homeserver requests per second across the whole run: every record GET and every directory LIST page counts. Above 0, at most 20. |
+| `--concurrency` | `1` | Requests in flight at once, 1 to 4. |
+| `--max-requests` | none | Stop cleanly (status `paused`) after this many requests. |
+| `--max-duration` | none | Stop cleanly (status `paused`) after this long: `90s`, `45m`, `2h`. |
+| `--max-consecutive-errors` | `20` | Abort (status `aborted`) after this many failed requests in a row. Failed requests back off from 1 s up to 60 s, with jitter. |
+| `--aggregate-pause-ms` | `50` | Pause between aggregate recomputes, which only touch the databases. |
+| `--dry-run` | off | Print the work left and the least time it takes at the chosen rate. Sends no request and writes nothing. |
+| `--force-rerun` | off | Start a job that is already `done` again from the beginning. It never takes a lease another runner holds. |
+
+Behavior:
+
+- Once only. A job's state (status, cursor, counters) is kept in the graph. A
+  finished job answers "already done" and sends nothing; `--force-rerun` is the
+  way to run it again.
+- Resumable. The cursor is saved after every item. After a pause, an abort, a
+  crash or an interrupt (Ctrl-C ends the run cleanly as `paused`), run the same
+  command again: it continues after the last finished item and never asks again
+  for one already finished. An item that was cut short is started again.
+- One runner at a time. The run holds a lease it renews while it works. A
+  second runner is refused ("another runner holds the lease") while the lease is
+  live; a crashed runner's lease expires after 60 seconds and the next run takes
+  over.
+- Unreachable and gone records are counted and not retried: a review or
+  directory the homeserver answers 404 for is `gone`, a homeserver that cannot
+  be reached is `unreachable`. Both leave the review out of the buckets until
+  its next edit, as in the migrations.
+- Concurrent feed changes are respected: a review that the watcher deleted or
+  edited after the backfill read it is never overwritten with the stale
+  record, and a deleted review is not brought back.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | The job is done, already done, or paused by a budget or an interrupt. |
+| `1` | Nothing ran: another runner holds the lease, the flags were refused, or the databases could not be reached. |
+| `2` | The run aborted: the error breaker tripped, the lease was lost, or a database failed. The cursor is kept. |
+| `3` | The job is done, but some records failed (`failed` above 0 in the totals). |
+
+Scripts should treat `0` as "run it again if the job is not done yet" only for
+a `paused` run (the last line printed says which), and any other nonzero code as
+a stop that needs a look at the log.

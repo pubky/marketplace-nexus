@@ -91,7 +91,7 @@ impl<'a> Order<'a> {
         }
     }
 
-    fn priced(mut self, price_decade: &'a str) -> Self {
+    pub(super) fn priced(mut self, price_decade: &'a str) -> Self {
         self.price_decade = Some(price_decade);
         self
     }
