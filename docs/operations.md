@@ -116,11 +116,6 @@ One-shot migrations (see the runbook in `README.md`):
 
 - `ListingAuctionTermsReindex1787256279` re-reads auction listings that
   predate the auction-term fields.
-- `ReviewBackfill1787905961` discovers and indexes marketplace reviews
-  published BEFORE the deployed watcher's replay cursor, by LISTing every
-  indexed user's reviews directory on their homeserver and running the
-  normal ingest (attestation verification and reputation recompute
-  included).
 - `ReviewModerationRecompute1792579958` re-derives every indexed review's
   `moderation` from the moderation markers and recomputes the aggregates that
   changed, so the reviews of users moderated before review moderation shipped
@@ -132,15 +127,6 @@ One-shot migrations (see the runbook in `README.md`):
   (shipping, communication) counts once, and every review aggregate is
   recomputed. No record is rewritten. It needs only the databases; run it
   once after the release that adds per-item reviews.
-- `ReviewTrustBucketsBackfill1792587206` re-reads every verified review
-  indexed without its attestation `iat` (indexed before per-attestor buckets
-  shipped) from the reviewer's homeserver, then recomputes every review
-  aggregate so each carries its per-attestor buckets. It needs outbound
-  access to homeservers. A homeserver that cannot be reached is reported and
-  skipped, not fatal: its reviews stay out of the buckets (never
-  over-counted) until their next edit. Run it once, after
-  `ReviewPerItemRecompute1792584000`, after the release that adds trust-scoped
-  aggregates.
 
 Run them where the databases are reachable, for example inside the `nexusd`
 container:
@@ -179,20 +165,44 @@ ran. A single-staged migration starts at `backfill`, so listing one does
 nothing. Migrations that are not listed run once, when they are first seen, and
 are then done.
 
-Both migrations are idempotent. The review backfill treats a missing review
-directory or record (homeserver 404) as gone. If a user's homeserver cannot be
-reached while its review directory is listed, that user is logged and counted
-as `unreachable` but skipped so one offline homeserver cannot permanently block
-this migration or the migrations after it. Record-level fetch, parse, and
-ingest failures still fail the migration and are retried on the next run;
-already-indexed reviews are skipped. The watcher does not need to be stopped.
+## Retired: the unthrottled review backfill migrations
+
+`ReviewBackfill1787905961` and `ReviewTrustBucketsBackfill1792587206` are no
+longer registered, so `nexusd db migration run` does not run them. They read
+from every reviewer's homeserver with no rate limit, no budget and no way to
+stop and continue. The same work is done by `nexusd db backfill reviews`, at a
+controlled rate (next section):
+
+| Retired migration | Command | What it does |
+| --- | --- | --- |
+| `ReviewBackfill1787905961` | `nexusd db backfill reviews --job review-discovery` | Lists each indexed user's reviews directory and ingests the records the graph lacks (reviews published before the watcher's replay cursor). |
+| `ReviewTrustBucketsBackfill1792587206` | `nexusd db backfill reviews --job review-trust-buckets` | Re-reads each verified review indexed without its attestation `iat` and recomputes every review aggregate, so each carries its per-attestor buckets. |
+
+A `Migration` node stored under either id stays in the database as it is. The
+runner only visits registered migrations, so the node is inert; nothing reads
+it, changes it or deletes it.
+
+Before relying on this on a database, check what that database recorded:
+
+```cypher
+MATCH (m:Migration)
+WHERE m.id IN ['ReviewBackfill1787905961', 'ReviewTrustBucketsBackfill1792587206']
+RETURN m.id, m.phase
+```
+
+`done` for an id means the old migration finished there, so its job has nothing
+left to do. No row for an id, or `backfill`, means the old migration never
+finished there: run its job with `nexusd db backfill reviews` once on that
+database (`review-discovery` first, then `review-trust-buckets`). No data is
+lost either way; the check only tells you whether the command still has work to
+do there. `review-discovery` sends one LIST request per indexed user, so run it
+only where the check asks for it.
 
 ## Running the review backfills at a controlled rate
 
-`ReviewBackfill1787905961` and `ReviewTrustBucketsBackfill1792587206` read from
-every reviewer's homeserver as fast as they can, with no cap and no way to stop
-and continue. On a deployment with many reviewers, run the same work with the
-throttled command instead:
+The review backfills read from every reviewer's homeserver, so they run as a
+command with a request rate, budgets and a place to continue from, and not as
+migrations:
 
 ```bash
 nexusd db backfill reviews --job review-trust-buckets --dry-run
@@ -208,10 +218,13 @@ Jobs (`--job`):
 
 - `review-trust-buckets` re-reads each verified review indexed without its
   attestation `iat` (one request per review), through the normal ingest, then
-  recomputes every review aggregate once. The same work as
-  `ReviewTrustBucketsBackfill1792587206`.
+  recomputes every review aggregate once. Run it once, after
+  `ReviewPerItemRecompute1792584000`, after the release that adds trust-scoped
+  aggregates.
 - `review-discovery` lists each indexed user's reviews directory and ingests
-  the records the graph lacks, the same work as `ReviewBackfill1787905961`.
+  the records the graph lacks: reviews published before the watcher's replay
+  cursor, which the event feed never delivers. It reads the users already
+  indexed, so run it after a substantial user set is indexed.
 
 Flags:
 
@@ -242,7 +255,7 @@ Behavior:
 - Unreachable and gone records are counted and not retried: a review or
   directory the homeserver answers 404 for is `gone`, a homeserver that cannot
   be reached is `unreachable`. Both leave the review out of the buckets until
-  its next edit, as in the migrations.
+  its next edit.
 - Concurrent feed changes are respected: a review that the watcher deleted or
   edited after the backfill read it is never overwritten with the stale
   record, and a deleted review is not brought back.

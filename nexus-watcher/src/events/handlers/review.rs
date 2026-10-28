@@ -1,8 +1,8 @@
-use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
+use crate::backfill::gate::{GateStop, RequestGate};
 use crate::events::handlers::listing::is_homeserver_not_found;
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
-use nexus_common::db::reindex::{get_all_user_ids, get_indexed_review_ids};
+use nexus_common::db::reindex::get_indexed_review_ids;
 use nexus_common::db::{OperationOutcome, PubkyConnector};
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::marketplace::{
@@ -367,90 +367,10 @@ pub struct ReviewBackfill {
     /// failure.
     pub gone: usize,
     /// Users whose reviews directory could not be reached. They are logged
-    /// and skipped without blocking this one-shot migration.
+    /// and skipped without blocking the run.
     pub unreachable: usize,
     /// Reviews that could not be fetched, parsed, or ingested this pass.
     pub failed: usize,
-}
-
-/// Discovers and indexes marketplace reviews published BEFORE the deployed
-/// watcher's replay cursor, which the events feed will never deliver.
-///
-/// Unlike the listing-terms backfill (whose candidates exist as incomplete
-/// graph rows), a pre-cursor review has NO index row at all, so candidates
-/// are discovered from the canonical source: for every indexed user, the
-/// reviewer-owned `/pub/pubky.app/marketplace/v1/reviews/` directory is
-/// LISTed on the homeserver (public, unauthenticated), already-indexed ids
-/// are skipped, and each remaining record is fetched and run through the
-/// normal ingest ([`sync_put`]) — offline attestation verification,
-/// reputation recompute, and all.
-///
-/// Failures never abort the pass: they are tallied and the migration re-run
-/// retries them (indexed reviews drop out via the already-indexed skip).
-pub async fn backfill_unindexed_reviews() -> Result<ReviewBackfill, DynError> {
-    let user_ids = get_all_user_ids().await?;
-    let total = user_ids.len();
-    info!(
-        "Review backfill: scanning the reviews directory of {} indexed user(s)",
-        total
-    );
-
-    // Bounded concurrency: the scan is network-bound (one homeserver LIST
-    // per user, pkarr resolution included), and a sequential pass over
-    // thousands of users outlives operator sessions. Sixteen in flight
-    // keeps the staging homeserver comfortable and the wall time in
-    // minutes.
-    const CONCURRENCY: usize = 16;
-    let mut summary = ReviewBackfill::default();
-    let mut scanned = 0usize;
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut queue = user_ids.into_iter();
-
-    loop {
-        while tasks.len() < CONCURRENCY {
-            let Some(user_id) = queue.next() else { break };
-            tasks.spawn(async move {
-                let result = backfill_reviews_for_user(&user_id).await;
-                (user_id, result)
-            });
-        }
-        let Some(joined) = tasks.join_next().await else {
-            break;
-        };
-        scanned += 1;
-        if scanned.is_multiple_of(250) {
-            info!("Review backfill: scanned {}/{} user(s)", scanned, total);
-        }
-        match joined {
-            Ok((_, Ok(user_summary))) => {
-                summary.indexed += user_summary.indexed;
-                summary.already_indexed += user_summary.already_indexed;
-                summary.gone += user_summary.gone;
-                summary.unreachable += user_summary.unreachable;
-                summary.failed += user_summary.failed;
-            }
-            Ok((user_id, Err(e))) => {
-                warn!("Review backfill for user {} failed: {:?}", user_id, e);
-                summary.failed += 1;
-            }
-            Err(e) => {
-                warn!("Review backfill task panicked: {:?}", e);
-                summary.failed += 1;
-            }
-        }
-    }
-    Ok(summary)
-}
-
-/// One user's backfill pass: LIST their reviews directory
-/// (cursor-paginated), skip ids the graph already carries, ingest the rest.
-pub async fn backfill_reviews_for_user(user_id: &str) -> Result<ReviewBackfill, DynError> {
-    let mut summary = ReviewBackfill::default();
-    match scan_user_reviews(&Unthrottled, user_id, &mut summary).await {
-        Ok(()) => Ok(summary),
-        Err(UserScanError::Failed(e)) => Err(e),
-        Err(UserScanError::Stopped(stop)) => Err(Box::new(stop)),
-    }
 }
 
 /// Why a user's directory scan did not finish.
@@ -462,9 +382,19 @@ pub enum UserScanError {
     Failed(DynError),
 }
 
-/// One user's discovery pass through a request gate. Every LIST page and
-/// every record GET takes a permit from `gate`, and the tallies go to
-/// `summary`, which holds what was done so far when the gate stops the scan.
+/// One user's discovery pass through a request gate. A review published before
+/// the deployed watcher's replay cursor has no index row and its event is never
+/// delivered, so candidates are discovered from the canonical source: the
+/// reviewer-owned `/pub/pubky.app/marketplace/v1/reviews/` directory is LISTed
+/// on the homeserver (public, unauthenticated), already-indexed ids are skipped
+/// and each remaining record is fetched and run through the normal ingest
+/// ([`sync_put`]), offline attestation verification and reputation recompute
+/// included.
+///
+/// Every LIST page and every record GET takes a permit from `gate`, and the
+/// tallies go to `summary`, which holds what was done so far when the gate
+/// stops the scan. Failures never abort the pass: they are tallied, and indexed
+/// reviews drop out of a later pass through the already-indexed skip.
 pub async fn scan_user_reviews(
     gate: &dyn RequestGate,
     user_id: &str,
@@ -498,7 +428,7 @@ pub async fn scan_user_reviews(
             }
             // A user with no reviews directory answers 404. Other LIST
             // failures mean this user's homeserver is unreachable. Neither
-            // case may permanently block the one-shot migration.
+            // case may permanently block the backfill.
             Err(e) if is_homeserver_not_found(&e) => {
                 permit.succeeded();
                 debug!("Review directory for user {} is gone", user_id);
@@ -598,19 +528,6 @@ pub enum ReviewIngest {
 
 /// How often one review is read again because the feed kept changing it.
 const MAX_READS_PER_REVIEW: usize = 3;
-
-/// Fetches one review record from the reviewer's homeserver (the canonical
-/// source) and runs the normal ingest. Returns `false` without indexing when
-/// the record no longer exists on the homeserver.
-pub async fn ingest_review_from_homeserver(
-    user_id: &str,
-    review_id: &str,
-) -> Result<bool, EventProcessorError> {
-    match ingest_review_through(&Unthrottled, user_id, review_id).await? {
-        ReviewIngest::Ingested => Ok(true),
-        ReviewIngest::Gone | ReviewIngest::Changed => Ok(false),
-    }
-}
 
 /// Reads one review from the reviewer's homeserver through `gate` and indexes
 /// it, guarded against the event feed: a review the feed deleted after it was
@@ -769,24 +686,6 @@ pub async fn fetch_review_record(
     }
 }
 
-/// Outcome tally of the one-shot trust-bucket backfill.
-#[derive(Debug, Default)]
-pub struct TrustBucketBackfill {
-    /// Verified reviews re-read from their homeserver, now carrying their
-    /// attestation's `iat` and price weight.
-    pub refetched: usize,
-    /// Reviews whose record left the homeserver; they stay out of the trust
-    /// buckets until their deletion is indexed.
-    pub gone: usize,
-    /// Reviews whose homeserver could not be reached; they stay out of the
-    /// trust buckets until their next edit.
-    pub unreachable: usize,
-    /// Reviews that were read but could not be ingested.
-    pub failed: usize,
-    /// Subject and listing aggregates recomputed.
-    pub aggregates: usize,
-}
-
 /// What re-reading one review without `iat` came to.
 #[derive(Debug)]
 pub enum Rebucket {
@@ -818,53 +717,4 @@ pub async fn rebucket_review(
         Err(ReviewIngestError::Invalid(e)) => Ok(Rebucket::Invalid(e)),
         Err(ReviewIngestError::Index(e)) => Ok(Rebucket::Failed(e)),
     }
-}
-
-/// One-shot backfill for the trust buckets. Verified reviews indexed before
-/// the index kept their attestation's `iat` and price weight are re-read from
-/// the reviewer's homeserver and run through the normal ingest (the index
-/// never stored the attestation, so it cannot derive them offline). Every
-/// subject and listing aggregate is then recomputed, so each carries its
-/// buckets and unverified count. Idempotent: a re-run re-reads only reviews
-/// still without `iat`.
-pub async fn backfill_trust_buckets() -> Result<TrustBucketBackfill, EventProcessorError> {
-    let mut summary = TrustBucketBackfill::default();
-    for (reviewer_id, review_id) in ReviewDetails::without_attestation_time().await? {
-        match rebucket_review(&Unthrottled, &reviewer_id, &review_id)
-            .await
-            .map_err(|stop| EventProcessorError::generic(stop.to_string()))?
-        {
-            Rebucket::Refetched => summary.refetched += 1,
-            Rebucket::Gone => {
-                debug!(
-                    "Review {}/{} left the homeserver; it stays unbucketed",
-                    reviewer_id, review_id
-                );
-                summary.gone += 1;
-            }
-            Rebucket::Unreachable(e) | Rebucket::Invalid(e) => {
-                warn!(
-                    "Review {}/{} is unreachable; it stays unbucketed until its next edit: {:?}",
-                    reviewer_id, review_id, e
-                );
-                summary.unreachable += 1;
-            }
-            Rebucket::Failed(e) => {
-                warn!(
-                    "Trust-bucket backfill could not ingest {}/{}: {:?}",
-                    reviewer_id, review_id, e
-                );
-                summary.failed += 1;
-            }
-        }
-    }
-    let (subjects, listings) = ReviewDetails::aggregate_scopes().await?;
-    for (subject_id, role) in &subjects {
-        ReputationSummary::recompute_subject(subject_id, *role).await?;
-    }
-    for (listing_owner_id, listing_id) in &listings {
-        ReputationSummary::recompute_listing(listing_owner_id, listing_id).await?;
-    }
-    summary.aggregates = subjects.len() + listings.len();
-    Ok(summary)
 }
