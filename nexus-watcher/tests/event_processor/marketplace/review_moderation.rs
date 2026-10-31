@@ -1060,11 +1060,13 @@ async fn a_derivation_reads_the_markers_only_once_it_holds_the_review_clock() ->
         let blocked = fetch_key_from_graph::<i64>(
             Query::new(
                 "test_blocked_derivation",
-                "SHOW TRANSACTIONS YIELD currentQuery, status
+                "SHOW TRANSACTIONS YIELD currentQuery, parameters, status
                  WHERE currentQuery CONTAINS 'MERGE (clock:ReviewModerationClock'
+                   AND parameters.review_id = $review_id
                    AND status STARTS WITH 'Blocked'
                  RETURN count(*) AS n",
-            ),
+            )
+            .param("review_id", review_id.as_str()),
             "n",
         )
         .await?
