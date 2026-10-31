@@ -1045,7 +1045,21 @@ pub fn excluded_reviewers_of_tag(moderator_id: &str, tag_id: &str) -> Query {
 pub fn review_moderation(reviewer_id: &str, review_id: &str) -> Query {
     Query::new(
         "review_moderation",
-        "CALL () {
+        format!(
+            "{REVIEW_MODERATION_MARKERS}
+             LIMIT 1
+             RETURN state, reason"
+        ),
+    )
+    .param("reviewer_id", reviewer_id)
+    .param("review_id", review_id)
+}
+
+/// The markers that apply to the review `($reviewer_id, $review_id)`, as
+/// `state, reason` rows, the deciding marker first: exclusion wins over hidden
+/// text, then the lowest tag id. Markers flagged as being released and marker
+/// rows read half-deleted are left out.
+pub(crate) const REVIEW_MODERATION_MARKERS: &str = "CALL () {
             MATCH (m:ModeratedReview {reviewer_id: $reviewer_id, review_id: $review_id})
             RETURN m.state AS state, m.label AS reason, m.tag_id AS tag_id, m.releasing AS releasing
             UNION ALL
@@ -1058,13 +1072,8 @@ pub fn review_moderation(reviewer_id: &str, review_id: &str) -> Query {
          WITH state, reason, tag_id, releasing
          WHERE releasing IS NULL
            AND state IS NOT NULL AND reason IS NOT NULL AND tag_id IS NOT NULL
-         RETURN state, reason
-         ORDER BY CASE state WHEN 'excluded' THEN 0 ELSE 1 END, tag_id, reason
-         LIMIT 1",
-    )
-    .param("reviewer_id", reviewer_id)
-    .param("review_id", review_id)
-}
+         WITH state, reason
+         ORDER BY CASE state WHEN 'excluded' THEN 0 ELSE 1 END, tag_id, reason";
 
 /// The distinct reviewer orders `(reviewer_id, attestor_id, order_ref, role)`
 /// of the verified review edges.

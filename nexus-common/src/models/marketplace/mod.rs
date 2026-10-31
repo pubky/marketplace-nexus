@@ -20,8 +20,8 @@ pub use drop::{
 };
 pub use listing::{ListingDetails, ListingSaleFormat};
 pub use moderation::{
-    ExcludedReviewer, ListingModerationState, ModeratedListing, ModeratedReview, ModeratedUser,
-    ReviewModeration, ReviewModerationState,
+    DerivedReviewModeration, ExcludedReviewer, ListingModerationState, ModeratedListing,
+    ModeratedReview, ModeratedUser, ReviewModeration, ReviewModerationState,
 };
 pub use reputation::{
     AttestorWindow, CountedReview, ReputationBucket, ReputationSnippet, ReputationSummary,
