@@ -34,6 +34,9 @@ COPY Cargo.toml Cargo.lock ./
 # Copy over all the source code
 COPY . .
 
+# Commit reported by /v0/info, for builds whose context has no usable .git
+ARG GIT_COMMIT
+
 # Build the project in release mode for the MUSL target
 RUN cargo build --release --bin nexusd
 
