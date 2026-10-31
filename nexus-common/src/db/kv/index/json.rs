@@ -280,6 +280,64 @@ pub async fn put_field_if_exists<T: Serialize + Send + Sync>(
     Ok(written == 1)
 }
 
+/// What [`put_field_if_newer`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionedWrite {
+    /// The field was written and `version` recorded.
+    Written,
+    /// A write of the same or a newer version was already recorded; nothing
+    /// was written.
+    Stale,
+    /// The document does not exist; nothing was written.
+    Missing,
+}
+
+/// Sets one top-level `field` of an existing JSON document, only when
+/// `version` is newer than the last version written to that field, which is
+/// recorded under the plain key `version_key`. The existence check, the
+/// version check and both writes run in one Lua script, so a write computed
+/// from an older read can never land after a newer one, and a deleted
+/// document is never re-created.
+pub async fn put_field_if_newer<T: Serialize + Send + Sync>(
+    prefix: &str,
+    key: &str,
+    field: &str,
+    value: &T,
+    version_key: &str,
+    version: i64,
+) -> RedisResult<VersionedWrite> {
+    let mut redis_conn = get_redis_conn().await?;
+    let index_key = format!("{prefix}:{key}");
+    let script = Script::new(
+        r#"
+        if redis.call('EXISTS', KEYS[1]) == 0 then
+            return 0
+        end
+        local stored = tonumber(redis.call('GET', KEYS[2])) or 0
+        if stored >= tonumber(ARGV[3]) then
+            return -1
+        end
+        redis.call('JSON.SET', KEYS[1], ARGV[1], ARGV[2])
+        redis.call('SET', KEYS[2], ARGV[3])
+        return 1
+    "#,
+    );
+    let outcome: i64 = script
+        .key(&index_key)
+        .key(version_key)
+        .arg(format!("$.{field}"))
+        .arg(to_json_value(value)?.to_string())
+        .arg(version.to_string())
+        .invoke_async(&mut redis_conn)
+        .await?;
+    debug!("Set field {field} of key {index_key} at version {version}: {outcome}");
+    Ok(match outcome {
+        1 => VersionedWrite::Written,
+        -1 => VersionedWrite::Stale,
+        _ => VersionedWrite::Missing,
+    })
+}
+
 /// Handles storing a boolean value in Redis with an optional expiration.
 ///
 /// This function sets a key in Redis to either `1` or `0`, depending on the boolean value provided.
