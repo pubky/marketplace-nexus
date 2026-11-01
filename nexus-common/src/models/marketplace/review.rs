@@ -1,7 +1,10 @@
 use super::{
-    AttestorWindow, CountedReview, ReputationBucket, ReviewModeration, ReviewResponseDetails,
+    AttestorWindow, CountedReview, DerivedReviewModeration, ReputationBucket, ReviewModeration,
+    ReviewResponseDetails,
 };
-use crate::db::kv::{put_field_if_exists, RedisResult, SortOrder};
+use crate::db::kv::{
+    put_field_if_exists, put_field_if_newer, RedisResult, SortOrder, VersionedWrite,
+};
 use crate::db::{
     exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, queries, GraphResult,
     OperationOutcome, RedisOps,
@@ -19,6 +22,14 @@ use utoipa::ToSchema;
 
 pub const REVIEW_SUBJECT_KEY_PARTS: [&str; 2] = ["Reviews", "Subject"];
 pub const REVIEW_LISTING_KEY_PARTS: [&str; 2] = ["Reviews", "Listing"];
+
+/// Prefix of the plain keys holding the version of the last derivation
+/// written to a review's `moderation` field
+/// ([`ReviewDetails::store_moderation`]). Like the graph clock the versions
+/// come from, the keys are never deleted, so a derivation computed before a
+/// review was deleted cannot overwrite one computed after it was indexed
+/// again.
+pub const REVIEW_MODERATION_VERSION_PREFIX: &str = "Review:ModerationVersion";
 
 /// The marketplace transaction service's review edit window. Records whose
 /// `updated_at` moved beyond this window after `created_at` are flagged
@@ -245,11 +256,19 @@ impl ReviewDetails {
             superseded,
         ))
         .await?;
-        if let Some(mut details) = Self::get_from_index(reviewer_id, review_id).await? {
-            details.superseded = superseded;
-            details
-                .put_index_json(&[reviewer_id, review_id], None, None)
-                .await?;
+        // Only the field is written: a whole-document write of this read
+        // would put back a moderation that a derivation stored meanwhile.
+        if let Some(details) = Self::get_from_index(reviewer_id, review_id).await? {
+            let indexed = put_field_if_exists(
+                &Self::prefix().await,
+                &[reviewer_id, review_id].join(":"),
+                "superseded",
+                &superseded,
+            )
+            .await?;
+            if !indexed {
+                return Ok(());
+            }
             if superseded {
                 details.remove_from_streams().await?;
             } else {
@@ -437,41 +456,45 @@ impl ReviewDetails {
         Ok(reviewer_ids)
     }
 
-    /// Re-derives an indexed review's moderation from the markers (see
-    /// [`ReviewModeration::get`]) and stores it on the edge and the details
-    /// JSON. Returns the updated details when the moderation changed, `None`
-    /// when it did not or the review is not indexed (its ingest reads the
-    /// markers). Only the JSON's `moderation` field is written, and only while
-    /// the review is still indexed: a review deleted meanwhile stays deleted.
+    /// Re-derives a review's moderation from the markers and stores it on the
+    /// edge ([`ReviewModeration::derive_and_store`]) and the details JSON
+    /// ([`Self::store_moderation`]). Returns the indexed details when the
+    /// stored moderation changed, so the caller recomputes what depends on it;
+    /// `None` when it did not or the review is not indexed.
     pub async fn refresh_moderation(
         reviewer_id: &str,
         review_id: &str,
     ) -> ModelResult<Option<Self>> {
-        let Some(mut details) = Self::get_from_index(reviewer_id, review_id).await? else {
-            return Ok(None);
-        };
-        let moderation = ReviewModeration::get(reviewer_id, review_id).await?;
-        if details.moderation == moderation {
-            return Ok(None);
-        }
-        exec_single_row(queries::put::set_review_moderation(
-            reviewer_id,
-            review_id,
-            moderation.as_ref(),
-        ))
-        .await?;
-        let indexed = put_field_if_exists(
+        let derived = ReviewModeration::derive_and_store(reviewer_id, review_id).await?;
+        Self::store_moderation(reviewer_id, review_id, &derived).await
+    }
+
+    /// Writes one derivation's moderation into the details JSON. Only the
+    /// `moderation` field is written, only while the review is indexed (a
+    /// review deleted meanwhile stays deleted), and only if no later
+    /// derivation has written it already: a derivation that read the markers
+    /// before a release never stores them after the release's own derivation.
+    /// Returns the indexed details when the derivation changed the edge,
+    /// holding whichever derivation's moderation is current.
+    pub async fn store_moderation(
+        reviewer_id: &str,
+        review_id: &str,
+        derived: &DerivedReviewModeration,
+    ) -> ModelResult<Option<Self>> {
+        let key = [reviewer_id, review_id].join(":");
+        let written = put_field_if_newer(
             &Self::prefix().await,
-            &[reviewer_id, review_id].join(":"),
+            &key,
             "moderation",
-            &moderation,
+            &derived.moderation,
+            &format!("{REVIEW_MODERATION_VERSION_PREFIX}:{key}"),
+            derived.version,
         )
         .await?;
-        if !indexed {
+        if written == VersionedWrite::Missing || !derived.changed {
             return Ok(None);
         }
-        details.moderation = moderation;
-        Ok(Some(details))
+        Ok(Self::get_from_index(reviewer_id, review_id).await?)
     }
 
     /// The review as review streams serve it: a moderated review's text is

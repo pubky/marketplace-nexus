@@ -1,8 +1,7 @@
 use crate::db::graph::error::{GraphError, GraphResult};
+use crate::db::graph::queries::get::REVIEW_MODERATION_MARKERS;
 use crate::db::graph::Query;
-use crate::models::marketplace::{
-    DropDetails, ListingDetails, ReviewDetails, ReviewModeration, ShopDetails,
-};
+use crate::models::marketplace::{DropDetails, ListingDetails, ReviewDetails, ShopDetails};
 use crate::models::post::PostRelationships;
 use crate::models::{file::FileDetails, post::PostDetails, user::UserDetails};
 use pubky_app_specs::{ParsedUri, Resource};
@@ -876,29 +875,45 @@ pub fn set_review_superseded(reviewer_id: &str, review_id: &str, superseded: boo
     .param("superseded", superseded)
 }
 
-/// Sets (or clears, with `None`) a review edge's moderation state and reason.
-pub fn set_review_moderation(
-    reviewer_id: &str,
-    review_id: &str,
-    moderation: Option<&ReviewModeration>,
-) -> Query {
+/// Derives one review's moderation from its markers and stores it on the
+/// review edge, as one locked step.
+///
+/// The review's `ReviewModerationClock` is bumped first, which write-locks it
+/// until the transaction ends, and the markers are read only after that (the
+/// marker read depends on the bumped version). Two derivations of one review
+/// therefore never interleave: the later one reads the markers after the
+/// earlier one has stored its result, so a release's re-derivation, which
+/// runs after the release flags its markers, always stores last. The returned
+/// `version` orders derivations for the details cache
+/// ([`crate::db::kv::put_field_if_newer`]). The clock is never deleted, so
+/// versions keep growing across a deletion and re-indexing of the review.
+///
+/// Returns `version`, the derived `state` and `reason` (null without
+/// moderation), whether the edge exists (`indexed`) and the edge's
+/// `previous_state` and `previous_reason`.
+pub fn derive_review_moderation(reviewer_id: &str, review_id: &str) -> Query {
     Query::new(
-        "set_review_moderation",
-        "MATCH (reviewer:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
-        SET r.moderation = $moderation,
-            r.moderation_reason = $moderation_reason
-        RETURN true AS flag;",
+        "derive_review_moderation",
+        format!(
+            "MERGE (clock:ReviewModerationClock {{reviewer_id: $reviewer_id, review_id: $review_id}})
+             SET clock.version = coalesce(clock.version, 0) + 1
+             WITH clock
+             CALL (clock) {{
+                 WITH clock WHERE clock.version IS NOT NULL
+                 {REVIEW_MODERATION_MARKERS}
+                 RETURN collect({{state: state, reason: reason}})[0] AS found
+             }}
+             OPTIONAL MATCH (:User {{id: $reviewer_id}})-[r:REVIEWED {{review_id: $review_id}}]->(:User)
+             WITH clock, found, r, r.moderation AS previous_state, r.moderation_reason AS previous_reason
+             FOREACH (edge IN CASE WHEN r IS NULL THEN [] ELSE [r] END |
+                 SET edge.moderation = found.state,
+                     edge.moderation_reason = found.reason)
+             RETURN clock.version AS version, found.state AS state, found.reason AS reason,
+                 r IS NOT NULL AS indexed, previous_state, previous_reason"
+        ),
     )
     .param("reviewer_id", reviewer_id.to_string())
     .param("review_id", review_id.to_string())
-    .param(
-        "moderation",
-        moderation.map(|moderation| moderation.state.as_str().to_string()),
-    )
-    .param(
-        "moderation_reason",
-        moderation.map(|moderation| moderation.reason.clone()),
-    )
 }
 
 /// Sets or clears the `has_response` flag on a review edge (maintained by

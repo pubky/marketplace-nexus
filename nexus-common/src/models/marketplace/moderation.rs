@@ -1,5 +1,6 @@
 use crate::db::{
-    exec_single_row, fetch_all_rows_from_graph, fetch_row_from_graph, queries, GraphResult,
+    exec_single_row, fetch_all_rows_from_graph, fetch_row_from_graph, queries, GraphError,
+    GraphResult,
 };
 use crate::models::error::ModelResult;
 use serde::{Deserialize, Serialize};
@@ -363,6 +364,61 @@ impl ReviewModeration {
         let reason: String = row.get("reason")?;
         Ok(ReviewModerationState::from_graph(&state).map(|state| Self { state, reason }))
     }
+
+    /// Derives a review's moderation like [`Self::get`] and stores it on the
+    /// review edge, as one locked step per review (see
+    /// [`queries::put::derive_review_moderation`]). This is the only path that
+    /// stores a review's moderation; the details cache is written from its
+    /// result with [`DerivedReviewModeration::version`].
+    pub async fn derive_and_store(
+        reviewer_id: &str,
+        review_id: &str,
+    ) -> GraphResult<DerivedReviewModeration> {
+        let row = fetch_row_from_graph(queries::put::derive_review_moderation(
+            reviewer_id,
+            review_id,
+        ))
+        .await?
+        .ok_or_else(|| {
+            GraphError::Generic(format!(
+                "derive_review_moderation returned no row for {reviewer_id}/{review_id}"
+            ))
+        })?;
+        let moderation = Self::from_row(
+            row.get::<Option<String>>("state")?,
+            row.get::<Option<String>>("reason")?,
+        );
+        let previous = Self::from_row(
+            row.get::<Option<String>>("previous_state")?,
+            row.get::<Option<String>>("previous_reason")?,
+        );
+        let indexed: bool = row.get("indexed")?;
+        Ok(DerivedReviewModeration {
+            version: row.get("version")?,
+            changed: indexed && previous != moderation,
+            moderation,
+        })
+    }
+
+    fn from_row(state: Option<String>, reason: Option<String>) -> Option<Self> {
+        let state = ReviewModerationState::from_graph(&state?)?;
+        Some(Self {
+            state,
+            reason: reason?,
+        })
+    }
+}
+
+/// A review's moderation as one [`ReviewModeration::derive_and_store`] stored it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedReviewModeration {
+    /// Orders this derivation among every derivation of the review: a higher
+    /// version read the markers later.
+    pub version: i64,
+    pub moderation: Option<ReviewModeration>,
+    /// Whether the review edge exists and its stored moderation changed, so
+    /// the aggregates that read it must be recomputed.
+    pub changed: bool,
 }
 
 /// Whether the moderation of pubky.app's moderator keeps a listing out of the

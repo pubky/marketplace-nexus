@@ -11,7 +11,7 @@ use anyhow::Result;
 use chrono::Utc;
 use nexus_common::db::graph::Query;
 use nexus_common::db::kv::put_field_if_exists;
-use nexus_common::db::{exec_single_row, RedisOps};
+use nexus_common::db::{exec_single_row, fetch_key_from_graph, Neo4JConfig, RedisOps};
 use nexus_common::models::event::EventProcessorError;
 use nexus_common::models::marketplace::{
     ExcludedReviewer, ModeratedReview, ModeratedUser, ReputationSummary, ReviewDetails,
@@ -884,6 +884,216 @@ async fn the_one_shot_recompute_hides_reviews_of_users_moderated_before_it() -> 
     ModeratedUser::delete(&moderator_id, &tag.create_id()).await?;
     handlers::review::recompute_all_review_moderation().await?;
     assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+
+    test.del(&buyer_kp, &review_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// A derivation that read the markers before a release began and writes the
+/// details cache only after the whole release (flag, re-derive, delete) has
+/// run loses to the release: the cache keeps the released moderation.
+#[tokio_shared_rt::test(shared)]
+async fn a_derivation_in_flight_across_a_whole_release_stores_nothing() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewInFlight").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &seller_profile("Watcher:ReviewInFlight:Buyer"))
+        .await?;
+    let moderator_kp = moderator_keypair().await;
+    test.create_user(
+        &moderator_kp,
+        &seller_profile("Watcher:ReviewInFlight:Moderator"),
+    )
+    .await?;
+
+    let text = "Re-derived across a whole release.";
+    let review = buyer_review(&market, &buyer_id, 'f', 3, text);
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+
+    // Moderating the user deletes their profile, so that case comes last.
+    let cases = [
+        (
+            tag_on_user(&buyer_id, EXCLUDE_LABEL),
+            ReviewModerationState::Excluded,
+        ),
+        (
+            tag_on_review(&buyer_id, &review_id, EXCLUDE_LABEL),
+            ReviewModerationState::Excluded,
+        ),
+        (
+            tag_on_review(&buyer_id, &review_id, MODERATED_LABEL),
+            ReviewModerationState::TextHidden,
+        ),
+        (
+            tag_on_user(&buyer_id, MODERATED_LABEL),
+            ReviewModerationState::TextHidden,
+        ),
+    ];
+    for (tag, state) in cases {
+        test.put(&moderator_kp, &tag.hs_path(), &tag).await?;
+        let applied = moderation(state, &tag.label);
+        assert_moderation(&market, &buyer_id, &review_id, applied.clone(), text).await;
+
+        // Another process's derivation: it has read the markers and stored
+        // on the edge, and its details write is still to come.
+        let in_flight = ReviewModeration::derive_and_store(&buyer_id, &review_id).await?;
+        assert_eq!(in_flight.moderation, applied);
+
+        test.del(&moderator_kp, &tag.hs_path()).await?;
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        assert_counted(&market, 1, 3.0).await;
+
+        let stored = ReviewDetails::store_moderation(&buyer_id, &review_id, &in_flight).await?;
+        assert!(stored.is_none(), "{stored:?}");
+        assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+        assert_counted(&market, 1, 3.0).await;
+    }
+
+    test.del(&buyer_kp, &review_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// The one-shot recompute (an operator's migration beside the live watcher)
+/// derives a fraud ring's review, a release of the ring's exclusion runs to
+/// the end, and only then does the recompute write its result: the review is
+/// counted again, and a later recompute finds nothing to change.
+#[tokio_shared_rt::test(shared)]
+async fn a_recompute_in_flight_across_a_fraud_ring_release_stores_nothing() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:RecomputeInFlight").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(
+            &buyer_kp,
+            &seller_profile("Watcher:RecomputeInFlight:Buyer"),
+        )
+        .await?;
+    let moderator_kp = moderator_keypair().await;
+    test.create_user(
+        &moderator_kp,
+        &seller_profile("Watcher:RecomputeInFlight:Moderator"),
+    )
+    .await?;
+
+    let text = "Counted again after the ring is cleared.";
+    let review = buyer_review(&market, &buyer_id, 'c', 4, text);
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+    let ring = tag_on_user(&buyer_id, EXCLUDE_LABEL);
+    test.put(&moderator_kp, &ring.hs_path(), &ring).await?;
+    let excluded = moderation(ReviewModerationState::Excluded, EXCLUDE_LABEL);
+    assert_moderation(&market, &buyer_id, &review_id, excluded.clone(), text).await;
+    assert_counted(&market, 0, 0.0).await;
+
+    // The recompute's derivation of this review, its details write pending.
+    let in_flight = ReviewModeration::derive_and_store(&buyer_id, &review_id).await?;
+    assert_eq!(in_flight.moderation, excluded);
+
+    test.del(&moderator_kp, &ring.hs_path()).await?;
+    let stored = ReviewDetails::store_moderation(&buyer_id, &review_id, &in_flight).await?;
+    assert!(stored.is_none(), "{stored:?}");
+    assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+    assert_counted(&market, 1, 4.0).await;
+
+    assert_eq!(
+        handlers::review::refresh_reviewer_moderation(&buyer_id).await?,
+        0
+    );
+    assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+
+    test.del(&buyer_kp, &review_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+/// A derivation write-locks the review's moderation clock before it reads the
+/// markers. While another transaction holds the clock, the derivation waits;
+/// a marker flagged as being released during that wait is already left out
+/// when the derivation reads.
+#[tokio_shared_rt::test(shared)]
+async fn a_derivation_reads_the_markers_only_once_it_holds_the_review_clock() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewClock").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &seller_profile("Watcher:ReviewClock:Buyer"))
+        .await?;
+    let moderator_kp = moderator_keypair().await;
+    test.create_user(
+        &moderator_kp,
+        &seller_profile("Watcher:ReviewClock:Moderator"),
+    )
+    .await?;
+    let moderator_id = default_moderation_tests().id;
+
+    let text = "Derived while the clock is held.";
+    let review = buyer_review(&market, &buyer_id, 'e', 2, text);
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+    let tag = tag_on_review(&buyer_id, &review_id, MODERATED_LABEL);
+    test.put(&moderator_kp, &tag.hs_path(), &tag).await?;
+
+    // An earlier derivation of the review, still uncommitted on its own
+    // connection: it holds the clock.
+    let config = Neo4JConfig::default();
+    let graph = neo4rs::Graph::new(config.uri.as_str(), &config.user, &config.password).await?;
+    let mut txn = graph.start_txn().await?;
+    txn.run(
+        neo4rs::query(
+            "MATCH (clock:ReviewModerationClock {reviewer_id: $reviewer_id, review_id: $review_id})
+             SET clock.version = clock.version + 1",
+        )
+        .param("reviewer_id", buyer_id.as_str())
+        .param("review_id", review_id.as_str()),
+    )
+    .await?;
+
+    let (reviewer, id) = (buyer_id.clone(), review_id.clone());
+    let derivation =
+        tokio::spawn(async move { ReviewModeration::derive_and_store(&reviewer, &id).await });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let blocked = fetch_key_from_graph::<i64>(
+            Query::new(
+                "test_blocked_derivation",
+                "SHOW TRANSACTIONS YIELD currentQuery, parameters, status
+                 WHERE currentQuery CONTAINS 'MERGE (clock:ReviewModerationClock'
+                   AND parameters.review_id = $review_id
+                   AND status STARTS WITH 'Blocked'
+                 RETURN count(*) AS n",
+            )
+            .param("review_id", review_id.as_str()),
+            "n",
+        )
+        .await?
+        .unwrap_or_default();
+        if blocked >= 1 {
+            break;
+        }
+        assert!(
+            !derivation.is_finished(),
+            "the derivation did not wait for the clock"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the derivation never blocked on the clock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    ModeratedReview::mark_releasing(&moderator_id, &tag.create_id()).await?;
+    txn.commit().await?;
+    let derived = derivation.await??;
+    assert_eq!(derived.moderation, None);
+    assert!(derived.changed);
+
+    test.del(&moderator_kp, &tag.hs_path()).await?;
+    assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+    assert_counted(&market, 1, 2.0).await;
 
     test.del(&buyer_kp, &review_path).await?;
     test.cleanup_user(&buyer_kp).await?;

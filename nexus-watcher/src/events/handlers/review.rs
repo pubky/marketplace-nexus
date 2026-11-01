@@ -65,6 +65,8 @@ pub async fn index_review(
     details.superseded = prior.as_ref().is_some_and(|prior| prior.superseded);
     // Moderation lives in markers keyed by the moderator's tag, so a tag
     // replayed before the review, and every edit, keep the review moderated.
+    // This read only keeps the text hidden from the first write on; the
+    // locked derivation after the index write below decides what is stored.
     details.moderation = ReviewModeration::get(&user_id, &review_id).await?;
 
     // SAVE TO GRAPH: requires both the reviewer and the subject users
@@ -79,7 +81,8 @@ pub async fn index_review(
     // SAVE TO INDEX: an edit refreshes the details JSON only; the review
     // keeps its original position in the review sorted sets
     details.put_to_index(existed).await?;
-    // A moderator tag handled while this review was being written.
+    // The locked derivation, which also covers a moderator tag handled while
+    // this review was being written.
     if let Some(refreshed) = ReviewDetails::refresh_moderation(&user_id, &review_id).await? {
         details = refreshed;
     }
@@ -182,8 +185,11 @@ pub async fn exclude_reviewer(
 /// derivation of a review's moderation skips, then the affected reviews are
 /// re-derived, then the markers are removed. A re-derivation running
 /// alongside (the one-shot recompute next to a live watcher) therefore never
-/// writes the released moderation back, and a failure leaves the markers in
-/// place so the retried tag deletion starts over.
+/// writes the released moderation back: one that read the markers before the
+/// flag stores on the edge before the release's re-derivation does, and its
+/// details write is rejected as older (see
+/// [`ReviewDetails::store_moderation`]). A failure leaves the markers in place
+/// so the retried tag deletion starts over.
 pub async fn release_moderation(
     moderator_id: &PubkyId,
     tag_id: &str,
