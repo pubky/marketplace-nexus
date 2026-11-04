@@ -165,8 +165,6 @@ impl VariantProcessor for ImageProcessor {
         options: &ImageOptions,
     ) -> Result<String, MediaProcessorError> {
         let deadline = Instant::now() + IMAGE_CONVERSION_TIMEOUT;
-        let (input, input_format) = Self::open_input(origin_file_path).await?;
-
         let slot = timeout_at(deadline, CONVERSION_SLOTS.clone().acquire_owned())
             .await
             .map_err(|_| MediaProcessorError::TimedOut)?
@@ -176,6 +174,8 @@ impl VariantProcessor for ImageProcessor {
         if fs::metadata(output_file_path).await.is_ok() {
             return Ok(String::new());
         }
+        // Opened only once a slot is held, so waiting requests hold no file.
+        let (input, input_format) = Self::open_input(origin_file_path).await?;
 
         let conversion = Conversion {
             input,
@@ -260,25 +260,18 @@ impl Conversion {
             .prefix("nexus-convert-")
             .tempdir()
             .map_err(MediaProcessorError::command_failed)?;
-        let temp_output = format!(
+        let temp_output = TempOutput(format!(
             "{}.tmp-{}-{}",
             self.output_file_path,
             std::process::id(),
             TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
+        ));
 
-        let result = self.convert(scratch.path(), &temp_output).await;
-        let result = match result {
-            Ok(()) => fs::rename(&temp_output, &self.output_file_path)
-                .await
-                .map_err(MediaProcessorError::command_failed),
-            Err(e) => Err(e),
-        };
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_output).await;
-        }
-        drop(scratch);
-        result.map(|_| String::new())
+        self.convert(scratch.path(), &temp_output.0).await?;
+        fs::rename(&temp_output.0, &self.output_file_path)
+            .await
+            .map_err(MediaProcessorError::command_failed)?;
+        Ok(String::new())
     }
 
     async fn convert(
@@ -324,19 +317,31 @@ impl Conversion {
         })
         .await;
 
-        match finished {
-            Ok(Ok((status, _))) if status.success() => Ok(()),
-            Ok(Ok((_, message))) => Err(MediaProcessorError::command_failed(format!(
-                "ImageMagick command failed: {}",
-                String::from_utf8_lossy(&message)
-            ))),
-            Ok(Err(e)) => Err(MediaProcessorError::command_failed(e)),
-            Err(_) => {
-                // Kill and reap before the scratch directory is removed.
-                let _ = child.kill().await;
-                Err(MediaProcessorError::TimedOut)
+        let result = match finished {
+            Ok(Ok((status, _))) if status.success() => return Ok(()),
+            Ok(Ok((_, message))) => {
+                return Err(MediaProcessorError::command_failed(format!(
+                    "ImageMagick command failed: {}",
+                    String::from_utf8_lossy(&message)
+                )))
             }
-        }
+            Ok(Err(e)) => Err(MediaProcessorError::command_failed(e)),
+            Err(_) => Err(MediaProcessorError::TimedOut),
+        };
+        // The process may still be running: kill it and wait until it is gone, so nothing writes
+        // to the scratch directory or the temporary output once they are removed.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        result
+    }
+}
+
+/// A temporary variant file, removed when dropped unless it was renamed into place.
+struct TempOutput(String);
+
+impl Drop for TempOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -387,6 +392,10 @@ mod tests {
         png.extend(png_chunk(b"IEND", &[]));
         png
     }
+
+    /// Held by every test that converts through `ImageProcessor::process`, so tests that depend
+    /// on when a conversion runs do not compete with other tests for the shared slots.
+    static SLOT_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Peak resident memory of any child process this test binary has waited for. Every other
     /// test here keeps ImageMagick well under the bomb test's 512 MiB bound.
@@ -445,6 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn payloads_that_are_not_allowlisted_rasters_never_reach_a_decoder() {
+        let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let canary = dir.path().join("secret");
         std::fs::write(&canary, "CANARY-1f0c8e").unwrap();
@@ -504,6 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn decompression_bombs_fail_fast_without_a_variant() {
+        let _serial = SLOT_TESTS.lock().await;
         let bombs = [
             ("compressed-40k", png_decompression_bomb(40_000)),
             ("header-60k", PNG_HEADER_BOMB_60K.to_vec()),
@@ -536,6 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_original_is_refused_before_decoding() {
+        let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let source = dir.path().join("main");
         let file = std::fs::File::create(&source).unwrap();
@@ -555,6 +567,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowlisted_rasters_become_webp_variants() {
+        let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let sources = [
             make_source(
@@ -602,6 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_requests_for_one_variant_all_succeed_with_one_complete_file() {
+        let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let source = make_source(dir.path(), "png", &["-size", "1600x1200", "plasma:"]).await;
         let output = dir.path().join("feed");
@@ -628,6 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_dropped_request_still_finishes_its_conversion_cleanly() {
+        let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
         let source = make_source(
             dir.path(),
@@ -647,16 +662,12 @@ mod tests {
             "the conversion finished before the request was dropped"
         );
 
-        ImageProcessor::process(path_str(&source), path_str(&output), &small_options())
-            .await
-            .expect("conversion after a dropped request failed");
-        // Every conversion releases its slot only after cleaning up.
+        // The conversion keeps its slot until it has finished and cleaned up.
         let _all_slots = CONVERSION_SLOTS
             .acquire_many(MAX_CONCURRENT_CONVERSIONS as u32)
             .await
             .unwrap();
-
-        let variant = std::fs::read(&output).unwrap();
+        let variant = std::fs::read(&output).expect("the dropped request's variant is missing");
         assert_eq!(&variant[8..12], b"WEBP");
         assert_eq!(
             entries(dir.path()),

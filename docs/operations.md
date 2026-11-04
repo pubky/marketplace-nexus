@@ -114,8 +114,8 @@ attestor publishes it again.
 
 `small` and `feed` image variants are made only from JPEG, PNG, GIF and WebP
 originals of at most 32 MiB, identified by their leading bytes and decoded with
-that format's decoder. Other image types (SVG among them) are served as stored
-(`main` only, and the avatar route serves `main` for them). A conversion has
+that format's decoder. Other image types (SVG among them) have only `main`, and
+the avatar route answers 404 for them. A conversion has
 30 seconds, at most two run at once, and each runs with ImageMagick limits of
 256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per side and 256 frames.
 File blobs larger than the specs' blob limit (100 MiB) are refused while they
