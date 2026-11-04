@@ -5,7 +5,7 @@ use crate::routes::AppState;
 use crate::{Error, Result};
 use axum::extract::{Request, State};
 use axum::{extract::Path, response::Response};
-use nexus_common::media::FileVariant;
+use nexus_common::media::{FileVariant, VariantController};
 use nexus_common::models::file::Blob;
 use nexus_common::models::{file::FileDetails, traits::Collection, user::UserDetails};
 use tower_http::services::fs::ServeFileSystemResponseBody;
@@ -62,7 +62,13 @@ pub async fn user_avatar_handler(
         return Err(Error::FileNotFound {});
     };
 
-    // 5. ensure small variant is created
+    // 5. ensure small variant is created; only raster images have one
+    if !VariantController::validate_variant_for_content_type(
+        &file_details.content_type,
+        &FileVariant::Small,
+    ) {
+        return Err(Error::FileNotFound {});
+    }
     let small_variant_content_type =
         Blob::get_by_id(&file_details, &FileVariant::Small, file_path.clone())
             .await

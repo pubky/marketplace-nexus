@@ -110,6 +110,27 @@ indexes them skips their events, so the release must be live before the
 attestor starts publishing; a record published earlier is indexed only when the
 attestor publishes it again.
 
+## Image variants and the runtime image
+
+`small` and `feed` image variants are made only from JPEG, PNG, GIF and WebP
+originals of at most 32 MiB, identified by their leading bytes and decoded with
+that format's decoder. Other image types (SVG among them) have only `main`, and
+the avatar route answers 404 for them. A conversion has
+30 seconds, at most two run at once, and each runs with ImageMagick limits of
+256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per side and 256 frames.
+File blobs larger than the specs' blob limit (100 MiB) are refused while they
+download.
+
+The runtime image (`Dockerfile`) installs only the JPEG and WebP coder packages
+on top of the base ImageMagick, replaces the system ImageMagick policy with
+`docker/imagemagick/policy.xml` (the coder allowlist, no delegates, the same
+limits) and runs `nexusd` as the unprivileged user `nexus`, UID and GID 10001.
+A deployment must therefore make its config dir (`config.toml`, `secret`)
+readable and its `files_path` writable by UID 10001; files that are root-owned
+with mode 600, or a volume created by an earlier root-run image, need their
+ownership changed once. Check the policy in a running container with
+`convert -list policy`.
+
 ## Running the backfill migrations
 
 One-shot migrations (see the runbook in `README.md`):

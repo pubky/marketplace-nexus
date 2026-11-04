@@ -7,14 +7,17 @@ use crate::{
 };
 use pubky_app_specs::PubkyAppBlob;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{
-    fs::{self, File},
+    fs::{self, OpenOptions},
     io::AsyncWriteExt,
 };
 
 use super::FileDetails;
 
 pub struct Blob;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Blob {
     pub async fn put_to_static(
@@ -29,9 +32,28 @@ impl Blob {
             fs::create_dir_all(&files_path).await?;
         };
 
-        let file_path = files_path.join(name);
-        let mut static_file = File::create(file_path).await?;
-        static_file.write_all(&blob.0).await?;
+        // Written aside and renamed into place, so a concurrent variant build never reads a partial file.
+        let file_path = files_path.join(&name);
+        let temp_path = files_path.join(format!(
+            "{name}.tmp-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let written = async {
+            let mut static_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .await?;
+            static_file.write_all(&blob.0).await?;
+            static_file.flush().await?;
+            fs::rename(&temp_path, &file_path).await
+        }
+        .await;
+        if written.is_err() {
+            let _ = fs::remove_file(&temp_path).await;
+        }
+        written?;
 
         Ok(())
     }
@@ -85,7 +107,7 @@ impl Blob {
 mod tests {
     use super::*;
     use pubky_app_specs::PubkyAppBlob;
-    use tokio::io::AsyncReadExt;
+    use tokio::{fs::File, io::AsyncReadExt};
 
     #[tokio_shared_rt::test(shared)]
     async fn test_put_to_static_creates_new_file() {
@@ -131,5 +153,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, b"second write");
+
+        let mut names = Vec::new();
+        let mut dir = fs::read_dir(&files_path).await.unwrap();
+        while let Some(entry) = dir.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["main".to_string()]);
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn concurrent_writes_of_one_file_leave_one_complete_version() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let files_path = tmp_dir.path().join("user1").join("file1");
+        let versions: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 256 * 1024]).collect();
+
+        let writes = versions.iter().cloned().map(|bytes| {
+            let files_path = files_path.clone();
+            tokio::spawn(async move {
+                Blob::put_to_static("main".to_string(), files_path, &PubkyAppBlob::new(bytes)).await
+            })
+        });
+        for write in futures::future::join_all(writes).await {
+            write.unwrap().expect("put_to_static failed");
+        }
+
+        let content = fs::read(files_path.join("main")).await.unwrap();
+        assert!(versions.contains(&content), "main is a mix of versions");
+        let mut names = Vec::new();
+        let mut dir = fs::read_dir(&files_path).await.unwrap();
+        while let Some(entry) = dir.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["main".to_string()]);
     }
 }

@@ -9,10 +9,14 @@ use nexus_common::models::{
     file::{FileDetails, FileMeta},
     traits::Collection,
 };
-use pubky_app_specs::{PubkyAppFile, PubkyAppObject, PubkyId};
+use pubky_app_specs::{PubkyAppFile, PubkyAppObject, PubkyId, VALIDATION_LIMITS};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::fs::remove_dir_all;
 use tracing::debug;
+
+/// Budget for fetching one file's blob, from request to the last body byte.
+const BLOB_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub async fn sync_put(
     file: PubkyAppFile,
@@ -58,19 +62,52 @@ async fn ingest(
     files_path: PathBuf,
 ) -> Result<Option<FileMeta>, EventProcessorError> {
     let pubky = PubkyConnector::get()?;
-    let response = match pubky.public_storage().get(&pubkyapp_file.src).await {
-        Ok(response) => response,
-        Err(e) if is_homeserver_not_found(&e) => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let fetch = async {
+        let mut response = match pubky.public_storage().get(&pubkyapp_file.src).await {
+            Ok(response) => response,
+            Err(e) if is_homeserver_not_found(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+
+        // Refuse an oversized blob as soon as that is known, instead of buffering it first.
+        let max_bytes = VALIDATION_LIMITS.max_blob_size_bytes;
+        let too_large = || {
+            EventProcessorError::InvalidEventLine(format!(
+                "File blob {} exceeds the {max_bytes} byte limit",
+                pubkyapp_file.src
+            ))
+        };
+        let declared = response.content_length();
+        if declared.is_some_and(|len| len > max_bytes as u64) {
+            return Err(too_large());
+        }
+        let mut body = Vec::with_capacity(declared.map_or(0, |len| len as usize));
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| EventProcessorError::client_error(e.to_string()))?
+        {
+            if body.len() + chunk.len() > max_bytes {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Some(body))
+    };
+    let Some(blob) = tokio::time::timeout(BLOB_FETCH_TIMEOUT, fetch)
+        .await
+        .map_err(|_| {
+            EventProcessorError::client_error(format!(
+                "Fetching file blob {} timed out",
+                pubkyapp_file.src
+            ))
+        })??
+    else {
+        return Ok(None);
     };
 
     let path = Path::new(&user_id.to_string()).join(file_id);
     let full_path = files_path.join(path.clone());
-
-    let blob = response
-        .bytes()
-        .await
-        .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
     let pubky_app_object = PubkyAppObject::from_uri(&pubkyapp_file.src, &blob)
         .map_err(EventProcessorError::generic)?;
 
