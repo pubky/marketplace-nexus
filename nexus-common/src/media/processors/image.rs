@@ -1,14 +1,21 @@
 use std::{
+    io::SeekFrom,
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
-        LazyLock,
+        Arc, LazyLock,
     },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use tokio::{fs, io::AsyncReadExt, process::Command, sync::Semaphore};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt},
+    process::Command,
+    sync::Semaphore,
+    time::{timeout_at, Instant},
+};
 
 use crate::{
     media::{processors::MediaProcessorError, FileVariant},
@@ -45,8 +52,8 @@ const IMAGEMAGICK_LIMITS: &[(&str, &str)] = &[
     ("thread", "2"),
 ];
 
-static CONVERSION_SLOTS: LazyLock<Semaphore> =
-    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_CONVERSIONS));
+static CONVERSION_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CONVERSIONS)));
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -157,9 +164,10 @@ impl VariantProcessor for ImageProcessor {
         output_file_path: &str,
         options: &ImageOptions,
     ) -> Result<String, MediaProcessorError> {
-        let input_format = Self::input_format(origin_file_path).await?;
+        let deadline = Instant::now() + IMAGE_CONVERSION_TIMEOUT;
+        let (input, input_format) = Self::open_input(origin_file_path).await?;
 
-        let _slot = tokio::time::timeout(IMAGE_CONVERSION_TIMEOUT, CONVERSION_SLOTS.acquire())
+        let slot = timeout_at(deadline, CONVERSION_SLOTS.clone().acquire_owned())
             .await
             .map_err(|_| MediaProcessorError::TimedOut)?
             .map_err(MediaProcessorError::command_failed)?;
@@ -169,31 +177,33 @@ impl VariantProcessor for ImageProcessor {
             return Ok(String::new());
         }
 
-        // Written next to the variant and renamed into place, so a reader never sees a partial file.
-        let temp_file_path = format!(
-            "{output_file_path}.tmp-{}-{}",
-            std::process::id(),
-            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-
-        let result = Self::convert(input_format, origin_file_path, &temp_file_path, options).await;
-        let result = match result {
-            Ok(stdout) => fs::rename(&temp_file_path, output_file_path)
-                .await
-                .map(|_| stdout)
-                .map_err(MediaProcessorError::command_failed),
-            Err(e) => Err(e),
+        let conversion = Conversion {
+            input,
+            input_format,
+            output_file_path: output_file_path.to_string(),
+            width: options.width.clone(),
+            format: options.format.clone(),
+            deadline,
         };
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_file_path).await;
-        }
-        result
+        // Runs to completion even when the request that started it goes away, so the child is
+        // always reaped and its files removed, and the slot is held for as long as it runs.
+        tokio::spawn(async move {
+            let result = conversion.run().await;
+            drop(slot);
+            result
+        })
+        .await
+        .map_err(MediaProcessorError::command_failed)?
     }
 }
 
 impl ImageProcessor {
-    /// Checks the stored original's size and identifies its format from its leading bytes.
-    async fn input_format(file_path: &str) -> Result<ImageInputFormat, MediaProcessorError> {
+    /// Opens the stored original, checks its size and identifies its format from its leading
+    /// bytes. The returned handle, rewound to the start, is what gets decoded: a re-ingest that
+    /// replaces the path afterwards does not change these bytes.
+    async fn open_input(
+        file_path: &str,
+    ) -> Result<(std::fs::File, ImageInputFormat), MediaProcessorError> {
         let mut file = fs::File::open(file_path)
             .await
             .map_err(MediaProcessorError::command_failed)?;
@@ -221,41 +231,111 @@ impl ImageProcessor {
             }
             read += n;
         }
+        let format = ImageInputFormat::sniff(&head[..read])
+            .ok_or(MediaProcessorError::UnsupportedInputFormat)?;
 
-        ImageInputFormat::sniff(&head[..read]).ok_or(MediaProcessorError::UnsupportedInputFormat)
+        file.seek(SeekFrom::Start(0))
+            .await
+            .map_err(MediaProcessorError::command_failed)?;
+        Ok((file.into_std().await, format))
+    }
+}
+
+/// One ImageMagick run: decodes `input` with its sniffed decoder and writes the variant next to
+/// `output_file_path`, renaming it into place on success.
+struct Conversion {
+    input: std::fs::File,
+    input_format: ImageInputFormat,
+    output_file_path: String,
+    width: String,
+    format: String,
+    deadline: Instant,
+}
+
+impl Conversion {
+    async fn run(self) -> Result<String, MediaProcessorError> {
+        // ImageMagick's own temporary files (spilled input, disk pixel cache) go here and are
+        // removed with it, including after the process is killed.
+        let scratch = tempfile::Builder::new()
+            .prefix("nexus-convert-")
+            .tempdir()
+            .map_err(MediaProcessorError::command_failed)?;
+        let temp_output = format!(
+            "{}.tmp-{}-{}",
+            self.output_file_path,
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+
+        let result = self.convert(scratch.path(), &temp_output).await;
+        let result = match result {
+            Ok(()) => fs::rename(&temp_output, &self.output_file_path)
+                .await
+                .map_err(MediaProcessorError::command_failed),
+            Err(e) => Err(e),
+        };
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_output).await;
+        }
+        drop(scratch);
+        result.map(|_| String::new())
     }
 
     async fn convert(
-        input_format: ImageInputFormat,
-        origin_file_path: &str,
-        output_file_path: &str,
-        options: &ImageOptions,
-    ) -> Result<String, MediaProcessorError> {
+        &self,
+        scratch: &std::path::Path,
+        temp_output: &str,
+    ) -> Result<(), MediaProcessorError> {
+        let input = self
+            .input
+            .try_clone()
+            .map_err(MediaProcessorError::command_failed)?;
+
         let mut command = Command::new("convert");
         for (resource, value) in IMAGEMAGICK_LIMITS {
             command.arg("-limit").arg(resource).arg(value);
         }
         command
-            .arg(format!("{}:{origin_file_path}", input_format.coder()))
+            .arg(format!("{}:-", self.input_format.coder()))
             .arg("-resize")
-            .arg(format!("{}x", options.width))
+            .arg(format!("{}x", self.width))
             .arg("-auto-orient") // https://github.com/ImageMagick/ImageMagick/issues/6396
-            .arg(format!("{}:{output_file_path}", options.format))
-            .stdin(Stdio::null())
+            .arg(format!("{}:{temp_output}", self.format))
+            .env("MAGICK_TEMPORARY_PATH", scratch)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let child_output = tokio::time::timeout(IMAGE_CONVERSION_TIMEOUT, command.output())
-            .await
-            .map_err(|_| MediaProcessorError::TimedOut)?
+        let mut child = command
+            .spawn()
             .map_err(MediaProcessorError::command_failed)?;
+        let mut stderr = child.stderr.take();
 
-        if child_output.status.success() {
-            Ok(String::from_utf8_lossy(&child_output.stdout).to_string())
-        } else {
-            Err(MediaProcessorError::command_failed(format!(
+        let finished = timeout_at(self.deadline, async {
+            let mut message = Vec::new();
+            let read_stderr = async {
+                if let Some(stderr) = stderr.as_mut() {
+                    let _ = stderr.read_to_end(&mut message).await;
+                }
+            };
+            let (status, ()) = tokio::join!(child.wait(), read_stderr);
+            status.map(|status| (status, message))
+        })
+        .await;
+
+        match finished {
+            Ok(Ok((status, _))) if status.success() => Ok(()),
+            Ok(Ok((_, message))) => Err(MediaProcessorError::command_failed(format!(
                 "ImageMagick command failed: {}",
-                String::from_utf8_lossy(&child_output.stderr)
-            )))
+                String::from_utf8_lossy(&message)
+            ))),
+            Ok(Err(e)) => Err(MediaProcessorError::command_failed(e)),
+            Err(_) => {
+                // Kill and reap before the scratch directory is removed.
+                let _ = child.kill().await;
+                Err(MediaProcessorError::TimedOut)
+            }
         }
     }
 }
@@ -308,7 +388,8 @@ mod tests {
         png
     }
 
-    /// Peak resident memory of any child process this test binary has waited for.
+    /// Peak resident memory of any child process this test binary has waited for. Every other
+    /// test here keeps ImageMagick well under the bomb test's 512 MiB bound.
     fn peak_child_rss_bytes() -> u64 {
         let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
         // SAFETY: getrusage only writes into the provided, properly sized rusage struct.
@@ -511,6 +592,8 @@ mod tests {
             let variant = std::fs::read(&output).unwrap();
             assert_eq!(&variant[0..4], b"RIFF", "{source:?}");
             assert_eq!(&variant[8..12], b"WEBP", "{source:?}");
+            let animated = variant.windows(4).any(|chunk| chunk == b"ANIM");
+            assert_eq!(animated, source.ends_with("gif"), "{source:?} animation");
         }
         assert!(entries(dir.path())
             .iter()
@@ -541,6 +624,75 @@ mod tests {
             entries(dir.path()),
             vec!["feed".to_string(), "png".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_still_finishes_its_conversion_cleanly() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(
+            dir.path(),
+            "png",
+            &["-size", "4000x3000", "gradient:red-blue"],
+        )
+        .await;
+        let output = dir.path().join("feed");
+
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            ImageProcessor::process(path_str(&source), path_str(&output), &small_options()),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the conversion finished before the request was dropped"
+        );
+
+        ImageProcessor::process(path_str(&source), path_str(&output), &small_options())
+            .await
+            .expect("conversion after a dropped request failed");
+        // Every conversion releases its slot only after cleaning up.
+        let _all_slots = CONVERSION_SLOTS
+            .acquire_many(MAX_CONCURRENT_CONVERSIONS as u32)
+            .await
+            .unwrap();
+
+        let variant = std::fs::read(&output).unwrap();
+        assert_eq!(&variant[8..12], b"WEBP");
+        assert_eq!(
+            entries(dir.path()),
+            vec!["feed".to_string(), "png".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conversion_past_its_deadline_is_killed_and_cleaned_up() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(
+            dir.path(),
+            "png",
+            &["-size", "4000x3000", "gradient:red-blue"],
+        )
+        .await;
+        let output = dir.path().join("feed");
+        let (input, input_format) = ImageProcessor::open_input(path_str(&source)).await.unwrap();
+
+        let conversion = Conversion {
+            input,
+            input_format,
+            output_file_path: path_str(&output).to_string(),
+            width: FEED_IMAGE_WIDTH.to_string(),
+            format: IMAGE_FORMAT.to_string(),
+            deadline: tokio::time::Instant::now() + Duration::from_millis(50),
+        };
+        let started = Instant::now();
+        let result = conversion.run().await;
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::TimedOut)),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(entries(dir.path()), vec!["png".to_string()]);
     }
 
     #[test]

@@ -25,6 +25,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tempfile = { workspace = true }
 toml = "1.0.7"
 tracing = { workspace = true }
 tracing-log = "0.2"
@@ -34,6 +35,5 @@ utoipa = "5.4.0"
 [dev-dependencies]
 flate2 = "1.1"
 libc = "0.2"
-tempfile = { workspace = true }
 tokio-shared-rt = { workspace = true }
 tracing-test = { workspace = true }
