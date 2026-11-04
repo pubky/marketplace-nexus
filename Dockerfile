@@ -47,21 +47,28 @@ FROM alpine:3.22
 
 ARG TARGETARCH
 
-# Install runtime dependencies
+# Install runtime dependencies. Image variants are made from JPEG, PNG, GIF and WebP only
+# (PNG and GIF ship with the base package), so no other ImageMagick coder package is installed.
 RUN apk add --no-cache ca-certificates \
     imagemagick \
     imagemagick-webp \
-    imagemagick-heic \
-    imagemagick-svg \
-    imagemagick-jpeg \
-    imagemagick-tiff \
-    imagemagick-raw
+    imagemagick-jpeg
+
+# Restrictive ImageMagick policy: coder allowlist, no delegates, resource limits.
+COPY docker/imagemagick/policy.xml /etc/ImageMagick-7/policy.xml
+
+# Unprivileged runtime user. The config dir must be readable and the files_path writable by it
+# (UID/GID 10001); the default config dir is ~/.pubky-nexus under its home.
+RUN addgroup -S -g 10001 nexus \
+    && adduser -S -D -u 10001 -G nexus -h /home/nexus nexus
 
 # Copy the compiled binaries from the builder stage
 COPY --from=builder /usr/src/app/target/release/nexusd /usr/local/bin/nexusd
 
 # Set the working directory
 WORKDIR /usr/local/bin
+
+USER 10001:10001
 
 # Expose the port the service listens on
 EXPOSE 8080
