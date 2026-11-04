@@ -28,6 +28,12 @@ pub enum MediaProcessorError {
     UnsupportedFileVariant,
     #[error("InvalidFilePath: {0}")]
     InvalidFilePath(String),
+    #[error("InputTooLarge: {size} bytes exceeds the {max} byte limit")]
+    InputTooLarge { size: u64, max: u64 },
+    #[error("UnsupportedInputFormat: the file is not a JPEG, PNG, GIF or WebP image")]
+    UnsupportedInputFormat,
+    #[error("TimedOut: media processing did not finish in time")]
+    TimedOut,
 }
 
 impl MediaProcessorError {

@@ -29,9 +29,20 @@ impl Blob {
             fs::create_dir_all(&files_path).await?;
         };
 
-        let file_path = files_path.join(name);
-        let mut static_file = File::create(file_path).await?;
-        static_file.write_all(&blob.0).await?;
+        // Written aside and renamed into place, so a concurrent variant build never reads a partial file.
+        let file_path = files_path.join(&name);
+        let temp_path = files_path.join(format!("{name}.tmp-{}", std::process::id()));
+        let written = async {
+            let mut static_file = File::create(&temp_path).await?;
+            static_file.write_all(&blob.0).await?;
+            static_file.flush().await?;
+            fs::rename(&temp_path, &file_path).await
+        }
+        .await;
+        if written.is_err() {
+            let _ = fs::remove_file(&temp_path).await;
+        }
+        written?;
 
         Ok(())
     }
@@ -131,5 +142,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, b"second write");
+
+        let mut names = Vec::new();
+        let mut dir = fs::read_dir(&files_path).await.unwrap();
+        while let Some(entry) = dir.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        assert_eq!(names, vec!["main".to_string()]);
     }
 }

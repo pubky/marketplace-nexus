@@ -5,7 +5,7 @@ use crate::routes::AppState;
 use crate::{Error, Result};
 use axum::extract::{Request, State};
 use axum::{extract::Path, response::Response};
-use nexus_common::media::FileVariant;
+use nexus_common::media::{FileVariant, VariantController};
 use nexus_common::models::file::Blob;
 use nexus_common::models::{file::FileDetails, traits::Collection, user::UserDetails};
 use tower_http::services::fs::ServeFileSystemResponseBody;
@@ -62,31 +62,34 @@ pub async fn user_avatar_handler(
         return Err(Error::FileNotFound {});
     };
 
-    // 5. ensure small variant is created
-    let small_variant_content_type =
-        Blob::get_by_id(&file_details, &FileVariant::Small, file_path.clone())
-            .await
-            .inspect_err(|_| {
-                error!(
-            "Error while processing small variant for user: {user_id} avatar with file: {file_id}"
-        )
-            })?;
+    // 5. ensure small variant is created; images that get no resized variants are served as stored
+    let variant = if VariantController::validate_variant_for_content_type(
+        &file_details.content_type,
+        &FileVariant::Small,
+    ) {
+        FileVariant::Small
+    } else {
+        FileVariant::Main
+    };
+    let variant_content_type = Blob::get_by_id(&file_details, &variant, file_path.clone())
+        .await
+        .inspect_err(|_| {
+            error!("Error while processing {variant} variant for user: {user_id} avatar with file: {file_id}")
+        })?;
 
     // serve the file using ServeDir
     // Create a new request with a modified path to serve the file using ServeDir
-    // 6. Build the url using small variant
+    // 6. Build the url using the chosen variant
     let file_uri_path = format!(
         "/{}/{}/{}", // /{owner_id}/{file_id}/{variant}
-        user_id,
-        file_details.id,
-        FileVariant::Small,
+        user_id, file_details.id, variant,
     );
 
     // 7. Serve the file. Then remove/replace any default Cache-Control header.
     let mut response = PubkyServeDir::try_call(
         request,
         file_uri_path,
-        small_variant_content_type,
+        variant_content_type,
         file_path.clone(),
     )
     .await?;
