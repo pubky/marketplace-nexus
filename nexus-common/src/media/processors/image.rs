@@ -1026,6 +1026,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_original_replaced_during_a_conversion_discards_its_variant() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(
+            dir.path(),
+            "png",
+            &["-size", "4000x3000", "gradient:red-blue"],
+        )
+        .await;
+        let output = dir.path().join("feed");
+        let conversion = open_conversion(&source, &output, IMAGE_CONVERSION_TIMEOUT).await;
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        let handle = conversion.spawn(slot);
+        // The test runtime has one thread, so the task only starts once the test yields.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !handle.is_finished(),
+            "the conversion finished before the original was replaced"
+        );
+        replace_by_rename(&source);
+        let result = handle.await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::Busy)),
+            "{result:?}"
+        );
+        assert_eq!(entries(dir.path()), vec!["png".to_string()]);
+    }
+
+    /// The watcher's delete removes the whole file directory, so neither the variant nor its
+    /// marker has anywhere to go.
+    #[tokio::test]
+    async fn a_removed_file_directory_during_a_conversion_answers_busy() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_dir = dir.path().join("file");
+        std::fs::create_dir(&file_dir).unwrap();
+        let source = make_source(&file_dir, "png", &["-size", "64x48", "xc:red"]).await;
+        let output = file_dir.join("small");
+        let conversion = open_conversion(&source, &output, IMAGE_CONVERSION_TIMEOUT).await;
+        std::fs::remove_dir_all(&file_dir).unwrap();
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        let result = conversion.spawn(slot).await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::Busy)),
+            "{result:?}"
+        );
+        assert!(!file_dir.exists(), "the file directory came back");
+        assert!(entries(dir.path()).is_empty());
+    }
+
+    /// The conversion itself succeeds and only moving its output into place fails, which says
+    /// nothing about the file.
+    #[tokio::test]
+    async fn a_host_failure_in_a_conversion_leaves_no_marker() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        let original = std::fs::read(&source).unwrap();
+        let output = dir.path().join("small");
+        std::fs::create_dir(&output).unwrap();
+        std::fs::write(output.join("content"), b"kept").unwrap();
+        let conversion = open_conversion(&source, &output, IMAGE_CONVERSION_TIMEOUT).await;
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        let result = conversion.spawn(slot).await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::CommandFailed { .. })),
+            "{result:?}"
+        );
+        // Listing the whole directory also rules out `small.failed` and `.tmp-` leftovers.
+        assert_eq!(
+            entries(dir.path()),
+            vec!["png".to_string(), "small".to_string()]
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(entries(&output), vec!["content".to_string()]);
+        assert_eq!(std::fs::read(output.join("content")).unwrap(), b"kept");
+    }
+
     #[test]
     fn only_a_killed_process_is_not_the_files_failure() {
         let killed = failure_from_exit(ExitStatus::from_raw(9), b"");
