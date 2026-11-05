@@ -48,8 +48,10 @@ and every query string the API receives.
   API origin. A type that is missing, empty, repeated or malformed is replaced by
   `application/octet-stream` and treated the same way.
 - Restoring a released seller's listings pages their listings directory with a
-  budget of 10,000 listings and 5 minutes, and refuses a homeserver whose page
-  does not advance its cursor.
+  budget of 10,000 listings, 5 minutes and about 2 MiB per page, refuses a
+  homeserver whose page does not advance its cursor or exceeds the page size, and
+  runs the whole restore (profile, shop, directory, every listing) under a
+  30-minute deadline.
 - 500 responses carry a generic message; the cause is in the server log.
 - Debug-level startup logs print the Neo4j password as `<redacted>`.
 

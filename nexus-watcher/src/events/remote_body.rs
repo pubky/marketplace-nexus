@@ -106,6 +106,21 @@ pub async fn fetch_record_capped(
     .await
 }
 
+/// `value` percent-encoded for use as a query parameter value (RFC 3986
+/// unreserved characters pass through).
+pub fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 /// Byte budget for the events feed of one poll: `events_limit` events and the
 /// cursor line, each at its longest, with their newlines.
 pub fn event_feed_budget(events_limit: u32) -> usize {
@@ -301,6 +316,15 @@ mod tests {
     fn the_feed_budget_cannot_overflow() {
         assert!(event_feed_budget(u32::MAX) > event_feed_budget(1000));
         assert!(event_lines("PUT pubky://a/pub/x", u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn query_values_are_percent_encoded() {
+        assert_eq!(percent_encode_query_value("AZaz09-._~"), "AZaz09-._~");
+        assert_eq!(
+            percent_encode_query_value("pubky://a b/&?#"),
+            "pubky%3A%2F%2Fa%20b%2F%26%3F%23"
+        );
     }
 
     #[test]
