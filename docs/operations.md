@@ -164,7 +164,7 @@ budget (the request spent most of it waiting for a slot) and a slot wait are not
 remembered. A variant built from an original that was replaced while it
 converted is discarded. Writing a new
 `main` file removes the `small` and `feed` variants built from the previous one.
-The remembered failures live in memory and are lost on restart. Error responses
+ImageMagick's diagnostics are capped at 4 KiB per run. The remembered failures live in memory and are lost on restart. Error responses
 carry no ImageMagick output or file paths.
 
 The runtime image (`Dockerfile`) installs only the JPEG and WebP coder packages

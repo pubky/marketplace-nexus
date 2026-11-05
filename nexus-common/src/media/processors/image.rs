@@ -62,6 +62,9 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static CONVERSIONS_STARTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// ImageMagick diagnostics kept per failed run (logged, and remembered with a failure).
+const MAX_STDERR_BYTES: usize = 4096;
+
 /// How long a variant that could not be made is not tried again.
 const FAILURE_TTL: Duration = Duration::from_secs(3600);
 
@@ -517,7 +520,7 @@ impl Conversion {
             let mut message = Vec::new();
             let read_stderr = async {
                 if let Some(stderr) = stderr.as_mut() {
-                    let _ = stderr.read_to_end(&mut message).await;
+                    message = drain_capped(stderr, MAX_STDERR_BYTES).await;
                 }
             };
             let (status, ()) = tokio::join!(child.wait(), read_stderr);
@@ -560,6 +563,22 @@ impl Conversion {
         let _ = child.start_kill();
         let _ = child.wait().await;
         result
+    }
+}
+
+/// Reads `reader` to its end and keeps the first `cap` bytes, so a process that writes a lot
+/// to stderr neither blocks on a full pipe nor makes the server hold its output.
+async fn drain_capped(reader: &mut (impl AsyncReadExt + Unpin), cap: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => return kept,
+            Ok(n) => {
+                let room = cap.saturating_sub(kept.len());
+                kept.extend_from_slice(&chunk[..n.min(room)]);
+            }
+        }
     }
 }
 
@@ -908,6 +927,21 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_noisy_stderr_is_read_to_the_end_but_only_the_head_is_kept() {
+        let noisy = vec![b'x'; 1024 * 1024];
+        let mut reader: &[u8] = &noisy;
+        let kept = drain_capped(&mut reader, MAX_STDERR_BYTES).await;
+        assert_eq!(kept.len(), MAX_STDERR_BYTES);
+        assert!(reader.is_empty(), "the pipe must be drained to the end");
+
+        let mut short: &[u8] = b"convert: bad";
+        assert_eq!(
+            drain_capped(&mut short, MAX_STDERR_BYTES).await,
+            b"convert: bad"
+        );
     }
 
     #[tokio::test]
