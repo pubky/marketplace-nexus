@@ -1,3 +1,4 @@
+use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use async_trait::async_trait;
@@ -936,17 +937,9 @@ pub(crate) async fn reindex_from_homeserver_with_moderation(
     let user_id = PubkyId::try_from(owner_id).map_err(EventProcessorError::generic)?;
     let uri = listing_uri_builder(owner_id.to_string(), listing_id.to_string());
 
-    let pubky = PubkyConnector::get()?;
-    let response = match pubky.public_storage().get(&uri).await {
-        Ok(response) => response,
-        Err(e) if is_homeserver_not_found(&e) => return Ok(false),
-        Err(e) => return Err(e.into()),
+    let Some(blob) = fetch_record_capped(&uri, MAX_RECORD_BYTES).await? else {
+        return Ok(false);
     };
-
-    let blob = response
-        .bytes()
-        .await
-        .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
     validate_public_listing_blob(&blob)?;
     let resource = Resource::Listing(listing_id.to_string());
     let pubky_object =

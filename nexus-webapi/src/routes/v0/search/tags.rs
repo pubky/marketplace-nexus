@@ -40,7 +40,7 @@ pub async fn search_tags_by_prefix_handler(
 
     let mut pagination = query.pagination;
     pagination.skip.get_or_insert_default();
-    pagination.limit.get_or_insert(20);
+    pagination.limit = Some(pagination.bounded_limit(20));
 
     debug!(
         "GET {SEARCH_TAGS_BY_PREFIX_ROUTE} validated_prefix:{}, skip: {:?}, limit: {:?}",

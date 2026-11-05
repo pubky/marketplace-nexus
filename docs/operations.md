@@ -23,6 +23,38 @@ team deploys it through
 - `[stack] allowed_homeservers`: optional list of z-base-32 ids; when set, the
   watcher polls only these and never adds a homeserver it discovers.
 
+## Limits on untrusted input
+
+Publishers and homeservers control every record, blob and feed the watcher reads,
+and every query string the API receives.
+
+- Homeserver responses are read against a byte budget and a deadline. The events
+  feed is bounded by `events_limit` (at most that many events plus the cursor
+  line, each at most 4,160 bytes); a feed that exceeds either bound is refused and
+  the poll fails. A record is limited to 2 MiB and 30 seconds, a
+  file blob to 100 MiB and 120 seconds, and the shared Pubky client has a
+  180-second per-request deadline.
+- The tag, follower, following, friends, search and username-stream endpoints cap
+  a requested page at 1,000 items (`limit`, `limit_tags`, `limit_taggers`) on the
+  indexed path. A cache miss is served from the graph and returns the full set;
+  other list endpoints keep their own limits.
+- Static files (`/static/files/...`, avatars) are always served with
+  `X-Content-Type-Options: nosniff`. Images (SVG excluded), video, audio, PDF,
+  plain text, JSON and `application/octet-stream` (which browsers download) are
+  served as they are. Any other declared type, including HTML,
+  XHTML, SVG and other XML types, also carries
+  `Content-Security-Policy: default-src 'none'; sandbox` and
+  `Content-Disposition: attachment`, so it downloads instead of rendering on the
+  API origin. A type that is missing, empty, repeated or malformed is replaced by
+  `application/octet-stream` and treated the same way.
+- Restoring a released seller's listings pages their listings directory with a
+  budget of 10,000 listings, 5 minutes and about 2 MiB per page, refuses a
+  homeserver whose page does not advance its cursor or exceeds the page size, and
+  runs the whole restore (profile, shop, directory, every listing) under a
+  30-minute deadline.
+- 500 responses carry a generic message; the cause is in the server log.
+- Debug-level startup logs print the Neo4j password as `<redacted>`.
+
 ### Moderation: launched setting
 
 The Shop index applies the same moderation as pubky.app: content and users that
@@ -120,6 +152,20 @@ the avatar route answers 404 for them. A conversion has
 256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per side and 256 frames.
 File blobs larger than the specs' blob limit (100 MiB) are refused while they
 download.
+
+A request that waits 30 seconds for a conversion slot is answered `503` with
+`Retry-After: 5` and `Cache-Control: no-store`. A variant that fails to build
+(the file is not a decodable image, is over the size limit, or makes ImageMagick
+fail or time out) is remembered for an hour per stored original, up to 4,096
+entries, so the same request does not start the work again; a re-published
+original (a different file, so a different inode, length or modification time)
+is tried afresh. A process killed by a signal, a timeout after a shortened
+budget (the request spent most of it waiting for a slot) and a slot wait are not
+remembered. A variant built from an original that was replaced while it
+converted is discarded. Writing a new
+`main` file removes the `small` and `feed` variants built from the previous one.
+ImageMagick's diagnostics are capped at 4 KiB per run. The remembered failures live in memory and are lost on restart. Error responses
+carry no ImageMagick output or file paths.
 
 The runtime image (`Dockerfile`) installs only the JPEG and WebP coder packages
 on top of the base ImageMagick, replaces the system ImageMagick policy with

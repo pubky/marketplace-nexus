@@ -1,15 +1,16 @@
 use handlers::listing::HomeserverRecord;
-use nexus_common::db::PubkyConnector;
 use nexus_common::models::event::{Event, EventProcessorError, EventType};
 use nexus_common::models::marketplace::{
     ExcludedReviewer, ModeratedListing, ModeratedReview, ModeratedUser,
 };
-use pubky_app_specs::{PubkyAppObject, PubkyId, Resource};
+use pubky_app_specs::{PubkyAppObject, PubkyId, Resource, VALIDATION_LIMITS};
+use remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 pub mod handlers;
 mod moderation;
+pub mod remote_body;
 pub mod retry;
 
 pub use moderation::Moderation;
@@ -30,24 +31,19 @@ pub async fn handle_put_event(
 ) -> Result<(), EventProcessorError> {
     debug!("Handling PUT event for URI: {}", event.uri);
 
-    let pubky = PubkyConnector::get()?;
-    let response = match pubky.public_storage().get(&event.uri).await {
-        Ok(response) => response,
-        Err(e) if handlers::listing::is_homeserver_not_found(&e) => {
-            debug!(
-                "PUT record {} is already gone from its homeserver; skipping",
-                event.uri
-            );
-            return Ok(());
-        }
-        Err(e) => return Err(e.into()),
-    };
-
-    let blob = response
-        .bytes()
-        .await
-        .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
     let resource = event.parsed_uri.resource.clone();
+    let max_bytes = if matches!(resource, Resource::Blob(_)) {
+        VALIDATION_LIMITS.max_blob_size_bytes
+    } else {
+        MAX_RECORD_BYTES
+    };
+    let Some(blob) = fetch_record_capped(&event.uri, max_bytes).await? else {
+        debug!(
+            "PUT record {} is already gone from its homeserver; skipping",
+            event.uri
+        );
+        return Ok(());
+    };
     if matches!(resource, Resource::Listing(_)) {
         handlers::listing::validate_public_listing_blob(&blob)?;
     }

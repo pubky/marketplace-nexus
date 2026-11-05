@@ -1,11 +1,21 @@
 use crate::db::RedisOps;
 use crate::models::error::ModelResult;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use utoipa::ToSchema;
 
 use super::followers::Followers;
 use super::following::Following;
 use super::traits::UserFollows;
+
+/// The ids in `following` that are also in `followers`, in `following`'s order.
+fn mutual_ids(following: Vec<String>, followers: Vec<String>) -> Vec<String> {
+    let followers: HashSet<String> = followers.into_iter().collect();
+    following
+        .into_iter()
+        .filter(|user_id| followers.contains(user_id))
+        .collect()
+}
 
 #[derive(Serialize, Deserialize, ToSchema, Default)]
 pub struct Friends(pub Vec<String>);
@@ -28,10 +38,7 @@ impl Friends {
             .0;
 
         // Find intersection of following and followers (mutual friends)
-        let mut friends: Vec<String> = following
-            .into_iter()
-            .filter(|user_id| followers.contains(user_id))
-            .collect();
+        let mut friends = mutual_ids(following, followers);
 
         if friends.is_empty() {
             return Ok(None);
@@ -58,5 +65,35 @@ impl Friends {
         )?;
 
         Ok(a_follows_b && b_follows_a)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mutual_ids;
+
+    fn ids(range: std::ops::Range<usize>) -> Vec<String> {
+        range.map(|i| format!("user{i}")).collect()
+    }
+
+    #[test]
+    fn mutual_ids_keep_the_order_of_the_following_list() {
+        let following = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let followers = vec!["b".to_string(), "c".to_string(), "z".to_string()];
+        assert_eq!(mutual_ids(following, followers), ["c", "b"]);
+    }
+
+    #[test]
+    fn no_overlap_yields_no_friends() {
+        assert!(mutual_ids(ids(0..10), ids(10..20)).is_empty());
+    }
+
+    #[test]
+    fn two_full_ten_thousand_entry_lists_intersect_without_a_quadratic_scan() {
+        let started = std::time::Instant::now();
+        let friends = mutual_ids(ids(0..10_000), ids(5_000..15_000));
+        assert_eq!(friends.len(), 5_000);
+        assert_eq!(friends[0], "user5000");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

@@ -19,7 +19,7 @@ use nexus_common::{
     },
 };
 
-use super::endpoints::STATIC_FILES_ROUTE;
+use super::{endpoints::STATIC_FILES_ROUTE, security_headers};
 
 #[derive(Deserialize, Serialize)]
 pub struct FileParams {
@@ -128,12 +128,10 @@ pub async fn static_files_handler(
 
     // if dl parameter is passed, set content-disposition header to attachment to force download
     if params.dl.is_some() {
-        let content_disposition_header = format!("attachment; filename=\"{}\"", file.name)
-            .parse()
-            .inspect_err(|_| error!("Invalid content disposition header: {}", file.name))?;
-        response
-            .headers_mut()
-            .insert("content-disposition", content_disposition_header);
+        response.headers_mut().insert(
+            "content-disposition",
+            security_headers::attachment_disposition(&file.name),
+        );
     }
 
     Ok(response)

@@ -65,6 +65,22 @@ async fn test_user_tags_with_viewer_id() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn test_user_tags_absurd_limits_are_served_not_allocated() -> Result<()> {
+    // A caller-chosen limit must never size an allocation or a Redis range.
+    let path = format!(
+        "/v0/user/{PUBKY_PEER}/tags?limit_tags={}&limit_taggers={}",
+        usize::MAX,
+        usize::MAX
+    );
+    let body = get_request(&path).await?;
+
+    let tags = body.as_array().expect("Tag list should be an array");
+    assert_eq!(tags.len(), 4);
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn test_user_tags_limit_tag_filter_active() -> Result<()> {
     let path = format!("/v0/user/{PUBKY_PEER}/tags?limit_tags=2");
     let body = get_request(&path).await?;

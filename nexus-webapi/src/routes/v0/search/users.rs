@@ -43,7 +43,7 @@ pub async fn search_users_by_name_handler(
     debug!("GET {SEARCH_USERS_BY_NAME_ROUTE} username:{}", username);
 
     let skip = query.pagination.skip.unwrap_or(0);
-    let limit = query.pagination.limit.unwrap_or(200);
+    let limit = query.pagination.bounded_limit(200);
 
     match UserSearch::get_by_name(&username, Some(skip), Some(limit)).await? {
         Some(user_search) => Ok(Json(user_search)),
@@ -81,7 +81,7 @@ pub async fn search_users_by_id_handler(
     debug!("GET {SEARCH_USERS_BY_ID_ROUTE} ID:{}", id_prefix);
 
     let skip = query.pagination.skip.unwrap_or(0);
-    let limit = query.pagination.limit.unwrap_or(200);
+    let limit = query.pagination.bounded_limit(200);
 
     match UserSearch::get_by_id(&id_prefix, Some(skip), Some(limit)).await? {
         Some(user_search) => Ok(Json(user_search)),

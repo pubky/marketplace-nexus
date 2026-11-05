@@ -2,7 +2,7 @@ mod pagination;
 pub mod routes;
 mod timeframe;
 
-pub use pagination::Pagination;
+pub use pagination::{bounded_page_limit, Pagination, MAX_PAGE_LIMIT};
 pub use timeframe::Timeframe;
 
 use serde::de::{self, Deserializer};

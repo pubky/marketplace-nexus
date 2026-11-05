@@ -34,6 +34,8 @@ pub enum MediaProcessorError {
     UnsupportedInputFormat,
     #[error("TimedOut: media processing did not finish in time")]
     TimedOut,
+    #[error("Busy: no conversion slot became free in time")]
+    Busy,
 }
 
 impl MediaProcessorError {

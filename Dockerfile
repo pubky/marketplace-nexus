@@ -1,7 +1,7 @@
 # ========================
 # Build Stage
 # ========================
-FROM rust:1.90.0-alpine3.22 AS builder
+FROM rust:1.90.0-alpine3.22@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS builder
 
 # Build platform argument (x86_64 or aarch64) (default: x86_64)
 ARG TARGETARCH
@@ -35,7 +35,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY . .
 
 # Build the project in release mode for the MUSL target
-RUN cargo build --release --bin nexusd
+RUN cargo build --locked --release --bin nexusd
 
 # Strip the binaries to reduce size
 RUN strip target/release/nexusd
@@ -43,7 +43,7 @@ RUN strip target/release/nexusd
 # ========================
 # Runtime Stage
 # ========================
-FROM alpine:3.22
+FROM alpine:3.22@sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f
 
 ARG TARGETARCH
 

@@ -10,6 +10,7 @@ mod avatar;
 mod endpoints;
 mod files;
 mod legacy_files;
+mod security_headers;
 mod serve_dir;
 
 pub fn routes(app_state: AppState) -> Router<AppState> {
@@ -21,6 +22,9 @@ pub fn routes(app_state: AppState) -> Router<AppState> {
             get(legacy_files::legacy_files_handler),
         )
         .route(USER_AVATAR_ROUTE, get(avatar::user_avatar_handler))
+        .layer(axum::middleware::from_fn(
+            security_headers::static_security_headers,
+        ))
 }
 
 #[derive(OpenApi)]
