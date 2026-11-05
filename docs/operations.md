@@ -29,13 +29,15 @@ Publishers and homeservers control every record, blob and feed the watcher reads
 and every query string the API receives.
 
 - Homeserver responses are read against a byte budget and a deadline. The events
-  feed is bounded by `events_limit` (its lines are at most `events_limit` events
-  plus the cursor line, and at most 2 KiB each); a feed that exceeds either bound
-  is refused and the poll fails. A record is limited to 2 MiB and 30 seconds, a
+  feed is bounded by `events_limit` (at most that many events plus the cursor
+  line, each at most 4,160 bytes); a feed that exceeds either bound is refused and
+  the poll fails. A record is limited to 2 MiB and 30 seconds, a
   file blob to 100 MiB and 120 seconds, and the shared Pubky client has a
   180-second per-request deadline.
-- Public list endpoints serve at most 1,000 items per request, whatever `limit`,
-  `limit_tags` or `limit_taggers` a caller sends.
+- The tag, follower, following, friends, search and username-stream endpoints cap
+  a requested page at 1,000 items (`limit`, `limit_tags`, `limit_taggers`) on the
+  indexed path. A cache miss is served from the graph and returns the full set;
+  other list endpoints keep their own limits.
 - Static files (`/static/files/...`, avatars) are always served with
   `X-Content-Type-Options: nosniff`. Images (SVG excluded), video, audio, PDF,
   plain text and JSON are served inline. Any other declared type, including HTML,
