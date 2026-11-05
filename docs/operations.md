@@ -153,6 +153,16 @@ the avatar route answers 404 for them. A conversion has
 File blobs larger than the specs' blob limit (100 MiB) are refused while they
 download.
 
+A request that waits 30 seconds for a conversion slot is answered `503` with
+`Retry-After: 5` and `Cache-Control: no-store`. A variant that fails to build
+(the file is not a decodable image, is over the size limit, or makes ImageMagick
+fail or time out) is remembered for an hour per stored original, up to 4,096
+entries, so the same request does not start the work again; a re-published
+original (different length or modification time) is tried afresh. Writing a new
+`main` file removes the `small` and `feed` variants built from the previous one.
+The remembered failures live in memory and are lost on restart. Error responses
+carry no ImageMagick output or file paths.
+
 The runtime image (`Dockerfile`) installs only the JPEG and WebP coder packages
 on top of the base ImageMagick, replaces the system ImageMagick policy with
 `docker/imagemagick/policy.xml` (the coder allowlist, no delegates, the same

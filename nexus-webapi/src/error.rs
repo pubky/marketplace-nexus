@@ -3,6 +3,7 @@ use axum::http::uri::InvalidUri;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use nexus_common::db::kv::RedisError;
+use nexus_common::media::processors::MediaProcessorError;
 use nexus_common::models::error::ModelError;
 use nexus_common::types::DynError;
 use std::io;
@@ -19,6 +20,8 @@ pub enum Error {
     PostNotFound { author_id: String, post_id: String },
     #[error("Internal server error: {source}")]
     InternalServerError { source: DynError },
+    #[error("Service busy, retry shortly")]
+    Busy,
     #[error("Bookmarks not found: {user_id}")]
     BookmarksNotFound { user_id: String },
     #[error("Tags not found")]
@@ -55,8 +58,11 @@ impl Error {
 
 impl From<ModelError> for Error {
     fn from(source: ModelError) -> Self {
-        Error::InternalServerError {
-            source: source.into(),
+        match source {
+            ModelError::MediaProcessorError(MediaProcessorError::Busy) => Error::Busy,
+            other => Error::InternalServerError {
+                source: other.into(),
+            },
         }
     }
 }
@@ -110,6 +116,7 @@ impl IntoResponse for Error {
             Error::TagsNotFound { .. } => StatusCode::NOT_FOUND,
             Error::InvalidInput { .. } => StatusCode::BAD_REQUEST,
             Error::InternalServerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::Busy => StatusCode::SERVICE_UNAVAILABLE,
             Error::TagNotFound { .. } => StatusCode::NOT_FOUND,
             Error::ShopNotFound { .. } => StatusCode::NOT_FOUND,
             Error::ListingNotFound { .. } => StatusCode::NOT_FOUND,
@@ -157,6 +164,7 @@ impl IntoResponse for Error {
                 error!("Attestor profile not found: {}", attestor_id)
             }
             Error::InternalServerError { source } => error!("Internal server error: {:?}", source),
+            Error::Busy => error!("Service busy: no media conversion slot was free in time"),
         };
 
         // The cause of an internal failure (Redis, graph, filesystem) is logged
@@ -169,7 +177,19 @@ impl IntoResponse for Error {
             "error": message
         });
 
-        (status_code, axum::Json(body)).into_response()
+        let mut response = (status_code, axum::Json(body)).into_response();
+        if matches!(self, Error::Busy) {
+            let headers = response.headers_mut();
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("5"),
+            );
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+        }
+        response
     }
 }
 
@@ -209,6 +229,25 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!body.contains("10.1.2.3"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_busy_conversion_pool_answers_503_with_retry_after_and_no_store() {
+        let error = Error::from(ModelError::MediaProcessorError(MediaProcessorError::Busy));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()["retry-after"], "5");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+
+    #[tokio::test]
+    async fn a_failed_conversion_is_still_a_generic_500() {
+        let error = Error::from(ModelError::MediaProcessorError(
+            MediaProcessorError::command_failed("convert: /srv/files/x/main: bad"),
+        ));
+        let (status, body) = body_of(error).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("/srv"), "{body}");
     }
 
     #[tokio::test]

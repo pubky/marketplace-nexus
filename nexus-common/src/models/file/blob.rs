@@ -55,6 +55,17 @@ impl Blob {
         }
         written?;
 
+        // A new original makes the variants built from the previous one stale.
+        if name == FileVariant::Main.to_string() {
+            for variant in [FileVariant::Small, FileVariant::Feed] {
+                match fs::remove_file(files_path.join(variant.to_string())).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -160,6 +171,54 @@ mod tests {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
         assert_eq!(names, vec!["main".to_string()]);
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn republishing_the_original_removes_its_stale_variants() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let files_path = tmp_dir.path().join("user1").join("file1");
+        Blob::put_to_static(
+            "main".to_string(),
+            files_path.clone(),
+            &PubkyAppBlob::new(b"first".to_vec()),
+        )
+        .await
+        .unwrap();
+        for variant in ["small", "feed"] {
+            fs::write(files_path.join(variant), b"built from the first original")
+                .await
+                .unwrap();
+        }
+
+        Blob::put_to_static(
+            "main".to_string(),
+            files_path.clone(),
+            &PubkyAppBlob::new(b"second".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        assert!(!files_path.join("small").exists());
+        assert!(!files_path.join("feed").exists());
+        assert_eq!(fs::read(files_path.join("main")).await.unwrap(), b"second");
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn writing_a_variant_leaves_the_other_variants_alone() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let files_path = tmp_dir.path().join("user1").join("file1");
+        fs::create_dir_all(&files_path).await.unwrap();
+        fs::write(files_path.join("small"), b"kept").await.unwrap();
+
+        Blob::put_to_static(
+            "feed".to_string(),
+            files_path.clone(),
+            &PubkyAppBlob::new(b"variant".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(files_path.join("small")).await.unwrap(), b"kept");
     }
 
     #[tokio_shared_rt::test(shared)]
