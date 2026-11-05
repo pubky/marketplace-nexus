@@ -201,6 +201,7 @@ async fn test_static_image_variant_failure_is_remembered() -> Result<()> {
     let small_path = file_dir.join("small");
     let marker_path = file_dir.join("small.failed");
     let small_url = format!("/static/files/{owner_id}/{file_id}/small");
+    let remembered_failure_text = "File variant could not be built";
 
     create_dir_all(&file_dir).await?;
     for leftover in [&small_path, &marker_path] {
@@ -217,6 +218,7 @@ async fn test_static_image_variant_failure_is_remembered() -> Result<()> {
     for detail in ["static/files", "convert", "ImageMagick"] {
         assert!(!body.contains(detail), "{body}");
     }
+    assert!(!body.contains(remembered_failure_text), "{body}");
     assert!(marker_path.exists());
     assert!(!small_path.exists());
 
@@ -224,6 +226,8 @@ async fn test_static_image_variant_failure_is_remembered() -> Result<()> {
     fs::copy(PathBuf::from(BLOB_PATH).join(IMAGE_BLOB_NAME), &main_path)?;
     let res = client.do_get(&small_url).await?;
     assert_eq!(res.status(), 500);
+    let body = res.json_body()?.to_string();
+    assert!(body.contains(remembered_failure_text), "{body}");
     assert!(!small_path.exists());
 
     // Without the marker, as after a re-publish or the retry period, the variant is built.

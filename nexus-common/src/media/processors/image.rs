@@ -1049,6 +1049,10 @@ mod tests {
                 failure.to_string().contains(&status.to_string()),
                 "{raw_status}: {failure}"
             );
+            assert!(
+                failure.to_string().contains("message"),
+                "{raw_status}: {failure}"
+            );
         }
     }
 
