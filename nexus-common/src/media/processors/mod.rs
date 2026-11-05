@@ -51,7 +51,8 @@ impl MediaProcessorError {
         }
     }
 
-    /// Whether the stored file itself caused this failure, so trying again soon cannot help.
+    /// Whether this failure counts as the file's own. A non-zero `convert` exit can't be told
+    /// apart from some host problems, so those count too until the marker expires.
     pub(crate) fn is_caused_by_file(&self) -> bool {
         matches!(
             self,

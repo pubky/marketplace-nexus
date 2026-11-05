@@ -95,8 +95,9 @@ pub async fn user_avatar_handler(
     // Remove any default "cache-control" header
     response.headers_mut().remove("cache-control");
 
-    // A variant removed while it is being served answers 404, which must not be cached publicly.
-    if response.status().is_success() {
+    // An error, such as a 404 for a variant removed mid-serve, must not be cached publicly.
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
         // Insert a new Cache-Control header (e.g., 1 hour)
         let cache_control_header = "public, max-age=3600"
             .parse()

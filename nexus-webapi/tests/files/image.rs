@@ -218,6 +218,35 @@ async fn test_static_image_variant_failure_is_remembered() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn test_static_file_not_modified_keeps_cache_header() -> Result<()> {
+    let client = httpc_test::new_client(host_url().await)?;
+
+    let test_image_dir_path = format!("static/files/{USER_PUBKY}/{FILE_ID}");
+    create_dir_all(&test_image_dir_path).await?;
+    fs::copy(
+        PathBuf::from(BLOB_PATH).join(IMAGE_BLOB_NAME),
+        format!("{test_image_dir_path}/main"),
+    )?;
+
+    let res = client
+        .do_get(&format!("/{test_image_dir_path}/main"))
+        .await?;
+    assert_eq!(res.status(), 200);
+    let last_modified = res.header("last-modified").unwrap();
+
+    let res = client
+        .reqwest_client()
+        .get(format!("{}/{test_image_dir_path}/main", host_url().await))
+        .header("if-modified-since", last_modified)
+        .send()
+        .await?;
+    assert_eq!(res.status(), 304);
+    assert_eq!(res.headers()["cache-control"], "public, max-age=3600");
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn test_static_file_missing_from_disk_is_not_cached_publicly() -> Result<()> {
     let client = httpc_test::new_client(host_url().await)?;
 

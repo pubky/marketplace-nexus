@@ -119,7 +119,9 @@ the avatar route answers 404 for them. At most two conversions run at once. A
 request waits up to 20 seconds for a free conversion slot and otherwise gets a
 503 with `Retry-After`. A conversion then has 30 seconds and runs with
 ImageMagick limits of 256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per
-side and 256 frames. File blobs larger than the specs' blob limit (100 MiB) are
+side and 256 frames. A request also gets a 503 with `Retry-After` when the file
+was replaced during its conversion, and the next request rebuilds the variant
+from the new file. File blobs larger than the specs' blob limit (100 MiB) are
 refused while they download.
 
 A variant that cannot be built is recorded in a `<variant>.failed` file next to

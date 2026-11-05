@@ -114,8 +114,9 @@ pub async fn static_files_handler(
     // Remove any default "cache-control" header (which may be set to no-cache)
     response.headers_mut().remove("cache-control");
 
-    // A variant removed while it is being served answers 404, which must not be cached publicly.
-    if response.status().is_success() {
+    // An error, such as a 404 for a variant removed mid-serve, must not be cached publicly.
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
         // Set a new Cache-Control header to cache the file for 3600 seconds (1 hour)
         let cache_control_header = "public, max-age=3600"
             .parse()
