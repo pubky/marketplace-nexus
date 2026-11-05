@@ -23,6 +23,28 @@ team deploys it through
 - `[stack] allowed_homeservers`: optional list of z-base-32 ids; when set, the
   watcher polls only these and never adds a homeserver it discovers.
 
+## Limits on untrusted input
+
+Publishers and homeservers control every record, blob and feed the watcher reads,
+and every query string the API receives.
+
+- Homeserver responses are read against a byte budget and a deadline. The events
+  feed is bounded by `events_limit` (its lines are at most `events_limit` events
+  plus the cursor line, and at most 2 KiB each); a feed that exceeds either bound
+  is refused and the poll fails. A record is limited to 2 MiB and 30 seconds, a
+  file blob to 100 MiB and 120 seconds, and the shared Pubky client has a
+  180-second per-request deadline.
+- Public list endpoints serve at most 1,000 items per request, whatever `limit`,
+  `limit_tags` or `limit_taggers` a caller sends.
+- Static files (`/static/files/...`, avatars) are always served with
+  `X-Content-Type-Options: nosniff`. A file whose publisher-declared type can run
+  script (HTML, XHTML, SVG and other XML types) also carries
+  `Content-Security-Policy: default-src 'none'; sandbox` and
+  `Content-Disposition: attachment`, so it downloads instead of rendering on the
+  API origin. Images embed as before.
+- 500 responses carry a generic message; the cause is in the server log.
+- Debug-level startup logs print the Neo4j password as `<redacted>`.
+
 ### Moderation: launched setting
 
 The Shop index applies the same moderation as pubky.app: content and users that
