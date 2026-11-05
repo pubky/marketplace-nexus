@@ -242,6 +242,20 @@ mod tests {
     }
 
     #[tokio_shared_rt::test(shared)]
+    async fn a_failed_removal_reports_an_error_with_the_new_main_in_place() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let files_path = tmp_dir.path().join("user1").join("file1");
+        fs::create_dir_all(files_path.join("small")).await.unwrap();
+        fs::write(files_path.join("main"), b"old").await.unwrap();
+        let blob = PubkyAppBlob::new(b"new".to_vec());
+
+        let result = Blob::put_to_static("main".to_string(), files_path.clone(), &blob).await;
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(files_path.join("main")).await.unwrap(), b"new");
+    }
+
+    #[tokio_shared_rt::test(shared)]
     async fn writing_another_name_removes_nothing() {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let files_path = file_dir_with_variants(&tmp_dir).await;

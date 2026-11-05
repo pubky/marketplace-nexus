@@ -34,7 +34,9 @@ pub enum MediaProcessorError {
     UnsupportedInputFormat,
     #[error("TimedOut: media processing did not finish in time")]
     TimedOut,
-    #[error("Busy: no conversion slot became free in time")]
+    /// Asking again shortly can work: no conversion slot became free in time, or the file changed
+    /// during conversion and the output was discarded. Writes no failure marker.
+    #[error("Busy: no conversion slot became free in time, or the file changed during conversion")]
     Busy,
     #[error("ConversionFailed: {0}")]
     ConversionFailed(String),

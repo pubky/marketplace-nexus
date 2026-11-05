@@ -1,6 +1,7 @@
 use std::{
     io::SeekFrom,
-    process::Stdio,
+    os::unix::{fs::MetadataExt, process::ExitStatusExt},
+    process::{ExitStatus, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, LazyLock,
@@ -222,6 +223,7 @@ impl ImageProcessor {
         let conversion = Conversion {
             input,
             input_format,
+            origin_file_path: origin_file_path.to_string(),
             output_file_path: output_file_path.to_string(),
             width: options.width.clone(),
             format: options.format.clone(),
@@ -304,8 +306,11 @@ async fn marker_is_fresh(marker: &str) -> bool {
         .map_or(true, |age| age < FAILED_VARIANT_RETRY_AFTER)
 }
 
-/// Writes the variant's failure marker if the file itself caused the failure. A slot-wait timeout
-/// or a host problem says nothing about the file, so it must not hold back a good image.
+/// Writes the variant's failure marker if the failure counts as the file's own. A slot-wait
+/// timeout, a killed process or an I/O error on the host says nothing about the file and writes no
+/// marker, so it does not hold back a good image. A non-zero `convert` exit cannot be told apart
+/// from a host problem such as a full disk or a broken coder install, so it counts as the file's
+/// failure and clears within the hour.
 async fn record_failure(marker: &str, error: &MediaProcessorError) {
     if !error.is_caused_by_file() {
         return;
@@ -334,11 +339,25 @@ async fn capture_stderr(mut stderr: impl AsyncRead + Unpin) -> Vec<u8> {
     message
 }
 
+/// What a `convert` run that did not succeed says about the file. SIGKILL comes from outside the
+/// process, typically from the OOM killer, so it says nothing about the file. Any other signal,
+/// such as SIGSEGV or SIGABRT, is a decoder crash caused by the input.
+fn failure_from_exit(status: ExitStatus, stderr: &[u8]) -> MediaProcessorError {
+    const SIGKILL: i32 = 9;
+    if status.signal() == Some(SIGKILL) {
+        return MediaProcessorError::command_failed("convert was killed by signal 9 (SIGKILL)");
+    }
+    MediaProcessorError::ConversionFailed(String::from_utf8_lossy(stderr).into_owned())
+}
+
 /// One ImageMagick run: decodes `input` with its sniffed decoder and writes the variant next to
 /// `output_file_path`, renaming it into place on success.
 struct Conversion {
+    /// Stays open until the outcome is recorded: an open file's inode cannot be reused, so
+    /// comparing it with `origin_file_path` cannot mistake a new file for this one.
     input: std::fs::File,
     input_format: ImageInputFormat,
+    origin_file_path: String,
     output_file_path: String,
     width: String,
     format: String,
@@ -348,7 +367,8 @@ struct Conversion {
 impl Conversion {
     /// Runs as its own task, which continues when the request that started it goes away: the
     /// child is always reaped, its files removed and its outcome recorded, and the slot is held
-    /// until all of that is done.
+    /// until all of that is done. If the original was replaced meanwhile, the outcome is discarded
+    /// and the answer is [`MediaProcessorError::Busy`], so the client asks again.
     fn spawn(self, slot: OwnedSemaphorePermit) -> JoinHandle<Result<String, MediaProcessorError>> {
         let marker = failed_variant_marker(&self.output_file_path);
         tokio::spawn(async move {
@@ -360,12 +380,38 @@ impl Conversion {
                 }
                 Err(e) => record_failure(&marker, e).await,
             }
+            // Checked after writing, which closes the race with `Blob::put_to_static`. It renames
+            // main before its cleanup, so if this sees the old main the cleanup runs later and
+            // removes the output, and if it sees the new main the output is removed here.
+            let result = if self.origin_changed().await {
+                let written = if result.is_ok() {
+                    &self.output_file_path
+                } else {
+                    &marker
+                };
+                let _ = remove_if_exists(written).await;
+                Err(MediaProcessorError::Busy)
+            } else {
+                result
+            };
             drop(slot);
             result
         })
     }
 
-    async fn run(self) -> Result<String, MediaProcessorError> {
+    /// Whether the origin path no longer holds the file this conversion read. A missing or
+    /// unreadable origin counts as changed.
+    async fn origin_changed(&self) -> bool {
+        let (Ok(read), Ok(current)) = (
+            self.input.metadata(),
+            fs::metadata(&self.origin_file_path).await,
+        ) else {
+            return true;
+        };
+        (read.dev(), read.ino()) != (current.dev(), current.ino())
+    }
+
+    async fn run(&self) -> Result<String, MediaProcessorError> {
         // ImageMagick's own temporary files (spilled input, disk pixel cache) go here and are
         // removed with it, including after the process is killed.
         let scratch = tempfile::Builder::new()
@@ -431,11 +477,7 @@ impl Conversion {
 
         let result = match finished {
             Ok(Ok((status, _))) if status.success() => return Ok(()),
-            Ok(Ok((_, message))) => {
-                return Err(MediaProcessorError::ConversionFailed(
-                    String::from_utf8_lossy(&message).into_owned(),
-                ))
-            }
+            Ok(Ok((status, message))) => return Err(failure_from_exit(status, &message)),
             Ok(Err(e)) => Err(MediaProcessorError::command_failed(e)),
             Err(_) => Err(MediaProcessorError::TimedOut),
         };
@@ -552,6 +594,27 @@ mod tests {
         path.to_str().expect("utf-8 temp path")
     }
 
+    /// Opens a conversion of `source` the way a request does, without running it.
+    async fn open_conversion(source: &Path, output: &Path, budget: Duration) -> Conversion {
+        let (input, input_format) = ImageProcessor::open_input(path_str(source)).await.unwrap();
+        Conversion {
+            input,
+            input_format,
+            origin_file_path: path_str(source).to_string(),
+            output_file_path: path_str(output).to_string(),
+            width: SMALL_IMAGE_WIDTH.to_string(),
+            format: IMAGE_FORMAT.to_string(),
+            deadline: tokio::time::Instant::now() + budget,
+        }
+    }
+
+    /// Replaces a file the way `Blob::put_to_static` does: a different file is renamed over it.
+    fn replace_by_rename(origin: &Path) {
+        let replacement = origin.with_extension("replacement");
+        std::fs::write(&replacement, b"new").unwrap();
+        std::fs::rename(&replacement, origin).unwrap();
+    }
+
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -625,6 +688,18 @@ mod tests {
 
             assert!(result.is_err(), "{name}: was decoded");
             assert!(!output.exists(), "{name}: a variant was written");
+            assert!(
+                dir.path().join(format!("{name}-small.failed")).exists(),
+                "{name}: no marker"
+            );
+
+            let second =
+                ImageProcessor::process(path_str(&source), path_str(&output), &small_options())
+                    .await;
+            assert!(
+                matches!(second, Err(MediaProcessorError::RecentlyFailed)),
+                "{name}: {second:?}"
+            );
         }
         assert!(
             entries(dir.path())
@@ -689,6 +764,14 @@ mod tests {
             Err(MediaProcessorError::InputTooLarge { .. })
         ));
         assert!(!output.exists());
+        assert!(dir.path().join("small.failed").exists());
+
+        let second =
+            ImageProcessor::process(path_str(&source), path_str(&output), &small_options()).await;
+        assert!(
+            matches!(second, Err(MediaProcessorError::RecentlyFailed)),
+            "{second:?}"
+        );
     }
 
     #[tokio::test]
@@ -816,6 +899,7 @@ mod tests {
         let conversion = Conversion {
             input,
             input_format,
+            origin_file_path: path_str(&source).to_string(),
             output_file_path: path_str(&output).to_string(),
             width: FEED_IMAGE_WIDTH.to_string(),
             format: IMAGE_FORMAT.to_string(),
@@ -830,6 +914,113 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(entries(dir.path()), vec!["png".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_spawned_conversion_past_its_deadline_leaves_its_marker() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(
+            dir.path(),
+            "png",
+            &["-size", "4000x3000", "gradient:red-blue"],
+        )
+        .await;
+        let output = dir.path().join("feed");
+        let conversion = open_conversion(&source, &output, Duration::from_millis(50)).await;
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        let result = conversion.spawn(slot).await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::TimedOut)),
+            "{result:?}"
+        );
+        assert_eq!(
+            entries(dir.path()),
+            vec!["feed.failed".to_string(), "png".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replaced_original_discards_the_finished_variant() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        let output = dir.path().join("small");
+        let conversion = open_conversion(&source, &output, IMAGE_CONVERSION_TIMEOUT).await;
+        replace_by_rename(&source);
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        let result = conversion.spawn(slot).await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::Busy)),
+            "{result:?}"
+        );
+        assert_eq!(entries(dir.path()), vec!["png".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_original_discards_the_failure_marker() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("main");
+        std::fs::write(&source, CORRUPT_PNG).unwrap();
+        let output = dir.path().join("small");
+        let conversion = open_conversion(&source, &output, IMAGE_CONVERSION_TIMEOUT).await;
+        replace_by_rename(&source);
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        let result = conversion.spawn(slot).await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::Busy)),
+            "{result:?}"
+        );
+        assert_eq!(entries(dir.path()), vec!["main".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_original_keeps_the_finished_variant() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        let output = dir.path().join("small");
+        let conversion = open_conversion(&source, &output, IMAGE_CONVERSION_TIMEOUT).await;
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        conversion
+            .spawn(slot)
+            .await
+            .unwrap()
+            .expect("conversion failed");
+
+        assert_eq!(
+            entries(dir.path()),
+            vec!["png".to_string(), "small".to_string()]
+        );
+    }
+
+    #[test]
+    fn only_a_killed_process_is_not_the_files_failure() {
+        let killed = failure_from_exit(ExitStatus::from_raw(9), b"");
+        assert!(
+            matches!(killed, MediaProcessorError::CommandFailed { .. }),
+            "{killed:?}"
+        );
+        assert!(killed.to_string().contains("SIGKILL"), "{killed}");
+        assert!(!killed.is_caused_by_file());
+
+        // SIGSEGV and exit code 1.
+        for raw_status in [11, 256] {
+            let failure = failure_from_exit(ExitStatus::from_raw(raw_status), b"message");
+            assert!(
+                matches!(failure, MediaProcessorError::ConversionFailed(_)),
+                "{raw_status}: {failure:?}"
+            );
+            assert!(failure.is_caused_by_file(), "{raw_status}");
+        }
     }
 
     #[tokio::test]
@@ -907,6 +1098,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_marker_dated_in_the_future_counts_as_fresh() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        let output = dir.path().join("small");
+        std::fs::File::create(dir.path().join("small.failed"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60 * 60))
+            .unwrap();
+
+        let result =
+            ImageProcessor::process(path_str(&source), path_str(&output), &small_options()).await;
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::RecentlyFailed)),
+            "{result:?}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn a_waiter_that_gets_a_slot_respects_a_failure_recorded_meanwhile() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        let output = dir.path().join("small");
+        let all_slots = CONVERSION_SLOTS
+            .acquire_many(MAX_CONCURRENT_CONVERSIONS as u32)
+            .await
+            .unwrap();
+
+        let waiter = {
+            let (source, output) = (source.clone(), output.clone());
+            tokio::spawn(async move {
+                ImageProcessor::process_with_slot_wait(
+                    path_str(&source),
+                    path_str(&output),
+                    &small_options(),
+                    Duration::from_secs(60),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::fs::File::create(dir.path().join("small.failed")).unwrap();
+        drop(all_slots);
+
+        let result = waiter.await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::RecentlyFailed)),
+            "{result:?}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
     async fn a_timeout_waiting_for_a_slot_is_busy_and_leaves_no_marker() {
         let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
@@ -963,6 +1211,7 @@ mod tests {
         let conversion = Conversion {
             input,
             input_format,
+            origin_file_path: path_str(&source).to_string(),
             output_file_path: path_str(&output).to_string(),
             width: SMALL_IMAGE_WIDTH.to_string(),
             format: IMAGE_FORMAT.to_string(),

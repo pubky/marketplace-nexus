@@ -216,3 +216,22 @@ async fn test_static_image_variant_failure_is_remembered() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn test_static_file_missing_from_disk_is_not_cached_publicly() -> Result<()> {
+    let client = httpc_test::new_client(host_url().await)?;
+
+    // Has graph details but no file on disk.
+    let owner_id = "sfgetccnq7s3h57a7imf6n7k5fqxus33yg85f1ndhnrnofjdmhjy";
+    let file_id = "2ZK1VCJN4YE00";
+    let file_dir = format!("static/files/{owner_id}/{file_id}");
+    assert!(!PathBuf::from(&file_dir).exists());
+
+    let res = client.do_get(&format!("/{file_dir}/main")).await?;
+
+    assert_eq!(res.status(), 404);
+    let cache_control = res.header("cache-control").unwrap_or_default();
+    assert!(!cache_control.contains("public"), "{cache_control}");
+
+    Ok(())
+}

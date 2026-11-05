@@ -39,7 +39,7 @@ pub struct FilePath {
 /// If the variant is not valid for the content type, a 400 Bad Request will be returned
 /// If the file does not exist, a 404 Not Found will be returned
 /// If the processing of the new variant fails, a 500 Internal Server Error will be returned
-/// If no conversion slot becomes free in time, a 503 Service Unavailable with Retry-After will be returned
+/// If no conversion slot becomes free in time, or the file changes during conversion, a 503 Service Unavailable with Retry-After will be returned
 #[utoipa::path(
     get,
     path = STATIC_FILES_ROUTE,
@@ -55,7 +55,7 @@ pub struct FilePath {
         (status = 200, description = "File's raw data"),
         (status = 404, description = "File not found"),
         (status = 500, description = "Internal server error"),
-        (status = 503, description = "No conversion slot became free in time, retry later")
+        (status = 503, description = "No conversion slot became free in time, or the file changed during conversion, retry later")
     )
 )]
 pub async fn static_files_handler(
@@ -114,15 +114,18 @@ pub async fn static_files_handler(
     // Remove any default "cache-control" header (which may be set to no-cache)
     response.headers_mut().remove("cache-control");
 
-    // Set a new Cache-Control header to cache the file for 3600 seconds (1 hour)
-    let cache_control_header = "public, max-age=3600"
-        .parse()
-        .inspect_err(|err| error!("Failed to parse Cache-Control header value: {}", err))?;
+    // A variant removed while it is being served answers 404, which must not be cached publicly.
+    if response.status().is_success() {
+        // Set a new Cache-Control header to cache the file for 3600 seconds (1 hour)
+        let cache_control_header = "public, max-age=3600"
+            .parse()
+            .inspect_err(|err| error!("Failed to parse Cache-Control header value: {}", err))?;
 
-    // Insert our newly parsed Cache-Control header.
-    response
-        .headers_mut()
-        .insert("cache-control", cache_control_header);
+        // Insert our newly parsed Cache-Control header.
+        response
+            .headers_mut()
+            .insert("cache-control", cache_control_header);
+    }
 
     // if dl parameter is passed, set content-disposition header to attachment to force download
     if params.dl.is_some() {

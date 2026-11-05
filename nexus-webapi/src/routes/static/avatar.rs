@@ -26,7 +26,7 @@ use super::endpoints::USER_AVATAR_ROUTE;
         (status = 200, description = "Avatar image"),
         (status = 404, description = "User or avatar not found"),
         (status = 500, description = "Internal error retrieving avatar"),
-        (status = 503, description = "No conversion slot became free in time, retry later")
+        (status = 503, description = "No conversion slot became free in time, or the file changed during conversion, retry later")
     )
 )]
 pub async fn user_avatar_handler(
@@ -95,14 +95,17 @@ pub async fn user_avatar_handler(
     // Remove any default "cache-control" header
     response.headers_mut().remove("cache-control");
 
-    // Insert a new Cache-Control header (e.g., 1 hour)
-    let cache_control_header = "public, max-age=3600"
-        .parse()
-        .inspect_err(|err| error!("Failed to parse Cache-Control header value: {}", err))?;
+    // A variant removed while it is being served answers 404, which must not be cached publicly.
+    if response.status().is_success() {
+        // Insert a new Cache-Control header (e.g., 1 hour)
+        let cache_control_header = "public, max-age=3600"
+            .parse()
+            .inspect_err(|err| error!("Failed to parse Cache-Control header value: {}", err))?;
 
-    response
-        .headers_mut()
-        .insert("cache-control", cache_control_header);
+        response
+            .headers_mut()
+            .insert("cache-control", cache_control_header);
+    }
 
     Ok(response)
 }

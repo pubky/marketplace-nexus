@@ -123,8 +123,10 @@ side and 256 frames. File blobs larger than the specs' blob limit (100 MiB) are
 refused while they download.
 
 A variant that cannot be built is recorded in a `<variant>.failed` file next to
-it and retried after an hour or when the file is re-published. Re-publishing a
-file removes its existing variants, which are rebuilt on the next request.
+it and retried after an hour or when the file is re-published. Deleting the
+`*.failed` files makes the next request try again sooner, for example after
+fixing a host problem. Re-publishing a file removes its existing variants, which
+are rebuilt on the next request.
 
 The runtime image (`Dockerfile`) installs only the JPEG and WebP coder packages
 on top of the base ImageMagick, replaces the system ImageMagick policy with

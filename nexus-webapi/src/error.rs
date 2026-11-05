@@ -8,7 +8,7 @@ use nexus_common::models::error::ModelError;
 use nexus_common::types::DynError;
 use std::io;
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -45,6 +45,8 @@ pub enum Error {
     AttestorProfileNotFound { attestor_id: String },
     #[error("Service busy, retry later")]
     ServiceBusy {},
+    #[error("File variant could not be built, retry later")]
+    VariantRecentlyFailed {},
     // Add other custom errors here
 }
 
@@ -60,6 +62,9 @@ impl From<ModelError> for Error {
     fn from(source: ModelError) -> Self {
         match source {
             ModelError::MediaProcessorError(MediaProcessorError::Busy) => Error::ServiceBusy {},
+            ModelError::MediaProcessorError(MediaProcessorError::RecentlyFailed) => {
+                Error::VariantRecentlyFailed {}
+            }
             source => Error::InternalServerError {
                 source: source.into(),
             },
@@ -123,6 +128,7 @@ impl IntoResponse for Error {
             Error::ReputationNotFound { .. } => StatusCode::NOT_FOUND,
             Error::AttestorProfileNotFound { .. } => StatusCode::NOT_FOUND,
             Error::ServiceBusy {} => StatusCode::SERVICE_UNAVAILABLE,
+            Error::VariantRecentlyFailed {} => StatusCode::INTERNAL_SERVER_ERROR,
             // Map other errors to appropriate status codes
         };
 
@@ -165,6 +171,9 @@ impl IntoResponse for Error {
             }
             Error::InternalServerError { source } => error!("Internal server error: {:?}", source),
             Error::ServiceBusy {} => warn!("Service busy, retry later"),
+            Error::VariantRecentlyFailed {} => {
+                debug!("File variant could not be built, retry later")
+            }
         };
 
         let body = serde_json::json!({
@@ -221,5 +230,16 @@ mod tests {
         assert!(body_of(response)
             .await
             .contains("Service busy, retry later"));
+    }
+
+    #[tokio::test]
+    async fn recently_failed_answers_500_without_retry_headers() {
+        let response = response_for(MediaProcessorError::RecentlyFailed);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        assert!(body_of(response)
+            .await
+            .contains("File variant could not be built, retry later"));
     }
 }
