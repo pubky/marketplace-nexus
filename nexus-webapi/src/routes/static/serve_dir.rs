@@ -4,13 +4,27 @@ use std::sync::OnceLock;
 use crate::Result;
 use axum::{
     body::Body,
-    http::{Request, Uri},
+    http::{header::CACHE_CONTROL, HeaderValue, Request, Uri},
     response::Response,
 };
 use tower_http::services::{fs::ServeFileSystemResponseBody, ServeDir};
 use tracing::error;
 
 static SERVE_DIR_INSTANCE: OnceLock<ServeDir> = OnceLock::new();
+
+/// Lets a served file be cached publicly for an hour, in place of any Cache-Control header the
+/// response already has. An error, such as a 404 for a variant removed mid-serve, gets no header.
+pub fn set_public_cache_control<B>(response: &mut Response<B>) {
+    response.headers_mut().remove(CACHE_CONTROL);
+
+    let status = response.status();
+    if !status.is_client_error() && !status.is_server_error() {
+        response.headers_mut().insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=3600"),
+        );
+    }
+}
 
 pub struct PubkyServeDir;
 
@@ -52,5 +66,51 @@ impl PubkyServeDir {
             .headers_mut()
             .insert("content-type", content_type_header);
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    /// A response of the given status that already has a Cache-Control header.
+    fn response_with_cache_control(status: StatusCode) -> Response<()> {
+        let mut response = Response::new(());
+        *response.status_mut() = status;
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        response
+    }
+
+    #[test]
+    fn served_and_unchanged_files_are_cached_publicly() {
+        for status in [
+            StatusCode::OK,
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::NOT_MODIFIED,
+        ] {
+            let mut response = response_with_cache_control(status);
+
+            set_public_cache_control(&mut response);
+
+            assert_eq!(
+                response.headers()[CACHE_CONTROL],
+                "public, max-age=3600",
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_are_not_cached_publicly() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::INTERNAL_SERVER_ERROR] {
+            let mut response = response_with_cache_control(status);
+
+            set_public_cache_control(&mut response);
+
+            assert!(!response.headers().contains_key(CACHE_CONTROL), "{status}");
+        }
     }
 }

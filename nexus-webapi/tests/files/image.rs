@@ -1,5 +1,6 @@
 use std::{
     fs::{self},
+    io::ErrorKind,
     path::PathBuf,
 };
 
@@ -14,6 +15,22 @@ const BLOB_PATH: &str = "tests/files/blobs";
 
 const FILE_ID: &str = "2ZKH7K7M9G3G0";
 const USER_PUBKY: &str = "y4euc58gnmxun9wo87gwmanu6kztt9pgw1zz1yp1azp7trrsjamy";
+
+/// Removes a variant's file and failure marker, so a leftover from an earlier failed run can't
+/// decide the result.
+fn remove_variant_leftovers(file_dir: &str, variant: FileVariant) -> Result<()> {
+    for leftover in [
+        format!("{file_dir}/{variant}"),
+        format!("{file_dir}/{variant}.failed"),
+    ] {
+        if let Err(e) = fs::remove_file(leftover) {
+            if e.kind() != ErrorKind::NotFound {
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(())
+}
 
 #[tokio_shared_rt::test(shared)]
 async fn test_static_image_serving_main() -> Result<()> {
@@ -88,6 +105,8 @@ async fn test_static_image_serving_feed() -> Result<()> {
 
     let result_file = files[0].as_ref().expect("Created file was not found.");
 
+    remove_variant_leftovers(&test_image_dir_path, FileVariant::Feed)?;
+
     let test_file_version_name = FileVariant::Feed.to_string();
     let test_file_path = format!("static/files/{USER_PUBKY}/{FILE_ID}/{test_file_version_name}");
 
@@ -140,6 +159,8 @@ async fn test_static_image_serving_small() -> Result<()> {
         .expect("Failed to fetch files from Nexus");
 
     let result_file = files[0].as_ref().expect("Created file was not found.");
+
+    remove_variant_leftovers(&test_image_dir_path, FileVariant::Small)?;
 
     let test_file_version_name = FileVariant::Small.to_string();
     let test_file_path = format!("static/files/{USER_PUBKY}/{FILE_ID}/{test_file_version_name}");
@@ -218,30 +239,52 @@ async fn test_static_image_variant_failure_is_remembered() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
-async fn test_static_file_not_modified_keeps_cache_header() -> Result<()> {
+async fn test_static_file_and_avatar_not_modified_keep_cache_header() -> Result<()> {
     let client = httpc_test::new_client(host_url().await)?;
 
-    let test_image_dir_path = format!("static/files/{USER_PUBKY}/{FILE_ID}");
-    create_dir_all(&test_image_dir_path).await?;
+    // This file is the user's avatar and no other test touches it on disk. Declared as image/jpeg
+    // while the bytes are PNG: the decoder is chosen from the leading bytes.
+    let owner_id = "4snwyct86m383rsduhw5xgcxpw7c63j3pq8x4ycqikxgik8y64ro";
+    let file_id = "003286NSMY490";
+    let file_dir = format!("static/files/{owner_id}/{file_id}");
+
+    create_dir_all(&file_dir).await?;
     fs::copy(
         PathBuf::from(BLOB_PATH).join(IMAGE_BLOB_NAME),
-        format!("{test_image_dir_path}/main"),
+        format!("{file_dir}/main"),
     )?;
+    remove_variant_leftovers(&file_dir, FileVariant::Small)?;
 
-    let res = client
-        .do_get(&format!("/{test_image_dir_path}/main"))
-        .await?;
+    let res = client.do_get(&format!("/{file_dir}/main")).await?;
     assert_eq!(res.status(), 200);
     let last_modified = res.header("last-modified").unwrap();
 
     let res = client
         .reqwest_client()
-        .get(format!("{}/{test_image_dir_path}/main", host_url().await))
+        .get(format!("{}/{file_dir}/main", host_url().await))
         .header("if-modified-since", last_modified)
         .send()
         .await?;
     assert_eq!(res.status(), 304);
     assert_eq!(res.headers()["cache-control"], "public, max-age=3600");
+
+    let avatar_url = format!("/static/avatar/{owner_id}");
+    let res = client.do_get(&avatar_url).await?;
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.header("content-type").unwrap(), "image/webp");
+    assert_eq!(res.header("cache-control").unwrap(), "public, max-age=3600");
+    let last_modified = res.header("last-modified").unwrap();
+
+    let res = client
+        .reqwest_client()
+        .get(format!("{}{avatar_url}", host_url().await))
+        .header("if-modified-since", last_modified)
+        .send()
+        .await?;
+    assert_eq!(res.status(), 304);
+    assert_eq!(res.headers()["cache-control"], "public, max-age=3600");
+
+    fs::remove_dir_all(&file_dir)?;
 
     Ok(())
 }

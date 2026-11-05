@@ -9,10 +9,11 @@ use nexus_common::media::{FileVariant, VariantController};
 use nexus_common::models::file::Blob;
 use nexus_common::models::{file::FileDetails, traits::Collection, user::UserDetails};
 use tower_http::services::fs::ServeFileSystemResponseBody;
-use tracing::{debug, error};
+use tracing::debug;
 use utoipa::OpenApi;
 
 use super::endpoints::USER_AVATAR_ROUTE;
+use super::serve_dir::set_public_cache_control;
 
 #[utoipa::path(
     get,
@@ -92,21 +93,7 @@ pub async fn user_avatar_handler(
     )
     .await?;
 
-    // Remove any default "cache-control" header
-    response.headers_mut().remove("cache-control");
-
-    // An error, such as a 404 for a variant removed mid-serve, must not be cached publicly.
-    let status = response.status();
-    if !status.is_client_error() && !status.is_server_error() {
-        // Insert a new Cache-Control header (e.g., 1 hour)
-        let cache_control_header = "public, max-age=3600"
-            .parse()
-            .inspect_err(|err| error!("Failed to parse Cache-Control header value: {}", err))?;
-
-        response
-            .headers_mut()
-            .insert("cache-control", cache_control_header);
-    }
+    set_public_cache_control(&mut response);
 
     Ok(response)
 }

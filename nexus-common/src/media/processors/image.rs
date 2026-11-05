@@ -321,8 +321,11 @@ async fn record_failure(marker: &str, error: &MediaProcessorError) {
         Ok(()) => fs::File::create(marker).await.map(drop),
         Err(e) => Err(e),
     };
-    if let Err(e) = written {
-        tracing::warn!("Could not write the failure marker {marker}: {e}");
+    match written {
+        // The only record of why the variant is held back: the request that hit the failure may
+        // be gone, and later requests get `RecentlyFailed` without the cause.
+        Ok(()) => tracing::warn!("Wrote the failure marker {marker}: {error}"),
+        Err(e) => tracing::warn!("Could not write the failure marker {marker}: {e}"),
     }
 }
 
@@ -347,7 +350,9 @@ fn failure_from_exit(status: ExitStatus, stderr: &[u8]) -> MediaProcessorError {
     if status.signal() == Some(SIGKILL) {
         return MediaProcessorError::command_failed("convert was killed by signal 9 (SIGKILL)");
     }
-    MediaProcessorError::ConversionFailed(String::from_utf8_lossy(stderr).into_owned())
+    // A crashed process often writes nothing, so the status can be the only clue.
+    let stderr = String::from_utf8_lossy(stderr);
+    MediaProcessorError::ConversionFailed(format!("{status}: {stderr}"))
 }
 
 /// One ImageMagick run: decodes `input` with its sniffed decoder and writes the variant next to
@@ -982,6 +987,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_deleted_original_discards_the_finished_variant() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        let output = dir.path().join("small");
+        let conversion = open_conversion(&source, &output, IMAGE_CONVERSION_TIMEOUT).await;
+        std::fs::remove_file(&source).unwrap();
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        let result = conversion.spawn(slot).await.unwrap();
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::Busy)),
+            "{result:?}"
+        );
+        assert!(entries(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
     async fn an_unchanged_original_keeps_the_finished_variant() {
         let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
@@ -1014,12 +1038,17 @@ mod tests {
 
         // SIGSEGV and exit code 1.
         for raw_status in [11, 256] {
-            let failure = failure_from_exit(ExitStatus::from_raw(raw_status), b"message");
+            let status = ExitStatus::from_raw(raw_status);
+            let failure = failure_from_exit(status, b"message");
             assert!(
                 matches!(failure, MediaProcessorError::ConversionFailed(_)),
                 "{raw_status}: {failure:?}"
             );
             assert!(failure.is_caused_by_file(), "{raw_status}");
+            assert!(
+                failure.to_string().contains(&status.to_string()),
+                "{raw_status}: {failure}"
+            );
         }
     }
 
@@ -1179,6 +1208,33 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(entries(dir.path()), vec!["main".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_known_failure_does_not_wait_for_a_slot() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("main");
+        std::fs::write(&source, CORRUPT_PNG).unwrap();
+        let output = dir.path().join("small");
+        std::fs::File::create(dir.path().join("small.failed")).unwrap();
+        let _all_slots = CONVERSION_SLOTS
+            .acquire_many(MAX_CONCURRENT_CONVERSIONS as u32)
+            .await
+            .unwrap();
+
+        let result = ImageProcessor::process_with_slot_wait(
+            path_str(&source),
+            path_str(&output),
+            &small_options(),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::RecentlyFailed)),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
