@@ -21,9 +21,9 @@ pub const RECORD_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// fraction of this.
 pub const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 
-/// Longest event line the watcher accepts: `PUT pubky://<key>/<path>`, with
-/// the path bounded by the specs' URL limits.
-pub const MAX_EVENT_LINE_BYTES: usize = 2 * 1024;
+/// Longest event line the watcher accepts: `PUT pubky://<key>/<path>` with a
+/// path of up to 4,096 bytes.
+pub const MAX_EVENT_LINE_BYTES: usize = 4_160;
 
 /// Reserve for the cursor line and rate-limit text around the event lines.
 const EVENT_FEED_SLACK_BYTES: usize = 1024;
@@ -106,24 +106,33 @@ pub async fn fetch_record_capped(
     .await
 }
 
-/// Byte budget for the events feed of one poll.
+/// Byte budget for the events feed of one poll: `events_limit` events and the
+/// cursor line, each at its longest, with their newlines.
 pub fn event_feed_budget(events_limit: u32) -> usize {
-    (events_limit as usize + 1)
-        .saturating_mul(MAX_EVENT_LINE_BYTES)
+    (events_limit as usize)
+        .saturating_add(1)
+        .saturating_mul(MAX_EVENT_LINE_BYTES + 1)
         .saturating_add(EVENT_FEED_SLACK_BYTES)
 }
 
 /// Splits an events feed into lines. The homeserver answers a `limit` request
 /// with at most `limit` events and a final `cursor:` line, so more lines than
 /// that mean the homeserver ignored the request. Truncating would drop the
-/// cursor line and replay the same feed forever, so the feed is refused.
+/// cursor line and replay the same feed forever, so the feed is refused, and so
+/// is a line longer than [MAX_EVENT_LINE_BYTES].
 pub fn event_lines(text: &str, events_limit: u32) -> Result<Vec<String>, EventProcessorError> {
-    let max_lines = events_limit as usize + 1;
+    let max_lines = (events_limit as usize).saturating_add(1);
     let mut lines = Vec::new();
     for line in text.trim().lines() {
         if lines.len() == max_lines {
             return Err(EventProcessorError::InvalidEventLine(format!(
                 "events feed has more than {max_lines} lines for a limit of {events_limit}"
+            )));
+        }
+        if line.len() > MAX_EVENT_LINE_BYTES {
+            return Err(EventProcessorError::InvalidEventLine(format!(
+                "events feed has a line of {} bytes, over the {MAX_EVENT_LINE_BYTES} byte limit",
+                line.len()
             )));
         }
         lines.push(line.to_string());
@@ -271,12 +280,36 @@ mod tests {
     }
 
     #[test]
-    fn the_feed_budget_scales_with_the_limit_and_cannot_overflow() {
-        assert_eq!(
-            event_feed_budget(50),
-            51 * MAX_EVENT_LINE_BYTES + EVENT_FEED_SLACK_BYTES
+    fn a_full_page_of_longest_lines_fits_the_budget_and_parses() {
+        let limit = 1000;
+        let path = "p".repeat(MAX_EVENT_LINE_BYTES - "PUT pubky://".len() - 52 - 1);
+        let line = format!("PUT pubky://{}/{path}", "k".repeat(52));
+        assert_eq!(line.len(), MAX_EVENT_LINE_BYTES);
+        let mut feed = vec![line; limit as usize];
+        feed.push("cursor: 123456".to_string());
+        let body = feed.join("\n");
+        assert!(
+            body.len() <= event_feed_budget(limit),
+            "{} > {}",
+            body.len(),
+            event_feed_budget(limit)
         );
+        assert_eq!(event_lines(&body, limit).unwrap().len(), limit as usize + 1);
+    }
+
+    #[test]
+    fn the_feed_budget_cannot_overflow() {
         assert!(event_feed_budget(u32::MAX) > event_feed_budget(1000));
+        assert!(event_lines("PUT pubky://a/pub/x", u32::MAX).is_ok());
+    }
+
+    #[test]
+    fn a_line_over_the_limit_is_refused() {
+        let long = format!("PUT pubky://a/{}", "p".repeat(MAX_EVENT_LINE_BYTES));
+        assert!(matches!(
+            event_lines(&long, 10),
+            Err(EventProcessorError::InvalidEventLine(_))
+        ));
     }
 
     #[test]
