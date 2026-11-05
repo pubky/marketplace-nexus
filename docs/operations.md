@@ -37,11 +37,16 @@ and every query string the API receives.
 - Public list endpoints serve at most 1,000 items per request, whatever `limit`,
   `limit_tags` or `limit_taggers` a caller sends.
 - Static files (`/static/files/...`, avatars) are always served with
-  `X-Content-Type-Options: nosniff`. A file whose publisher-declared type can run
-  script (HTML, XHTML, SVG and other XML types) also carries
+  `X-Content-Type-Options: nosniff`. Images (SVG excluded), video, audio, PDF,
+  plain text and JSON are served inline. Any other declared type, including HTML,
+  XHTML, SVG and other XML types, also carries
   `Content-Security-Policy: default-src 'none'; sandbox` and
   `Content-Disposition: attachment`, so it downloads instead of rendering on the
-  API origin. Images embed as before.
+  API origin. A type that is missing, empty, repeated or malformed is replaced by
+  `application/octet-stream` and treated the same way.
+- Restoring a released seller's listings pages their listings directory with a
+  budget of 10,000 listings and 5 minutes, and refuses a homeserver whose page
+  does not advance its cursor.
 - 500 responses carry a generic message; the cause is in the server log.
 - Debug-level startup logs print the Neo4j password as `<redacted>`.
 

@@ -239,3 +239,34 @@ async fn test_static_serving_pdf_stays_inline_but_is_not_sniffed() -> Result<()>
     assert!(res.header("content-disposition").is_none());
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn test_static_serving_publisher_empty_type_is_a_sandboxed_download() -> Result<()> {
+    let client = httpc_test::new_client(host_url().await)?;
+    let file = index_published_file(
+        "2ZKSEC000EMPT",
+        "page.html",
+        "",
+        b"<script>alert(1)</script>",
+    )
+    .await?;
+
+    let res = client
+        .do_get(&format!(
+            "/static/files/{ACTIVE_FILE_USER}/{}/main",
+            file.id
+        ))
+        .await?;
+    remove_published_file(&file).await?;
+
+    assert_eq!(res.status(), 200);
+    let header = |name: &str| res.header(name).unwrap_or_default();
+    assert_eq!(header("content-type"), "application/octet-stream");
+    assert_eq!(header("x-content-type-options"), "nosniff");
+    assert_eq!(
+        header("content-security-policy"),
+        "default-src 'none'; sandbox"
+    );
+    assert_eq!(header("content-disposition"), "attachment");
+    Ok(())
+}

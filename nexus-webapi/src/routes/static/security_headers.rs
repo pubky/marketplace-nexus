@@ -3,8 +3,9 @@
 //! A publisher chooses the `content_type` of a file record and nexus stores the
 //! blob verbatim, so the main variant can be HTML, XHTML or SVG. Served inline
 //! from the API origin, such a document would run with that origin's browser
-//! authority. Every static response therefore carries `nosniff`, and responses
-//! whose type can execute script are sandboxed and offered as a download.
+//! authority. Every static response therefore carries `nosniff`, and a response
+//! whose type is not known to be inert (or cannot be classified) is sandboxed
+//! and offered as a download.
 
 use axum::{
     extract::Request,
@@ -21,25 +22,41 @@ const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-ty
 /// No script, no embedded resources, an opaque origin and no top-level navigation.
 const ACTIVE_CONTENT_POLICY: &str = "default-src 'none'; sandbox";
 
-/// True when a browser would run script from a document of this media type.
-pub fn is_active_content_type(content_type: &str) -> bool {
+/// The `type/subtype` of a single, well-formed media type, lowercased.
+fn media_type_essence(content_type: &str) -> Option<String> {
+    if content_type.contains(',') {
+        return None;
+    }
     let essence = content_type
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    matches!(
-        essence.as_str(),
-        "text/html"
-            | "application/xhtml+xml"
-            | "image/svg+xml"
-            | "text/xml"
-            | "application/xml"
-            | "text/xsl"
-            | "application/xslt+xml"
-            | "text/cache-manifest"
-    ) || essence.ends_with("+xml")
+    let (kind, subtype) = essence.split_once('/')?;
+    let is_token = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    (is_token(kind) && is_token(subtype)).then_some(essence)
+}
+
+/// True when a browser may render a document of this media type inline without
+/// giving it script. Anything unrecognised, malformed or ambiguous is not.
+pub fn is_inline_safe(content_type: &str) -> bool {
+    let Some(essence) = media_type_essence(content_type) else {
+        return false;
+    };
+    let (kind, subtype) = essence.split_once('/').unwrap_or_default();
+    match kind {
+        "image" => !subtype.ends_with("+xml"),
+        "video" | "audio" => true,
+        "application" => matches!(subtype, "pdf" | "octet-stream" | "json"),
+        "text" => subtype == "plain",
+        _ => false,
+    }
 }
 
 /// Content-Disposition for a download of `name`. A publisher-controlled name may
@@ -98,25 +115,58 @@ fn percent_encode_attr_chars(value: &str) -> String {
     out
 }
 
+/// What a response declares about its own type.
+enum DeclaredType {
+    Missing,
+    /// Empty, repeated, comma-joined or otherwise not a single `type/subtype`.
+    Unclassifiable,
+    Media(String),
+}
+
+fn declared_type(headers: &axum::http::HeaderMap) -> DeclaredType {
+    let mut values = headers.get_all(CONTENT_TYPE).iter();
+    match (values.next(), values.next()) {
+        (None, _) => DeclaredType::Missing,
+        (Some(value), None) => match value.to_str() {
+            Ok(text) if media_type_essence(text).is_some() => DeclaredType::Media(text.to_string()),
+            _ => DeclaredType::Unclassifiable,
+        },
+        (Some(_), Some(_)) => DeclaredType::Unclassifiable,
+    }
+}
+
 /// Applies the hardening headers to every response of the static routes.
+///
+/// A successful response whose declared type is not known to be inert is
+/// sandboxed and offered as a download. A type that is absent, empty,
+/// repeated or malformed cannot be classified, so it is replaced by
+/// `application/octet-stream` instead of being left to the browser's guess.
 pub async fn static_security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
+    let success = response.status().is_success();
+    let declared = declared_type(response.headers());
     let headers = response.headers_mut();
 
     headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 
-    let active = headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(is_active_content_type);
-    if active {
-        headers.insert(
-            CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(ACTIVE_CONTENT_POLICY),
-        );
-        if !headers.contains_key(CONTENT_DISPOSITION) {
-            headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
+    match declared {
+        DeclaredType::Missing if !success => return response,
+        DeclaredType::Media(content_type) if is_inline_safe(&content_type) => return response,
+        DeclaredType::Missing | DeclaredType::Unclassifiable => {
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
         }
+        DeclaredType::Media(_) => {}
+    }
+
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(ACTIVE_CONTENT_POLICY),
+    );
+    if !headers.contains_key(CONTENT_DISPOSITION) {
+        headers.insert(CONTENT_DISPOSITION, HeaderValue::from_static("attachment"));
     }
     response
 }
@@ -208,6 +258,142 @@ mod tests {
                 headers["x-content-type-options"], "nosniff",
                 "{content_type}"
             );
+            assert!(
+                !headers.contains_key(CONTENT_SECURITY_POLICY),
+                "{content_type}"
+            );
+            assert!(!headers.contains_key(CONTENT_DISPOSITION), "{content_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_types_are_not_rendered_inline() {
+        for content_type in [
+            "text/css",
+            "text/javascript",
+            "application/zip",
+            "font/woff2",
+            "model/gltf+json",
+            "multipart/form-data",
+        ] {
+            let response = fetch(app(content_type, None)).await;
+            let headers = response.headers();
+            assert_eq!(
+                headers[CONTENT_SECURITY_POLICY], ACTIVE_CONTENT_POLICY,
+                "{content_type}"
+            );
+            assert_eq!(headers[CONTENT_DISPOSITION], "attachment", "{content_type}");
+            assert_eq!(headers[CONTENT_TYPE], content_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_malformed_type_becomes_a_sandboxed_download() {
+        for content_type in [
+            "",
+            " ",
+            "text/html, text/plain",
+            "html",
+            "text/",
+            "/html",
+            "a b/c",
+        ] {
+            let response = fetch(app(content_type, None)).await;
+            let headers = response.headers();
+            assert_eq!(
+                headers[CONTENT_TYPE], "application/octet-stream",
+                "{content_type:?}"
+            );
+            assert_eq!(
+                headers[CONTENT_SECURITY_POLICY], ACTIVE_CONTENT_POLICY,
+                "{content_type:?}"
+            );
+            assert_eq!(
+                headers[CONTENT_DISPOSITION], "attachment",
+                "{content_type:?}"
+            );
+            assert_eq!(headers["x-content-type-options"], "nosniff");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repeated_type_header_becomes_a_sandboxed_download() {
+        let app = Router::new()
+            .route(
+                "/file",
+                get(|| async {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "image/png")
+                        .header(CONTENT_TYPE, "text/html")
+                        .body(Body::from("x"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(static_security_headers));
+        let response = fetch(app).await;
+        let headers = response.headers();
+        assert_eq!(headers.get_all(CONTENT_TYPE).iter().count(), 1);
+        assert_eq!(headers[CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(headers[CONTENT_SECURITY_POLICY], ACTIVE_CONTENT_POLICY);
+    }
+
+    #[tokio::test]
+    async fn a_successful_response_with_no_type_becomes_a_sandboxed_download() {
+        let app = Router::new()
+            .route(
+                "/file",
+                get(|| async { Response::new(Body::from("<script>alert(1)</script>")) }),
+            )
+            .layer(axum::middleware::from_fn(static_security_headers));
+        let response = fetch(app).await;
+        let headers = response.headers();
+        assert_eq!(headers[CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(headers[CONTENT_SECURITY_POLICY], ACTIVE_CONTENT_POLICY);
+        assert_eq!(headers[CONTENT_DISPOSITION], "attachment");
+    }
+
+    #[tokio::test]
+    async fn a_partial_content_response_is_hardened_like_a_full_one() {
+        let app = Router::new()
+            .route(
+                "/file",
+                get(|| async {
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(CONTENT_TYPE, "text/html")
+                        .body(Body::from("<scr"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(static_security_headers));
+        let response = fetch(app).await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[CONTENT_SECURITY_POLICY],
+            ACTIVE_CONTENT_POLICY
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_without_a_type_only_gains_nosniff() {
+        let app = Router::new()
+            .route(
+                "/file",
+                get(|| async { axum::response::Redirect::permanent("/elsewhere") }),
+            )
+            .layer(axum::middleware::from_fn(static_security_headers));
+        let response = fetch(app).await;
+        let headers = response.headers();
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert!(!headers.contains_key(CONTENT_TYPE));
+        assert!(!headers.contains_key(CONTENT_SECURITY_POLICY));
+    }
+
+    #[tokio::test]
+    async fn plain_text_and_json_stay_inline() {
+        for content_type in ["text/plain; charset=utf-8", "application/json"] {
+            let response = fetch(app(content_type, None)).await;
+            let headers = response.headers();
             assert!(
                 !headers.contains_key(CONTENT_SECURITY_POLICY),
                 "{content_type}"
