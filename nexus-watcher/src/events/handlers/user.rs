@@ -1,5 +1,6 @@
 use super::listing::{self, is_homeserver_not_found, ModerationChecks};
 use super::{review, shop};
+use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use crate::events::EventProcessorError;
 
 use nexus_common::db::queries::get::user_is_safe_to_delete;
@@ -249,17 +250,7 @@ async fn restore_from_homeserver(user_id: &PubkyId) -> Result<(), EventProcessor
 /// other failure is an error: an unreachable homeserver never reads as a
 /// deleted record.
 async fn fetch_record(uri: &str) -> Result<Option<Vec<u8>>, EventProcessorError> {
-    let pubky = PubkyConnector::get()?;
-    let response = match pubky.public_storage().get(uri).await {
-        Ok(response) => response,
-        Err(e) if is_homeserver_not_found(&e) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let blob = response
-        .bytes()
-        .await
-        .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
-    Ok(Some(blob.to_vec()))
+    fetch_record_capped(uri, MAX_RECORD_BYTES).await
 }
 
 /// The ids of every listing record in the user's listings directory on their

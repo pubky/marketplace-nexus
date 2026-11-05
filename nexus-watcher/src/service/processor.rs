@@ -1,6 +1,7 @@
 use nexus_common::models::event::{Event, EventProcessorError};
 
 use crate::events::handle;
+use crate::events::remote_body::{event_feed_budget, event_lines, read_capped, within};
 use crate::events::retry::event::RetryEvent;
 use crate::events::Moderation;
 use crate::service::traits::TEventProcessor;
@@ -80,7 +81,9 @@ impl EventProcessor {
             // timeout (an hour, sized for large batch processing), starving
             // every other homeserver's processor in the meantime. Observed in
             // production on 2026-08-21: the watcher went silent for 70 minutes
-            // on unreachable homeservers.
+            // on unreachable homeservers. The body is read against a byte budget
+            // sized from the requested limit, so a homeserver that ignores the
+            // limit cannot make the watcher buffer an unbounded feed.
             let fetch = async {
                 let response = pubky
                     .client()
@@ -89,18 +92,16 @@ impl EventProcessor {
                     .await
                     .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
 
-                response
-                    .text()
-                    .await
-                    .map_err(|e| EventProcessorError::client_error(e.to_string()))
+                let body =
+                    read_capped(response, event_feed_budget(self.limit), "Events feed").await?;
+                Ok(String::from_utf8_lossy(&body).into_owned())
             };
-            tokio::time::timeout(std::time::Duration::from_secs(POLL_TIMEOUT_SECS), fetch)
-                .await
-                .map_err(|_| {
-                    EventProcessorError::client_error(format!(
-                        "events poll timed out after {POLL_TIMEOUT_SECS}s"
-                    ))
-                })??
+            within(
+                std::time::Duration::from_secs(POLL_TIMEOUT_SECS),
+                "events poll",
+                fetch,
+            )
+            .await?
         };
 
         if Self::defer_rate_limited_feed(
@@ -111,7 +112,7 @@ impl EventProcessor {
             return Ok(None);
         }
 
-        let lines: Vec<String> = response_text.trim().lines().map(String::from).collect();
+        let lines = event_lines(&response_text, self.limit)?;
         debug!("Homeserver response lines {:?}", lines);
 
         if lines.is_empty() || (lines.len() == 1 && lines[0].is_empty()) {

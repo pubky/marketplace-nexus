@@ -3210,6 +3210,7 @@ dependencies = [
  "pubky-app-specs",
  "pubky-testnet",
  "rand 0.10.0",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
