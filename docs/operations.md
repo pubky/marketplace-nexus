@@ -158,7 +158,11 @@ A request that waits 30 seconds for a conversion slot is answered `503` with
 (the file is not a decodable image, is over the size limit, or makes ImageMagick
 fail or time out) is remembered for an hour per stored original, up to 4,096
 entries, so the same request does not start the work again; a re-published
-original (different length or modification time) is tried afresh. Writing a new
+original (a different file, so a different inode, length or modification time)
+is tried afresh. A process killed by a signal, a timeout after a shortened
+budget (the request spent most of it waiting for a slot) and a slot wait are not
+remembered. A variant built from an original that was replaced while it
+converted is discarded. Writing a new
 `main` file removes the `small` and `feed` variants built from the previous one.
 The remembered failures live in memory and are lost on restart. Error responses
 carry no ImageMagick output or file paths.

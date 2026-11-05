@@ -58,27 +58,44 @@ static CONVERSION_SLOTS: LazyLock<Arc<Semaphore>> =
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Output paths of the conversions started, for tests.
+#[cfg(test)]
+static CONVERSIONS_STARTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// How long a variant that could not be made is not tried again.
 const FAILURE_TTL: Duration = Duration::from_secs(3600);
 
 /// Failures remembered at once; beyond it new failures are simply retried on demand.
 const MAX_REMEMBERED_FAILURES: usize = 4096;
 
-/// What identifies the stored original a failure was recorded for. A re-published file has a
-/// different length or modification time, so its failure no longer applies.
+/// What identifies one stored original: a re-published file is written aside and renamed into
+/// place, so it has a different inode, and normally a different length or modification time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OriginStamp {
     len: u64,
     modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64),
 }
 
 impl OriginStamp {
-    async fn of(path: &str) -> Option<Self> {
-        let metadata = fs::metadata(path).await.ok()?;
-        Some(Self {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (metadata.dev(), metadata.ino())
+        };
+        Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
-        })
+            #[cfg(unix)]
+            identity,
+        }
+    }
+
+    async fn of(path: &str) -> Option<Self> {
+        let metadata = fs::metadata(path).await.ok()?;
+        Some(Self::from_metadata(&metadata))
     }
 }
 
@@ -274,14 +291,31 @@ impl VariantProcessor for ImageProcessor {
         output_file_path: &str,
         options: &ImageOptions,
     ) -> Result<String, MediaProcessorError> {
-        let origin_stamp = OriginStamp::of(origin_file_path).await;
-        if let Some(stamp) = origin_stamp {
+        Self::process_within(
+            origin_file_path,
+            output_file_path,
+            options,
+            IMAGE_CONVERSION_TIMEOUT,
+        )
+        .await
+    }
+}
+
+impl ImageProcessor {
+    /// [`VariantProcessor::process`] with the wall-clock budget as a parameter.
+    async fn process_within(
+        origin_file_path: &str,
+        output_file_path: &str,
+        options: &ImageOptions,
+        budget: Duration,
+    ) -> Result<String, MediaProcessorError> {
+        if let Some(stamp) = OriginStamp::of(origin_file_path).await {
             if let Some(failure) = known_failure_for(output_file_path, stamp) {
                 return Err(failure.error());
             }
         }
 
-        let deadline = Instant::now() + IMAGE_CONVERSION_TIMEOUT;
+        let deadline = Instant::now() + budget;
         let slot = timeout_at(deadline, CONVERSION_SLOTS.clone().acquire_owned())
             .await
             .map_err(|_| MediaProcessorError::Busy)?
@@ -292,7 +326,7 @@ impl VariantProcessor for ImageProcessor {
             return Ok(String::new());
         }
         // Opened only once a slot is held, so waiting requests hold no file.
-        let (input, input_format) = match Self::open_input(origin_file_path).await {
+        let (input, input_format, origin_stamp) = match Self::open_input(origin_file_path).await {
             Ok(opened) => opened,
             Err(error) => {
                 let failure = match &error {
@@ -307,8 +341,10 @@ impl VariantProcessor for ImageProcessor {
                     }
                     _ => None,
                 };
-                if let Some(failure) = failure {
-                    remember_failure(output_file_path, origin_stamp, failure);
+                if let (Some(failure), Some(stamp)) =
+                    (failure, OriginStamp::of(origin_file_path).await)
+                {
+                    remember_failure(output_file_path, Some(stamp), failure);
                 }
                 return Err(error);
             }
@@ -317,11 +353,13 @@ impl VariantProcessor for ImageProcessor {
         let conversion = Conversion {
             input,
             input_format,
+            origin_file_path: origin_file_path.to_string(),
             output_file_path: output_file_path.to_string(),
             width: options.width.clone(),
             format: options.format.clone(),
             deadline,
-            origin_stamp,
+            budget: deadline.saturating_duration_since(Instant::now()),
+            origin_stamp: Some(origin_stamp),
         };
         // Runs to completion even when the request that started it goes away, so the child is
         // always reaped and its files removed, and the slot is held for as long as it runs.
@@ -341,15 +379,16 @@ impl ImageProcessor {
     /// replaces the path afterwards does not change these bytes.
     async fn open_input(
         file_path: &str,
-    ) -> Result<(std::fs::File, ImageInputFormat), MediaProcessorError> {
+    ) -> Result<(std::fs::File, ImageInputFormat, OriginStamp), MediaProcessorError> {
         let mut file = fs::File::open(file_path)
             .await
             .map_err(MediaProcessorError::command_failed)?;
-        let size = file
+        let metadata = file
             .metadata()
             .await
-            .map_err(MediaProcessorError::command_failed)?
-            .len();
+            .map_err(MediaProcessorError::command_failed)?;
+        let stamp = OriginStamp::from_metadata(&metadata);
+        let size = metadata.len();
         if size > MAX_IMAGE_INPUT_BYTES {
             return Err(MediaProcessorError::InputTooLarge {
                 size,
@@ -375,7 +414,7 @@ impl ImageProcessor {
         file.seek(SeekFrom::Start(0))
             .await
             .map_err(MediaProcessorError::command_failed)?;
-        Ok((file.into_std().await, format))
+        Ok((file.into_std().await, format, stamp))
     }
 }
 
@@ -384,10 +423,14 @@ impl ImageProcessor {
 struct Conversion {
     input: std::fs::File,
     input_format: ImageInputFormat,
+    origin_file_path: String,
     output_file_path: String,
     width: String,
     format: String,
     deadline: Instant,
+    /// What was left of the request's budget when the conversion started: a timeout after a
+    /// short budget says nothing about the file.
+    budget: Duration,
     origin_stamp: Option<OriginStamp>,
 }
 
@@ -407,10 +450,30 @@ impl Conversion {
         ));
 
         self.convert(scratch.path(), &temp_output.0).await?;
+        // A variant built from an original that was replaced meanwhile must not be installed:
+        // the check runs before and after the rename, so a replacement landing between them
+        // still removes the stale variant again.
+        self.ensure_origin_unchanged().await?;
         fs::rename(&temp_output.0, &self.output_file_path)
             .await
             .map_err(MediaProcessorError::command_failed)?;
+        if let Err(error) = self.ensure_origin_unchanged().await {
+            let _ = fs::remove_file(&self.output_file_path).await;
+            return Err(error);
+        }
         Ok(String::new())
+    }
+
+    async fn ensure_origin_unchanged(&self) -> Result<(), MediaProcessorError> {
+        let Some(expected) = self.origin_stamp else {
+            return Ok(());
+        };
+        if OriginStamp::of(&self.origin_file_path).await == Some(expected) {
+            return Ok(());
+        }
+        Err(MediaProcessorError::command_failed(
+            "the original changed during the conversion",
+        ))
     }
 
     async fn convert(
@@ -422,6 +485,12 @@ impl Conversion {
             .input
             .try_clone()
             .map_err(MediaProcessorError::command_failed)?;
+
+        #[cfg(test)]
+        CONVERSIONS_STARTED
+            .lock()
+            .unwrap()
+            .push(self.output_file_path.clone());
 
         let mut command = Command::new("convert");
         for (resource, value) in IMAGEMAGICK_LIMITS {
@@ -458,25 +527,31 @@ impl Conversion {
 
         let result = match finished {
             Ok(Ok((status, _))) if status.success() => return Ok(()),
-            Ok(Ok((_, message))) => {
+            Ok(Ok((status, message))) => {
                 let message = format!(
                     "ImageMagick command failed: {}",
                     String::from_utf8_lossy(&message)
                 );
-                remember_failure(
-                    &self.output_file_path,
-                    self.origin_stamp,
-                    KnownFailure::CommandFailed(message.clone()),
-                );
+                // An exit code is ImageMagick's verdict on these bytes under fixed limits. A
+                // process ended by a signal (an OOM kill, an operator) says nothing about them.
+                if status.code().is_some() {
+                    remember_failure(
+                        &self.output_file_path,
+                        self.origin_stamp,
+                        KnownFailure::CommandFailed(message.clone()),
+                    );
+                }
                 return Err(MediaProcessorError::command_failed(message));
             }
             Ok(Err(e)) => Err(MediaProcessorError::command_failed(e)),
             Err(_) => {
-                remember_failure(
-                    &self.output_file_path,
-                    self.origin_stamp,
-                    KnownFailure::TimedOut,
-                );
+                if self.budget >= IMAGE_CONVERSION_TIMEOUT / 2 {
+                    remember_failure(
+                        &self.output_file_path,
+                        self.origin_stamp,
+                        KnownFailure::TimedOut,
+                    );
+                }
                 Err(MediaProcessorError::TimedOut)
             }
         };
@@ -608,6 +683,8 @@ mod tests {
         OriginStamp {
             len,
             modified: None,
+            #[cfg(unix)]
+            identity: (0, 0),
         }
     }
 
@@ -677,6 +754,27 @@ mod tests {
             "the failure must be remembered"
         );
         assert!(!output.exists());
+        let started = |output: &Path| {
+            CONVERSIONS_STARTED
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.as_str() == path_str(output))
+                .count()
+        };
+        assert_eq!(started(&output), 1);
+
+        let second =
+            ImageProcessor::process(path_str(&origin), path_str(&output), &small_options()).await;
+        assert!(
+            matches!(second, Err(MediaProcessorError::CommandFailed { .. })),
+            "{second:?}"
+        );
+        assert_eq!(
+            started(&output),
+            1,
+            "the repeat must not start a conversion"
+        );
 
         // A different original (here a different length) is tried afresh.
         std::fs::write(&origin, b"short").unwrap();
@@ -694,6 +792,122 @@ mod tests {
             .await
             .expect("a republished valid image must convert");
         assert!(output.exists());
+    }
+
+    #[tokio::test]
+    async fn a_request_that_finds_no_free_slot_in_time_is_busy_and_remembers_nothing() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(
+            dir.path(),
+            "png",
+            &["-size", "64x48", "gradient:white-black"],
+        )
+        .await;
+        let output = dir.path().join("small");
+
+        let held = CONVERSION_SLOTS
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_CONVERSIONS as u32)
+            .await
+            .unwrap();
+        let result = ImageProcessor::process_within(
+            path_str(&source),
+            path_str(&output),
+            &small_options(),
+            Duration::from_millis(100),
+        )
+        .await;
+        drop(held);
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::Busy)),
+            "{result:?}"
+        );
+        let stamp = OriginStamp::of(path_str(&source)).await.unwrap();
+        assert!(known_failure_for(path_str(&output), stamp).is_none());
+        ImageProcessor::process(path_str(&source), path_str(&output), &small_options())
+            .await
+            .expect("the same request succeeds once a slot is free");
+    }
+
+    #[tokio::test]
+    async fn a_variant_built_from_a_replaced_original_is_not_installed() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let origin = make_source(
+            dir.path(),
+            "png",
+            &["-size", "64x48", "gradient:white-black"],
+        )
+        .await;
+        let output = dir.path().join("small");
+        let (input, input_format, stamp) =
+            ImageProcessor::open_input(path_str(&origin)).await.unwrap();
+        let conversion = Conversion {
+            input,
+            input_format,
+            origin_file_path: path_str(&origin).to_string(),
+            output_file_path: path_str(&output).to_string(),
+            width: SMALL_IMAGE_WIDTH.to_string(),
+            format: IMAGE_FORMAT.to_string(),
+            deadline: tokio::time::Instant::now() + IMAGE_CONVERSION_TIMEOUT,
+            budget: IMAGE_CONVERSION_TIMEOUT,
+            origin_stamp: Some(stamp),
+        };
+
+        // Re-publishing writes aside and renames into place, like Blob::put_to_static.
+        let replacement = dir.path().join("main.tmp");
+        std::fs::copy(&origin, &replacement).unwrap();
+        std::fs::rename(&replacement, &origin).unwrap();
+
+        let result = conversion.run().await;
+        assert!(result.is_err(), "{result:?}");
+        assert!(!output.exists(), "a stale variant was installed");
+        assert_eq!(entries(dir.path()), vec!["png".to_string()]);
+        assert!(known_failure_for(path_str(&output), stamp).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_remembered_only_when_the_conversion_had_its_full_budget() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let origin = make_source(
+            dir.path(),
+            "png",
+            &["-size", "4000x3000", "gradient:red-blue"],
+        )
+        .await;
+
+        for (name, budget, remembered) in [
+            ("short", Duration::from_millis(50), false),
+            ("full", IMAGE_CONVERSION_TIMEOUT, true),
+        ] {
+            let output = dir.path().join(name);
+            let (input, input_format, stamp) =
+                ImageProcessor::open_input(path_str(&origin)).await.unwrap();
+            let conversion = Conversion {
+                input,
+                input_format,
+                origin_file_path: path_str(&origin).to_string(),
+                output_file_path: path_str(&output).to_string(),
+                width: FEED_IMAGE_WIDTH.to_string(),
+                format: IMAGE_FORMAT.to_string(),
+                deadline: tokio::time::Instant::now() + Duration::from_millis(50),
+                budget,
+                origin_stamp: Some(stamp),
+            };
+            let result = conversion.run().await;
+            assert!(
+                matches!(result, Err(MediaProcessorError::TimedOut)),
+                "{name}: {result:?}"
+            );
+            assert_eq!(
+                known_failure_for(path_str(&output), stamp).is_some(),
+                remembered,
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -929,15 +1143,17 @@ mod tests {
         )
         .await;
         let output = dir.path().join("feed");
-        let (input, input_format) = ImageProcessor::open_input(path_str(&source)).await.unwrap();
+        let (input, input_format, _) = ImageProcessor::open_input(path_str(&source)).await.unwrap();
 
         let conversion = Conversion {
             input,
             input_format,
+            origin_file_path: path_str(&source).to_string(),
             output_file_path: path_str(&output).to_string(),
             width: FEED_IMAGE_WIDTH.to_string(),
             format: IMAGE_FORMAT.to_string(),
             deadline: tokio::time::Instant::now() + Duration::from_millis(50),
+            budget: IMAGE_CONVERSION_TIMEOUT,
             origin_stamp: None,
         };
         let started = Instant::now();
