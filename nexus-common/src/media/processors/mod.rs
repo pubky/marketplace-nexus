@@ -34,6 +34,12 @@ pub enum MediaProcessorError {
     UnsupportedInputFormat,
     #[error("TimedOut: media processing did not finish in time")]
     TimedOut,
+    #[error("Busy: no conversion slot became free in time")]
+    Busy,
+    #[error("ConversionFailed: {0}")]
+    ConversionFailed(String),
+    #[error("RecentlyFailed: this variant failed recently and is not retried yet")]
+    RecentlyFailed,
 }
 
 impl MediaProcessorError {
@@ -42,6 +48,23 @@ impl MediaProcessorError {
             source: source.into(),
         }
     }
+
+    /// Whether the stored file itself caused this failure, so trying again soon cannot help.
+    pub fn is_caused_by_file(&self) -> bool {
+        matches!(
+            self,
+            Self::ConversionFailed(_)
+                | Self::TimedOut
+                | Self::InputTooLarge { .. }
+                | Self::UnsupportedInputFormat
+        )
+    }
+}
+
+/// The failure marker of a variant, given the variant's file name or path: an empty file next to
+/// the variant, whose modified time says when the variant last failed.
+pub(crate) fn failed_variant_marker(variant: &str) -> String {
+    format!("{variant}.failed")
 }
 
 #[async_trait]

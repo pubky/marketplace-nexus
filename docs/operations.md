@@ -115,11 +115,16 @@ attestor publishes it again.
 `small` and `feed` image variants are made only from JPEG, PNG, GIF and WebP
 originals of at most 32 MiB, identified by their leading bytes and decoded with
 that format's decoder. Other image types (SVG among them) have only `main`, and
-the avatar route answers 404 for them. A conversion has
-30 seconds, at most two run at once, and each runs with ImageMagick limits of
-256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per side and 256 frames.
-File blobs larger than the specs' blob limit (100 MiB) are refused while they
-download.
+the avatar route answers 404 for them. At most two conversions run at once. A
+request waits up to 20 seconds for a free conversion slot and otherwise gets a
+503 with `Retry-After`. A conversion then has 30 seconds and runs with
+ImageMagick limits of 256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per
+side and 256 frames. File blobs larger than the specs' blob limit (100 MiB) are
+refused while they download.
+
+A variant that cannot be built is recorded in a `<variant>.failed` file next to
+it and retried after an hour or when the file is re-published. Re-publishing a
+file removes its existing variants, which are rebuilt on the next request.
 
 The runtime image (`Dockerfile`) installs only the JPEG and WebP coder packages
 on top of the base ImageMagick, replaces the system ImageMagick policy with

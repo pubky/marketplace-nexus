@@ -1,12 +1,13 @@
 use crate::{
     media::{
-        processors::{ImageProcessor, VariantProcessor, VideoProcessor},
+        processors::{failed_variant_marker, ImageProcessor, VariantProcessor, VideoProcessor},
         FileVariant, VariantController,
     },
     models::error::{ModelError, ModelResult},
 };
 use pubky_app_specs::PubkyAppBlob;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{
     fs::{self, OpenOptions},
@@ -55,6 +56,25 @@ impl Blob {
         }
         written?;
 
+        if name == FileVariant::Main.to_string() {
+            Self::remove_built_from_previous_main(&files_path).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Removes the variants and failure markers of the previous main file; variants are rebuilt
+    /// on the next request. Called once the new main is in place, so a rebuild reads the new file.
+    async fn remove_built_from_previous_main(files_path: &Path) -> std::io::Result<()> {
+        for variant in [FileVariant::Small, FileVariant::Feed] {
+            let variant = variant.to_string();
+            for built in [failed_variant_marker(&variant), variant] {
+                match fs::remove_file(files_path.join(built)).await {
+                    Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
+        }
         Ok(())
     }
 
@@ -186,5 +206,55 @@ mod tests {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
         assert_eq!(names, vec!["main".to_string()]);
+    }
+
+    /// Creates a file directory holding a main file, both variants and both failure markers.
+    async fn file_dir_with_variants(tmp_dir: &tempfile::TempDir) -> PathBuf {
+        let files_path = tmp_dir.path().join("user1").join("file1");
+        fs::create_dir_all(&files_path).await.unwrap();
+        for name in ["main", "small", "feed", "small.failed", "feed.failed"] {
+            fs::write(files_path.join(name), b"old").await.unwrap();
+        }
+        files_path
+    }
+
+    async fn sorted_names(files_path: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut dir = fs::read_dir(files_path).await.unwrap();
+        while let Some(entry) = dir.next_entry().await.unwrap() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        names
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn writing_main_removes_existing_variants_and_markers() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let files_path = file_dir_with_variants(&tmp_dir).await;
+        let blob = PubkyAppBlob::new(b"new".to_vec());
+
+        Blob::put_to_static("main".to_string(), files_path.clone(), &blob)
+            .await
+            .expect("put_to_static failed");
+
+        assert_eq!(sorted_names(&files_path).await, vec!["main".to_string()]);
+        assert_eq!(fs::read(files_path.join("main")).await.unwrap(), b"new");
+    }
+
+    #[tokio_shared_rt::test(shared)]
+    async fn writing_another_name_removes_nothing() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let files_path = file_dir_with_variants(&tmp_dir).await;
+        let blob = PubkyAppBlob::new(b"new".to_vec());
+
+        Blob::put_to_static("small".to_string(), files_path.clone(), &blob)
+            .await
+            .expect("put_to_static failed");
+
+        assert_eq!(
+            sorted_names(&files_path).await,
+            ["feed", "feed.failed", "main", "small", "small.failed"]
+        );
     }
 }

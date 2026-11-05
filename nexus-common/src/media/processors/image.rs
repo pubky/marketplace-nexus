@@ -1,5 +1,5 @@
 use std::{
-    io::SeekFrom,
+    io::{ErrorKind, SeekFrom},
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -11,14 +11,18 @@ use std::{
 use async_trait::async_trait;
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
     process::Command,
-    sync::Semaphore,
-    time::{timeout_at, Instant},
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+    time::{timeout, timeout_at, Instant},
 };
 
 use crate::{
-    media::{processors::MediaProcessorError, FileVariant},
+    media::{
+        processors::{failed_variant_marker, MediaProcessorError},
+        FileVariant,
+    },
     models::file::FileDetails,
 };
 
@@ -32,8 +36,18 @@ const IMAGE_FORMAT: &str = "webp";
 /// anything larger is not a legitimate image upload.
 pub const MAX_IMAGE_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Wall-clock budget for one conversion, including the wait for a free conversion slot.
+/// How long a request waits for a free conversion slot before it is answered as busy. Together
+/// with [`IMAGE_CONVERSION_TIMEOUT`] this stays under a typical 60 second proxy timeout.
+const SLOT_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Wall-clock budget for one conversion, counted from when it holds a conversion slot.
 pub const IMAGE_CONVERSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a variant that could not be built is left alone before it is tried again.
+const FAILED_VARIANT_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// ImageMagick error output kept per run.
+const MAX_CAPTURED_STDERR_BYTES: u64 = 4 * 1024;
 
 /// ImageMagick processes that may run at once across the whole process.
 const MAX_CONCURRENT_CONVERSIONS: usize = 2;
@@ -164,18 +178,46 @@ impl VariantProcessor for ImageProcessor {
         output_file_path: &str,
         options: &ImageOptions,
     ) -> Result<String, MediaProcessorError> {
-        let deadline = Instant::now() + IMAGE_CONVERSION_TIMEOUT;
-        let slot = timeout_at(deadline, CONVERSION_SLOTS.clone().acquire_owned())
+        Self::process_with_slot_wait(
+            origin_file_path,
+            output_file_path,
+            options,
+            SLOT_WAIT_TIMEOUT,
+        )
+        .await
+    }
+}
+
+impl ImageProcessor {
+    async fn process_with_slot_wait(
+        origin_file_path: &str,
+        output_file_path: &str,
+        options: &ImageOptions,
+        slot_wait: Duration,
+    ) -> Result<String, MediaProcessorError> {
+        let marker = failed_variant_marker(output_file_path);
+        // Requests for a variant that is known to fail do not queue for a slot.
+        if let Some(outcome) = known_outcome(output_file_path, &marker).await {
+            return outcome;
+        }
+
+        let slot = timeout(slot_wait, CONVERSION_SLOTS.clone().acquire_owned())
             .await
-            .map_err(|_| MediaProcessorError::TimedOut)?
+            .map_err(|_| MediaProcessorError::Busy)?
             .map_err(MediaProcessorError::command_failed)?;
 
-        // A concurrent request may have produced this variant while we waited for a slot.
-        if fs::metadata(output_file_path).await.is_ok() {
-            return Ok(String::new());
+        // A concurrent request may have built this variant, or failed to, while we waited.
+        if let Some(outcome) = known_outcome(output_file_path, &marker).await {
+            return outcome;
         }
         // Opened only once a slot is held, so waiting requests hold no file.
-        let (input, input_format) = Self::open_input(origin_file_path).await?;
+        let (input, input_format) = match Self::open_input(origin_file_path).await {
+            Ok(opened) => opened,
+            Err(e) => {
+                record_failure(&marker, &e).await;
+                return Err(e);
+            }
+        };
 
         let conversion = Conversion {
             input,
@@ -183,21 +225,15 @@ impl VariantProcessor for ImageProcessor {
             output_file_path: output_file_path.to_string(),
             width: options.width.clone(),
             format: options.format.clone(),
-            deadline,
+            // Starts with the slot held, so waiting for a slot takes nothing from this budget.
+            deadline: Instant::now() + IMAGE_CONVERSION_TIMEOUT,
         };
-        // Runs to completion even when the request that started it goes away, so the child is
-        // always reaped and its files removed, and the slot is held for as long as it runs.
-        tokio::spawn(async move {
-            let result = conversion.run().await;
-            drop(slot);
-            result
-        })
-        .await
-        .map_err(MediaProcessorError::command_failed)?
+        conversion
+            .spawn(slot)
+            .await
+            .map_err(MediaProcessorError::command_failed)?
     }
-}
 
-impl ImageProcessor {
     /// Opens the stored original, checks its size and identifies its format from its leading
     /// bytes. The returned handle, rewound to the start, is what gets decoded: a re-ingest that
     /// replaces the path afterwards does not change these bytes.
@@ -241,6 +277,63 @@ impl ImageProcessor {
     }
 }
 
+/// What earlier requests already settled for this variant, if anything.
+async fn known_outcome(
+    output_file_path: &str,
+    marker: &str,
+) -> Option<Result<String, MediaProcessorError>> {
+    if fs::metadata(output_file_path).await.is_ok() {
+        return Some(Ok(String::new()));
+    }
+    if marker_is_fresh(marker).await {
+        return Some(Err(MediaProcessorError::RecentlyFailed));
+    }
+    None
+}
+
+async fn marker_is_fresh(marker: &str) -> bool {
+    let Ok(modified) = fs::metadata(marker)
+        .await
+        .and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    // `elapsed` fails for a time in the future, which counts as fresh.
+    modified
+        .elapsed()
+        .map_or(true, |age| age < FAILED_VARIANT_RETRY_AFTER)
+}
+
+/// Writes the variant's failure marker if the file itself caused the failure. A slot-wait timeout
+/// or a host problem says nothing about the file, so it must not hold back a good image.
+async fn record_failure(marker: &str, error: &MediaProcessorError) {
+    if !error.is_caused_by_file() {
+        return;
+    }
+    // Removed first: creating over an empty file may keep its modified time, and a repeat failure
+    // must start a new retry period.
+    let written = match fs::remove_file(marker).await {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+        _ => fs::File::create(marker).await.map(drop),
+    };
+    if let Err(e) = written {
+        tracing::warn!("Could not write the failure marker {marker}: {e}");
+    }
+}
+
+/// Reads a process's error output to its end and returns at most
+/// [`MAX_CAPTURED_STDERR_BYTES`] of it. The rest is read and discarded, so the process can never
+/// block on a full pipe.
+async fn capture_stderr(mut stderr: impl AsyncRead + Unpin) -> Vec<u8> {
+    let mut message = Vec::new();
+    let _ = (&mut stderr)
+        .take(MAX_CAPTURED_STDERR_BYTES)
+        .read_to_end(&mut message)
+        .await;
+    let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+    message
+}
+
 /// One ImageMagick run: decodes `input` with its sniffed decoder and writes the variant next to
 /// `output_file_path`, renaming it into place on success.
 struct Conversion {
@@ -253,6 +346,25 @@ struct Conversion {
 }
 
 impl Conversion {
+    /// Runs as its own task, which continues when the request that started it goes away: the
+    /// child is always reaped, its files removed and its outcome recorded, and the slot is held
+    /// until all of that is done.
+    fn spawn(self, slot: OwnedSemaphorePermit) -> JoinHandle<Result<String, MediaProcessorError>> {
+        let marker = failed_variant_marker(&self.output_file_path);
+        tokio::spawn(async move {
+            let result = self.run().await;
+            match &result {
+                // Best effort: only an expired marker can still be there.
+                Ok(_) => {
+                    let _ = fs::remove_file(&marker).await;
+                }
+                Err(e) => record_failure(&marker, e).await,
+            }
+            drop(slot);
+            result
+        })
+    }
+
     async fn run(self) -> Result<String, MediaProcessorError> {
         // ImageMagick's own temporary files (spilled input, disk pixel cache) go here and are
         // removed with it, including after the process is killed.
@@ -306,13 +418,13 @@ impl Conversion {
         let mut stderr = child.stderr.take();
 
         let finished = timeout_at(self.deadline, async {
-            let mut message = Vec::new();
             let read_stderr = async {
-                if let Some(stderr) = stderr.as_mut() {
-                    let _ = stderr.read_to_end(&mut message).await;
+                match stderr.as_mut() {
+                    Some(stderr) => capture_stderr(stderr).await,
+                    None => Vec::new(),
                 }
             };
-            let (status, ()) = tokio::join!(child.wait(), read_stderr);
+            let (status, message) = tokio::join!(child.wait(), read_stderr);
             status.map(|status| (status, message))
         })
         .await;
@@ -320,10 +432,9 @@ impl Conversion {
         let result = match finished {
             Ok(Ok((status, _))) if status.success() => return Ok(()),
             Ok(Ok((_, message))) => {
-                return Err(MediaProcessorError::command_failed(format!(
-                    "ImageMagick command failed: {}",
-                    String::from_utf8_lossy(&message)
-                )))
+                return Err(MediaProcessorError::ConversionFailed(
+                    String::from_utf8_lossy(&message).into_owned(),
+                ))
             }
             Ok(Err(e)) => Err(MediaProcessorError::command_failed(e)),
             Err(_) => Err(MediaProcessorError::TimedOut),
@@ -424,6 +535,17 @@ mod tests {
             format: IMAGE_FORMAT.to_string(),
             content_type: "image/webp".to_string(),
         }
+    }
+
+    /// A file that is identified as a PNG and that no decoder accepts.
+    const CORRUPT_PNG: &[u8] = b"\x89PNG\r\n\x1a\nthis is not an image";
+
+    /// Writes a failure marker of the given age.
+    fn write_aged_marker(marker: &Path, age: Duration) {
+        std::fs::File::create(marker)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
     }
 
     fn path_str(path: &Path) -> &str {
@@ -536,7 +658,11 @@ mod tests {
                 "{name}: took {:?}",
                 started.elapsed()
             );
-            assert_eq!(entries(dir.path()), vec!["main".to_string()], "{name}");
+            assert_eq!(
+                entries(dir.path()),
+                vec!["main".to_string(), "small.failed".to_string()],
+                "{name}"
+            );
         }
         assert!(
             peak_child_rss_bytes() < 512 * 1024 * 1024,
@@ -704,6 +830,168 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(entries(dir.path()), vec!["png".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_variant_is_not_converted_again_while_its_marker_is_fresh() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("main");
+        std::fs::write(&source, CORRUPT_PNG).unwrap();
+        let output = dir.path().join("small");
+        let marker = dir.path().join("small.failed");
+
+        let first =
+            ImageProcessor::process(path_str(&source), path_str(&output), &small_options()).await;
+
+        assert!(
+            matches!(first, Err(MediaProcessorError::ConversionFailed(_))),
+            "{first:?}"
+        );
+        assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0);
+
+        // The original now converts, so only the marker can keep the variant from being built.
+        let valid = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        std::fs::copy(valid, &source).unwrap();
+
+        let second =
+            ImageProcessor::process(path_str(&source), path_str(&output), &small_options()).await;
+
+        assert!(
+            matches!(second, Err(MediaProcessorError::RecentlyFailed)),
+            "{second:?}"
+        );
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn an_expired_marker_allows_a_retry() {
+        let _serial = SLOT_TESTS.lock().await;
+        let expired = FAILED_VARIANT_RETRY_AFTER + Duration::from_secs(60);
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // A retry that succeeds builds the variant and removes the marker.
+        let source = make_source(dir.path(), "png", &["-size", "64x48", "xc:red"]).await;
+        let output = dir.path().join("small");
+        let marker = dir.path().join("small.failed");
+        write_aged_marker(&marker, expired);
+
+        ImageProcessor::process(path_str(&source), path_str(&output), &small_options())
+            .await
+            .expect("the retry failed");
+
+        assert!(output.exists());
+        assert!(!marker.exists());
+
+        // A retry that fails starts a new retry period.
+        let source = dir.path().join("corrupt");
+        std::fs::write(&source, CORRUPT_PNG).unwrap();
+        let output = dir.path().join("feed");
+        let marker = dir.path().join("feed.failed");
+        write_aged_marker(&marker, expired);
+
+        let result =
+            ImageProcessor::process(path_str(&source), path_str(&output), &small_options()).await;
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::ConversionFailed(_))),
+            "{result:?}"
+        );
+        let age = std::fs::metadata(&marker)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(age < Duration::from_secs(60), "marker age is {age:?}");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_waiting_for_a_slot_is_busy_and_leaves_no_marker() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("main");
+        std::fs::write(&source, CORRUPT_PNG).unwrap();
+        let output = dir.path().join("small");
+        let _all_slots = CONVERSION_SLOTS
+            .acquire_many(MAX_CONCURRENT_CONVERSIONS as u32)
+            .await
+            .unwrap();
+
+        let result = ImageProcessor::process_with_slot_wait(
+            path_str(&source),
+            path_str(&output),
+            &small_options(),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::Busy)),
+            "{result:?}"
+        );
+        assert_eq!(entries(dir.path()), vec!["main".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_host_problem_leaves_no_marker() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("main");
+        let output = dir.path().join("small");
+
+        let result =
+            ImageProcessor::process(path_str(&source), path_str(&output), &small_options()).await;
+
+        assert!(
+            matches!(result, Err(MediaProcessorError::CommandFailed { .. })),
+            "{result:?}"
+        );
+        assert!(entries(dir.path()).is_empty());
+    }
+
+    /// A corrupt file fails too fast to drop a real request while its conversion runs, so this
+    /// drops the handle of the spawned task instead, which is what a dropped request leaves.
+    #[tokio::test]
+    async fn a_failed_conversion_leaves_its_marker_after_the_request_is_gone() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("main");
+        std::fs::write(&source, CORRUPT_PNG).unwrap();
+        let output = dir.path().join("small");
+        let (input, input_format) = ImageProcessor::open_input(path_str(&source)).await.unwrap();
+        let conversion = Conversion {
+            input,
+            input_format,
+            output_file_path: path_str(&output).to_string(),
+            width: SMALL_IMAGE_WIDTH.to_string(),
+            format: IMAGE_FORMAT.to_string(),
+            deadline: tokio::time::Instant::now() + IMAGE_CONVERSION_TIMEOUT,
+        };
+        let slot = CONVERSION_SLOTS.clone().acquire_owned().await.unwrap();
+
+        drop(conversion.spawn(slot));
+
+        // The task keeps its slot until the marker is written.
+        let _all_slots = CONVERSION_SLOTS
+            .acquire_many(MAX_CONCURRENT_CONVERSIONS as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            entries(dir.path()),
+            vec!["main".to_string(), "small.failed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_stderr_is_capped_and_the_rest_is_drained() {
+        let total = MAX_CAPTURED_STDERR_BYTES * 3;
+        let mut stderr = std::io::Cursor::new(vec![b'x'; total as usize]);
+
+        let message = capture_stderr(&mut stderr).await;
+
+        assert_eq!(message.len() as u64, MAX_CAPTURED_STDERR_BYTES);
+        assert_eq!(stderr.position(), total);
     }
 
     #[test]

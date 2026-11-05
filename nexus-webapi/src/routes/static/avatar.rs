@@ -25,7 +25,8 @@ use super::endpoints::USER_AVATAR_ROUTE;
     responses(
         (status = 200, description = "Avatar image"),
         (status = 404, description = "User or avatar not found"),
-        (status = 500, description = "Internal error retrieving avatar")
+        (status = 500, description = "Internal error retrieving avatar"),
+        (status = 503, description = "No conversion slot became free in time, retry later")
     )
 )]
 pub async fn user_avatar_handler(

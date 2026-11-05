@@ -39,6 +39,7 @@ pub struct FilePath {
 /// If the variant is not valid for the content type, a 400 Bad Request will be returned
 /// If the file does not exist, a 404 Not Found will be returned
 /// If the processing of the new variant fails, a 500 Internal Server Error will be returned
+/// If no conversion slot becomes free in time, a 503 Service Unavailable with Retry-After will be returned
 #[utoipa::path(
     get,
     path = STATIC_FILES_ROUTE,
@@ -53,7 +54,8 @@ pub struct FilePath {
     responses(
         (status = 200, description = "File's raw data"),
         (status = 404, description = "File not found"),
-        (status = 500, description = "Internal server error")
+        (status = 500, description = "Internal server error"),
+        (status = 503, description = "No conversion slot became free in time, retry later")
     )
 )]
 pub async fn static_files_handler(
