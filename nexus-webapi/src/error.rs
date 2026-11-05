@@ -159,10 +159,62 @@ impl IntoResponse for Error {
             Error::InternalServerError { source } => error!("Internal server error: {:?}", source),
         };
 
+        // The cause of an internal failure (Redis, graph, filesystem) is logged
+        // above and never sent to the caller.
+        let message = match &self {
+            Error::InternalServerError { .. } => "Internal server error".to_string(),
+            other => other.to_string(),
+        };
         let body = serde_json::json!({
-            "error": self.to_string()
+            "error": message
         });
 
         (status_code, axum::Json(body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body_of(error: Error) -> (StatusCode, String) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn internal_errors_do_not_expose_their_cause() {
+        let cause = io::Error::other("WRONGTYPE Operation against a key at 10.1.2.3:6379");
+        let (status, body) = body_of(Error::InternalServerError {
+            source: Box::new(cause),
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !body.contains("WRONGTYPE") && !body.contains("10.1.2.3"),
+            "{body}"
+        );
+        assert_eq!(body, r#"{"error":"Internal server error"}"#);
+    }
+
+    #[tokio::test]
+    async fn redis_failures_do_not_expose_their_cause() {
+        let (status, body) = body_of(Error::from(RedisError::IoError(
+            "connection reset by peer 10.1.2.3:6379".into(),
+        )))
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!body.contains("10.1.2.3"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn client_errors_keep_their_message() {
+        let (status, body) = body_of(Error::invalid_input("limit must be a number")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("limit must be a number"));
     }
 }
