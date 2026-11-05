@@ -1,6 +1,6 @@
 use super::listing::{self, is_homeserver_not_found, ModerationChecks};
 use super::{review, shop};
-use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
+use crate::events::remote_body::{fetch_record_capped, within, MAX_RECORD_BYTES};
 use crate::events::EventProcessorError;
 
 use nexus_common::db::queries::get::user_is_safe_to_delete;
@@ -253,37 +253,151 @@ async fn fetch_record(uri: &str) -> Result<Option<Vec<u8>>, EventProcessorError>
     fetch_record_capped(uri, MAX_RECORD_BYTES).await
 }
 
-/// The ids of every listing record in the user's listings directory on their
-/// homeserver (cursor-paginated). A user with no directory has none.
-async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventProcessorError> {
-    let pubky = PubkyConnector::get()?;
-    let storage = pubky.public_storage();
-    let directory = listing_uri_builder(user_id.to_string(), String::new());
+/// Most listings restored for one seller. A directory listing is cursor-paged
+/// by a homeserver the seller chooses, so its length is bounded here.
+const MAX_RESTORED_LISTINGS: usize = 10_000;
 
-    let mut listing_ids = Vec::new();
-    let mut cursor: Option<String> = None;
-    loop {
-        let mut request = storage
-            .list(directory.as_str())?
-            .shallow(true)
-            .limit(LISTING_RESTORE_PAGE);
-        if let Some(cursor_value) = &cursor {
-            request = request.cursor(cursor_value);
-        }
-        let entries = match request.send().await {
-            Ok(entries) => entries,
-            Err(e) if is_homeserver_not_found(&e) => return Ok(listing_ids),
-            Err(e) => return Err(e.into()),
-        };
-        for entry in &entries {
-            let url = entry.to_pubky_url();
-            if let Some(listing_id) = url.rsplit('/').next().filter(|id| !id.is_empty()) {
-                listing_ids.push(listing_id.to_string());
+/// Budget for paging a whole listings directory.
+const LISTING_DIRECTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Accumulates the pages of a listings directory, refusing a homeserver that
+/// repeats its cursor or serves more ids than [MAX_RESTORED_LISTINGS].
+#[derive(Default)]
+struct ListingIdPages {
+    ids: Vec<String>,
+    seen: std::collections::HashSet<String>,
+    cursor: Option<String>,
+}
+
+impl ListingIdPages {
+    /// Adds one page of entry URLs. Returns the cursor to resume from, or
+    /// `None` when the page was the last.
+    fn add_page(&mut self, urls: &[String]) -> Result<Option<String>, EventProcessorError> {
+        for url in urls {
+            let Some(listing_id) = url.rsplit('/').next().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            if self.seen.insert(listing_id.to_string()) {
+                if self.ids.len() == MAX_RESTORED_LISTINGS {
+                    return Err(EventProcessorError::InvalidEventLine(format!(
+                        "listings directory has more than {MAX_RESTORED_LISTINGS} entries"
+                    )));
+                }
+                self.ids.push(listing_id.to_string());
             }
         }
-        if entries.len() < LISTING_RESTORE_PAGE as usize {
-            return Ok(listing_ids);
+        if urls.len() < LISTING_RESTORE_PAGE as usize {
+            return Ok(None);
         }
-        cursor = entries.last().map(|entry| entry.to_pubky_url());
+        let next = urls.last().cloned();
+        if next == self.cursor {
+            return Err(EventProcessorError::InvalidEventLine(
+                "listings directory page did not advance its cursor".to_string(),
+            ));
+        }
+        self.cursor = next.clone();
+        Ok(next)
+    }
+}
+
+/// The ids of every listing record in the user's listings directory on their
+/// homeserver (cursor-paginated, bounded by [MAX_RESTORED_LISTINGS] and
+/// [LISTING_DIRECTORY_TIMEOUT]). A user with no directory has none.
+async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventProcessorError> {
+    within(
+        LISTING_DIRECTORY_TIMEOUT,
+        &format!("listing the listings of {user_id}"),
+        async {
+            let pubky = PubkyConnector::get()?;
+            let storage = pubky.public_storage();
+            let directory = listing_uri_builder(user_id.to_string(), String::new());
+
+            let mut pages = ListingIdPages::default();
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut request = storage
+                    .list(directory.as_str())?
+                    .shallow(true)
+                    .limit(LISTING_RESTORE_PAGE);
+                if let Some(cursor_value) = &cursor {
+                    request = request.cursor(cursor_value);
+                }
+                let entries = match request.send().await {
+                    Ok(entries) => entries,
+                    Err(e) if is_homeserver_not_found(&e) => return Ok(pages.ids),
+                    Err(e) => return Err(e.into()),
+                };
+                let urls: Vec<String> = entries.iter().map(|entry| entry.to_pubky_url()).collect();
+                match pages.add_page(&urls)? {
+                    Some(next) => cursor = Some(next),
+                    None => return Ok(pages.ids),
+                }
+            }
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod listing_id_pages_tests {
+    use super::*;
+
+    fn page(prefix: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|i| format!("pubky://owner/pub/pubky.app/listings/{prefix}{i:05}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_short_page_ends_the_listing() {
+        let mut pages = ListingIdPages::default();
+        assert_eq!(pages.add_page(&page("a", 3)).unwrap(), None);
+        assert_eq!(pages.ids.len(), 3);
+        assert_eq!(pages.ids[0], "a00000");
+    }
+
+    #[test]
+    fn a_full_page_returns_its_last_entry_as_the_cursor() {
+        let mut pages = ListingIdPages::default();
+        let full = page("a", LISTING_RESTORE_PAGE as usize);
+        let next = pages.add_page(&full).unwrap();
+        assert_eq!(next.as_deref(), full.last().map(String::as_str));
+        assert_eq!(pages.add_page(&page("b", 2)).unwrap(), None);
+        assert_eq!(pages.ids.len(), LISTING_RESTORE_PAGE as usize + 2);
+    }
+
+    #[test]
+    fn a_homeserver_that_repeats_its_cursor_is_refused() {
+        let mut pages = ListingIdPages::default();
+        let full = page("a", LISTING_RESTORE_PAGE as usize);
+        pages.add_page(&full).unwrap();
+        let error = pages
+            .add_page(&full)
+            .expect_err("a repeated final entry must not loop forever");
+        assert!(error.to_string().contains("did not advance"), "{error}");
+    }
+
+    #[test]
+    fn repeated_ids_are_kept_once() {
+        let mut pages = ListingIdPages::default();
+        let mut urls = page("a", 2);
+        urls.extend(page("a", 2));
+        pages.add_page(&urls).unwrap();
+        assert_eq!(pages.ids, ["a00000", "a00001"]);
+    }
+
+    #[test]
+    fn more_ids_than_the_budget_are_refused() {
+        let mut pages = ListingIdPages::default();
+        let mut result = Ok(None);
+        for chunk in 0..=(MAX_RESTORED_LISTINGS / LISTING_RESTORE_PAGE as usize) {
+            result = pages.add_page(&page(&format!("c{chunk}-"), LISTING_RESTORE_PAGE as usize));
+            if result.is_err() {
+                break;
+            }
+        }
+        let error = result.expect_err("an endless directory must be cut off");
+        assert!(error.to_string().contains("more than"), "{error}");
+        assert_eq!(pages.ids.len(), MAX_RESTORED_LISTINGS);
     }
 }
