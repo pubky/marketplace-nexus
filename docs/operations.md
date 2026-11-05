@@ -40,7 +40,8 @@ and every query string the API receives.
   other list endpoints keep their own limits.
 - Static files (`/static/files/...`, avatars) are always served with
   `X-Content-Type-Options: nosniff`. Images (SVG excluded), video, audio, PDF,
-  plain text and JSON are served inline. Any other declared type, including HTML,
+  plain text, JSON and `application/octet-stream` (which browsers download) are
+  served as they are. Any other declared type, including HTML,
   XHTML, SVG and other XML types, also carries
   `Content-Security-Policy: default-src 'none'; sandbox` and
   `Content-Disposition: attachment`, so it downloads instead of rendering on the
