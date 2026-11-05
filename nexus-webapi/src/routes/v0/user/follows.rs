@@ -32,7 +32,7 @@ pub async fn user_followers_handler(
     debug!("GET {USER_FOLLOWERS_ROUTE} user_id:{}", user_id);
 
     let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(200);
+    let limit = query.bounded_limit(200);
 
     match Followers::get_by_id(&user_id, Some(skip), Some(limit)).await? {
         Some(followers) => Ok(Json(followers)),
@@ -63,7 +63,7 @@ pub async fn user_following_handler(
     debug!("GET {USER_FOLLOWING_ROUTE} user_id:{}", user_id);
 
     let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(200);
+    let limit = query.bounded_limit(200);
 
     match Following::get_by_id(&user_id, Some(skip), Some(limit)).await? {
         Some(following) => Ok(Json(following)),
@@ -94,7 +94,7 @@ pub async fn user_friends_handler(
     debug!("GET {USER_FRIENDS_ROUTE} user_id:{}", user_id);
 
     let skip = query.skip.unwrap_or(0);
-    let limit = query.limit.unwrap_or(200);
+    let limit = query.bounded_limit(200);
 
     match Friends::get_by_id(&user_id, Some(skip), Some(limit)).await? {
         Some(friends) => Ok(Json(friends)),

@@ -154,7 +154,7 @@ pub async fn stream_username_search_handler(
     }
 
     let skip = query.pagination.skip.unwrap_or(0);
-    let limit = query.pagination.limit.unwrap_or(20);
+    let limit = query.pagination.bounded_limit(20);
 
     debug!("GET {STREAM_USERS_USERNAME_SEARCH_ROUTE}?username={username}");
 

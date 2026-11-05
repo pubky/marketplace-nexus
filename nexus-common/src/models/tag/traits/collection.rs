@@ -4,6 +4,7 @@ use crate::db::{
     execute_graph_operation, fetch_row_from_graph, queries, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
+use crate::types::bounded_page_limit;
 use async_trait::async_trait;
 use tracing::error;
 
@@ -141,9 +142,9 @@ where
         limit_taggers: Option<usize>,
         is_cache: bool,
     ) -> RedisResult<Option<Vec<TagDetails>>> {
-        let limit_tags = limit_tags.unwrap_or(5);
+        let limit_tags = bounded_page_limit(limit_tags, 5);
         let skip_tags = skip_tags.unwrap_or(0);
-        let limit_taggers = limit_taggers.unwrap_or(5);
+        let limit_taggers = bounded_page_limit(limit_taggers, 5);
         let key_parts = Self::create_sorted_set_key_parts(user_id, extra_param, is_cache);
         // Prepare the extra prefix for cache search
         let cache_prefix = match is_cache {
@@ -166,7 +167,7 @@ where
         .await?
         {
             Some(tag_scores) => {
-                let mut tags = Vec::with_capacity(limit_tags);
+                let mut tags = Vec::with_capacity(tag_scores.len());
                 // TODO: Temporal fix. Should it delete SORTED SET value if score is 0?
                 for (label, score) in tag_scores.iter() {
                     // Just process the tags that has score
