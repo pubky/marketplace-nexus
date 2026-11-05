@@ -59,10 +59,17 @@ pub fn is_inline_safe(content_type: &str) -> bool {
     }
 }
 
+/// Longest download name used. The specs cap file names at 255 characters; the
+/// limit keeps the encoded header (three bytes per character, twice) small even
+/// for a record that was indexed without that check.
+const MAX_DOWNLOAD_NAME_CHARS: usize = 255;
+
 /// Content-Disposition for a download of `name`. A publisher-controlled name may
 /// hold quotes, control characters or non-ASCII text, none of which belong in
 /// a quoted-string header parameter.
 pub fn attachment_disposition(name: &str) -> HeaderValue {
+    let name: String = name.chars().take(MAX_DOWNLOAD_NAME_CHARS).collect();
+    let name = name.as_str();
     let plain = name
         .chars()
         .all(|c| c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\');
@@ -317,6 +324,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_type_with_non_ascii_bytes_becomes_a_sandboxed_download() {
+        let app = Router::new()
+            .route(
+                "/file",
+                get(|| async {
+                    Response::builder()
+                        .header(
+                            CONTENT_TYPE,
+                            HeaderValue::from_bytes(b"text/html; note=\"\xc3\xa9\"").unwrap(),
+                        )
+                        .body(Body::from("<script>alert(1)</script>"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn(static_security_headers));
+        let response = fetch(app).await;
+        let headers = response.headers();
+        assert_eq!(headers[CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(headers[CONTENT_SECURITY_POLICY], ACTIVE_CONTENT_POLICY);
+        assert_eq!(headers[CONTENT_DISPOSITION], "attachment");
+    }
+
+    #[tokio::test]
     async fn a_repeated_type_header_becomes_a_sandboxed_download() {
         let app = Router::new()
             .route(
@@ -437,6 +467,17 @@ mod tests {
             value,
             "attachment; filename=\"caf_.svg\"; filename*=UTF-8''caf%C3%A9.svg"
         );
+    }
+
+    #[test]
+    fn a_very_long_name_is_cut_before_encoding() {
+        let name = "é".repeat(100_000);
+        let value = attachment_disposition(&name);
+        assert!(value.len() < 4_000, "{}", value.len());
+        assert!(value
+            .to_str()
+            .unwrap()
+            .starts_with("attachment; filename=\""));
     }
 
     #[test]
