@@ -77,22 +77,29 @@ const MAX_REMEMBERED_FAILURES: usize = 4096;
 struct OriginStamp {
     len: u64,
     modified: Option<SystemTime>,
+    identity: Option<(u64, u64)>,
+}
+
+/// Device and inode of a file, where the platform has them.
+fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
     #[cfg(unix)]
-    identity: (u64, u64),
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 impl OriginStamp {
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt;
-            (metadata.dev(), metadata.ino())
-        };
         Self {
             len: metadata.len(),
             modified: metadata.modified().ok(),
-            #[cfg(unix)]
-            identity,
+            identity: file_identity(metadata),
         }
     }
 
@@ -100,6 +107,14 @@ impl OriginStamp {
         let metadata = fs::metadata(path).await.ok()?;
         Some(Self::from_metadata(&metadata))
     }
+}
+
+/// Why the stored original could not be opened for decoding, with the identity of the file that
+/// was open when it failed (not of whatever the path names by the time the failure is handled).
+#[derive(Debug)]
+struct OpenFailure {
+    error: MediaProcessorError,
+    stamp: Option<OriginStamp>,
 }
 
 /// A conversion outcome that depends only on the stored bytes, so repeating it is wasted work.
@@ -331,7 +346,7 @@ impl ImageProcessor {
         // Opened only once a slot is held, so waiting requests hold no file.
         let (input, input_format, origin_stamp) = match Self::open_input(origin_file_path).await {
             Ok(opened) => opened,
-            Err(error) => {
+            Err(OpenFailure { error, stamp }) => {
                 let failure = match &error {
                     MediaProcessorError::UnsupportedInputFormat => {
                         Some(KnownFailure::UnsupportedInputFormat)
@@ -344,10 +359,8 @@ impl ImageProcessor {
                     }
                     _ => None,
                 };
-                if let (Some(failure), Some(stamp)) =
-                    (failure, OriginStamp::of(origin_file_path).await)
-                {
-                    remember_failure(output_file_path, Some(stamp), failure);
+                if let Some(failure) = failure {
+                    remember_failure(output_file_path, stamp, failure);
                 }
                 return Err(error);
             }
@@ -382,6 +395,16 @@ impl ImageProcessor {
     /// replaces the path afterwards does not change these bytes.
     async fn open_input(
         file_path: &str,
+    ) -> Result<(std::fs::File, ImageInputFormat, OriginStamp), OpenFailure> {
+        let mut stamp = None;
+        Self::open_input_inner(file_path, &mut stamp)
+            .await
+            .map_err(|error| OpenFailure { error, stamp })
+    }
+
+    async fn open_input_inner(
+        file_path: &str,
+        opened_stamp: &mut Option<OriginStamp>,
     ) -> Result<(std::fs::File, ImageInputFormat, OriginStamp), MediaProcessorError> {
         let mut file = fs::File::open(file_path)
             .await
@@ -391,6 +414,7 @@ impl ImageProcessor {
             .await
             .map_err(MediaProcessorError::command_failed)?;
         let stamp = OriginStamp::from_metadata(&metadata);
+        *opened_stamp = Some(stamp);
         let size = metadata.len();
         if size > MAX_IMAGE_INPUT_BYTES {
             return Err(MediaProcessorError::InputTooLarge {
@@ -457,11 +481,15 @@ impl Conversion {
         // the check runs before and after the rename, so a replacement landing between them
         // still removes the stale variant again.
         self.ensure_origin_unchanged().await?;
+        let installed = fs::metadata(&temp_output.0)
+            .await
+            .ok()
+            .and_then(|metadata| file_identity(&metadata));
         fs::rename(&temp_output.0, &self.output_file_path)
             .await
             .map_err(MediaProcessorError::command_failed)?;
         if let Err(error) = self.ensure_origin_unchanged().await {
-            let _ = fs::remove_file(&self.output_file_path).await;
+            remove_if_installed(&self.output_file_path, installed).await;
             return Err(error);
         }
         Ok(String::new())
@@ -564,6 +592,17 @@ impl Conversion {
         let _ = child.wait().await;
         result
     }
+}
+
+/// Removes `path` unless a different file (a newer conversion's variant) has taken its place
+/// since this conversion installed the file with identity `installed`.
+async fn remove_if_installed(path: &str, installed: Option<(u64, u64)>) {
+    if let (Some(installed), Ok(metadata)) = (installed, fs::metadata(path).await) {
+        if file_identity(&metadata) != Some(installed) {
+            return;
+        }
+    }
+    let _ = fs::remove_file(path).await;
 }
 
 /// Reads `reader` to its end and keeps the first `cap` bytes, so a process that writes a lot
@@ -702,8 +741,7 @@ mod tests {
         OriginStamp {
             len,
             modified: None,
-            #[cfg(unix)]
-            identity: (0, 0),
+            identity: None,
         }
     }
 
@@ -942,6 +980,52 @@ mod tests {
             drain_capped(&mut short, MAX_STDERR_BYTES).await,
             b"convert: bad"
         );
+    }
+
+    #[tokio::test]
+    async fn an_open_failure_carries_the_stamp_of_the_file_that_was_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let origin = dir.path().join("main");
+        std::fs::write(&origin, b"not an image at all").unwrap();
+        let before = OriginStamp::of(path_str(&origin)).await.unwrap();
+
+        let failure = ImageProcessor::open_input(path_str(&origin))
+            .await
+            .expect_err("text is not an allowed image format");
+        assert!(matches!(
+            failure.error,
+            MediaProcessorError::UnsupportedInputFormat
+        ));
+        assert_eq!(failure.stamp, Some(before));
+
+        let missing = ImageProcessor::open_input(path_str(&dir.path().join("none")))
+            .await
+            .expect_err("a missing original cannot be opened");
+        assert_eq!(
+            missing.stamp, None,
+            "no file was open, so nothing to remember"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_only_the_file_this_conversion_installed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let variant = dir.path().join("small");
+        std::fs::write(&variant, b"ours").unwrap();
+        let ours = file_identity(&std::fs::metadata(&variant).unwrap());
+
+        // A newer conversion installs its own variant over the path.
+        let newer = dir.path().join("small.tmp");
+        std::fs::write(&newer, b"newer").unwrap();
+        std::fs::rename(&newer, &variant).unwrap();
+        remove_if_installed(path_str(&variant), ours).await;
+        if ours.is_some() {
+            assert_eq!(std::fs::read(&variant).unwrap(), b"newer");
+        }
+
+        let identity = file_identity(&std::fs::metadata(&variant).unwrap());
+        remove_if_installed(path_str(&variant), identity).await;
+        assert!(!variant.exists());
     }
 
     #[tokio::test]
