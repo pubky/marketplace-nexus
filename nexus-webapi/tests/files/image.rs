@@ -166,3 +166,53 @@ async fn test_static_image_serving_small() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn test_static_image_variant_failure_is_remembered() -> Result<()> {
+    let client = httpc_test::new_client(host_url().await)?;
+
+    // Declared as image/jpeg while the bytes are PNG: the decoder is chosen from the leading bytes.
+    let owner_id = "sfgetccnq7s3h57a7imf6n7k5fqxus33yg85f1ndhnrnofjdmhjy";
+    let file_id = "2ZK2RH7KN91G0";
+
+    let file_dir = PathBuf::from(format!("static/files/{owner_id}/{file_id}"));
+    let main_path = file_dir.join("main");
+    let small_path = file_dir.join("small");
+    let marker_path = file_dir.join("small.failed");
+    let small_url = format!("/static/files/{owner_id}/{file_id}/small");
+
+    create_dir_all(&file_dir).await?;
+    for leftover in [&small_path, &marker_path] {
+        if leftover.exists() {
+            fs::remove_file(leftover)?;
+        }
+    }
+    fs::write(&main_path, b"\x89PNG\r\n\x1a\nnot an image")?;
+
+    // The corrupt file fails to convert and the failure is recorded next to the variant.
+    let res = client.do_get(&small_url).await?;
+    assert_eq!(res.status(), 500);
+    let body = res.json_body()?.to_string();
+    for detail in ["static/files", "convert", "ImageMagick"] {
+        assert!(!body.contains(detail), "{body}");
+    }
+    assert!(marker_path.exists());
+    assert!(!small_path.exists());
+
+    // A valid main written straight to disk is not picked up, so no second conversion ran.
+    fs::copy(PathBuf::from(BLOB_PATH).join(IMAGE_BLOB_NAME), &main_path)?;
+    let res = client.do_get(&small_url).await?;
+    assert_eq!(res.status(), 500);
+    assert!(!small_path.exists());
+
+    // Without the marker, as after a re-publish or the retry period, the variant is built.
+    fs::remove_file(&marker_path)?;
+    let res = client.do_get(&small_url).await?;
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.header("content-type").unwrap(), "image/webp");
+    assert!(small_path.exists());
+
+    fs::remove_dir_all(&file_dir)?;
+
+    Ok(())
+}
