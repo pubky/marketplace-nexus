@@ -1,5 +1,5 @@
 use std::{
-    io::{ErrorKind, SeekFrom},
+    io::SeekFrom,
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::{
     media::{
-        processors::{failed_variant_marker, MediaProcessorError},
+        processors::{failed_variant_marker, remove_if_exists, MediaProcessorError},
         FileVariant,
     },
     models::file::FileDetails,
@@ -312,9 +312,9 @@ async fn record_failure(marker: &str, error: &MediaProcessorError) {
     }
     // Removed first: creating over an empty file may keep its modified time, and a repeat failure
     // must start a new retry period.
-    let written = match fs::remove_file(marker).await {
-        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-        _ => fs::File::create(marker).await.map(drop),
+    let written = match remove_if_exists(marker).await {
+        Ok(()) => fs::File::create(marker).await.map(drop),
+        Err(e) => Err(e),
     };
     if let Err(e) = written {
         tracing::warn!("Could not write the failure marker {marker}: {e}");

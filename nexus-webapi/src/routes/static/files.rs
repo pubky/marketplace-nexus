@@ -99,11 +99,7 @@ pub async fn static_files_handler(
         )));
     }
 
-    let file_variant_content_type = Blob::get_by_id(&file, &variant, file_path.clone())
-        .await
-        .inspect_err(|_| {
-            error!("Error while processing file variant for variant: {variant} and file: {file_id}")
-        })?;
+    let file_variant_content_type = Blob::get_by_id(&file, &variant, file_path.clone()).await?;
 
     let request_uri = request.uri().clone();
 

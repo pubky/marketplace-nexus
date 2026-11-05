@@ -71,13 +71,7 @@ pub async fn user_avatar_handler(
         return Err(Error::FileNotFound {});
     }
     let small_variant_content_type =
-        Blob::get_by_id(&file_details, &FileVariant::Small, file_path.clone())
-            .await
-            .inspect_err(|_| {
-                error!(
-            "Error while processing small variant for user: {user_id} avatar with file: {file_id}"
-        )
-            })?;
+        Blob::get_by_id(&file_details, &FileVariant::Small, file_path.clone()).await?;
 
     // serve the file using ServeDir
     // Create a new request with a modified path to serve the file using ServeDir

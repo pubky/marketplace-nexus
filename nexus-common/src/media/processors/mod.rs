@@ -1,6 +1,6 @@
 use crate::{media::FileVariant, models::file::FileDetails};
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod image;
@@ -50,7 +50,7 @@ impl MediaProcessorError {
     }
 
     /// Whether the stored file itself caused this failure, so trying again soon cannot help.
-    pub fn is_caused_by_file(&self) -> bool {
+    pub(crate) fn is_caused_by_file(&self) -> bool {
         matches!(
             self,
             Self::ConversionFailed(_)
@@ -65,6 +65,14 @@ impl MediaProcessorError {
 /// the variant, whose modified time says when the variant last failed.
 pub(crate) fn failed_variant_marker(variant: &str) -> String {
     format!("{variant}.failed")
+}
+
+/// Removes a file. A file that is already gone is not an error.
+pub(crate) async fn remove_if_exists(path: impl AsRef<Path>) -> std::io::Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 #[async_trait]

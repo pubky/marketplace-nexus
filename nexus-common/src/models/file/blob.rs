@@ -1,12 +1,14 @@
 use crate::{
     media::{
-        processors::{failed_variant_marker, ImageProcessor, VariantProcessor, VideoProcessor},
+        processors::{
+            failed_variant_marker, remove_if_exists, ImageProcessor, MediaProcessorError,
+            VariantProcessor, VideoProcessor,
+        },
         FileVariant, VariantController,
     },
     models::error::{ModelError, ModelResult},
 };
 use pubky_app_specs::PubkyAppBlob;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{
@@ -69,10 +71,7 @@ impl Blob {
         for variant in [FileVariant::Small, FileVariant::Feed] {
             let variant = variant.to_string();
             for built in [failed_variant_marker(&variant), variant] {
-                match fs::remove_file(files_path.join(built)).await {
-                    Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
-                    _ => {}
-                }
+                remove_if_exists(files_path.join(built)).await?;
             }
         }
         Ok(())
@@ -94,7 +93,17 @@ impl Blob {
             Self::put_variant(file, variant, file_path)
                 .await
                 .inspect_err(|e| {
-                    tracing::error!("Creating variant failed for file: {file:?} with error: {e}")
+                    // A busy server or an already recorded failure is a routine answer.
+                    if !matches!(
+                        e,
+                        ModelError::MediaProcessorError(
+                            MediaProcessorError::Busy | MediaProcessorError::RecentlyFailed
+                        )
+                    ) {
+                        tracing::error!(
+                            "Creating variant failed for file: {file:?} with error: {e}"
+                        )
+                    }
                 })
         }
     }
@@ -174,12 +183,7 @@ mod tests {
             .unwrap();
         assert_eq!(content, b"second write");
 
-        let mut names = Vec::new();
-        let mut dir = fs::read_dir(&files_path).await.unwrap();
-        while let Some(entry) = dir.next_entry().await.unwrap() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-        assert_eq!(names, vec!["main".to_string()]);
+        assert_eq!(sorted_names(&files_path).await, vec!["main".to_string()]);
     }
 
     #[tokio_shared_rt::test(shared)]
@@ -200,12 +204,7 @@ mod tests {
 
         let content = fs::read(files_path.join("main")).await.unwrap();
         assert!(versions.contains(&content), "main is a mix of versions");
-        let mut names = Vec::new();
-        let mut dir = fs::read_dir(&files_path).await.unwrap();
-        while let Some(entry) = dir.next_entry().await.unwrap() {
-            names.push(entry.file_name().to_string_lossy().into_owned());
-        }
-        assert_eq!(names, vec!["main".to_string()]);
+        assert_eq!(sorted_names(&files_path).await, vec!["main".to_string()]);
     }
 
     /// Creates a file directory holding a main file, both variants and both failure markers.
