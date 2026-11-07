@@ -60,8 +60,8 @@ impl std::fmt::Display for GateStop {
 impl std::error::Error for GateStop {}
 
 /// Front door of every homeserver request: a request waits for a permit, then
-/// reports how it went through the permit. The unthrottled gate (the existing
-/// migrations) hands permits out at once.
+/// reports how it went through the permit. The unthrottled gate hands permits
+/// out at once.
 #[async_trait]
 pub trait RequestGate: Send + Sync {
     async fn acquire(&self) -> Result<RequestPermit, GateStop>;
@@ -101,7 +101,8 @@ impl RequestPermit {
     }
 }
 
-/// No limit: the behaviour the registered migrations always had.
+/// No limit: permits are handed out at once. For a caller that reads a record
+/// outside a backfill run.
 pub struct Unthrottled;
 
 #[async_trait]

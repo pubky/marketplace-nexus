@@ -6,12 +6,11 @@ use super::utils::{
 use crate::event_processor::utils::watcher::WatcherTest;
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
+use nexus_common::db::fetch_row_from_graph;
 use nexus_common::db::graph::Query;
-use nexus_common::db::{exec_single_row, fetch_row_from_graph, RedisOps};
 use nexus_common::models::marketplace::{
     AttestorWindow, ReputationBucket, ReputationSummary, ReviewDetails,
 };
-use nexus_watcher::events::handlers::review::backfill_trust_buckets;
 use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::{
     traits::HasPath, PubkyAppListing, PubkyAppListingCondition, PubkyAppListingSale,
@@ -137,7 +136,7 @@ async fn seller_summary(seller_id: &str) -> ReputationSummary {
         .expect("the seller aggregate exists")
 }
 
-async fn listing_summary(market: &Market) -> ReputationSummary {
+pub(super) async fn listing_summary(market: &Market) -> ReputationSummary {
     ReputationSummary::get_by_listing(&market.seller_id, &market.listing_id)
         .await
         .unwrap()
@@ -596,77 +595,6 @@ async fn an_unverified_review_is_never_bucketed() -> Result<()> {
     test.del(&forged_kp, &forged_path).await?;
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&forged_kp).await?;
-    test.cleanup_user(&market.seller_kp).await?;
-    Ok(())
-}
-
-#[tokio_shared_rt::test(shared)]
-async fn the_one_shot_backfill_rereads_reviews_indexed_without_their_iat() -> Result<()> {
-    let mut test = WatcherTest::setup().await?;
-    let market = market(&mut test, "Watcher:ReviewBuckets:Backfill").await?;
-    let (buyer_kp, buyer_id) = buyer(&mut test, "Watcher:ReviewBuckets:Backfill:Buyer").await?;
-    let attestor = test_attestor_key();
-    let attestor_id = attestor_pubky(&attestor);
-
-    let order = Order::new(&attestor, 801, 1_790_000_800, 4).priced("USD:5");
-    let (review_id, path) = test
-        .create_review(&buyer_kp, &order.review(&market, &buyer_id))
-        .await?;
-
-    // The index before this release: no iat or weight on the edge or in
-    // the details, and an aggregate without buckets.
-    exec_single_row(
-        Query::new(
-            "test_remove_attestation_time",
-            "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
-             REMOVE r.iat, r.price_weight",
-        )
-        .param("reviewer_id", buyer_id.as_str())
-        .param("review_id", review_id.as_str()),
-    )
-    .await?;
-    let mut details = ReviewDetails::get_from_index(&buyer_id, &review_id)
-        .await?
-        .expect("indexed");
-    details.iat = None;
-    details.price_weight = None;
-    details
-        .put_index_json(&[&buyer_id, &review_id], None, None)
-        .await?;
-    ReputationSummary::recompute_subject(
-        &market.seller_id,
-        PubkyAppReviewRole::BuyerReviewingSeller,
-    )
-    .await?;
-    assert!(seller_summary(&market.seller_id).await.buckets.is_empty());
-
-    let summary = backfill_trust_buckets().await?;
-    assert!(summary.refetched >= 1);
-    assert_eq!(summary.failed, 0);
-
-    let details = ReviewDetails::get_from_index(&buyer_id, &review_id)
-        .await?
-        .expect("indexed");
-    assert_eq!(
-        (details.iat, details.price_weight),
-        (Some(1_790_000_800), Some(4))
-    );
-    let bucket = &seller_summary(&market.seller_id).await.buckets[&attestor_id];
-    assert_eq!((bucket.buyers, bucket.weight_total), (1, 4));
-    assert_eq!(
-        listing_summary(&market).await.buckets[&attestor_id].first_iat,
-        Some(1_790_000_800)
-    );
-
-    // Idempotent: nothing is left to re-read for this review.
-    backfill_trust_buckets().await?;
-    assert_eq!(
-        seller_summary(&market.seller_id).await.buckets[&attestor_id].weight_total,
-        4
-    );
-
-    test.del(&buyer_kp, &path).await?;
-    test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
     Ok(())
 }
