@@ -6,13 +6,129 @@
 //! of the listed directory (a resource, or a subdirectory ending with `/`),
 //! and refused when a full page ends where the previous one did. Entries are
 //! parsed with the SDK's [PubkyResource] parser, the way the SDK's own LIST
-//! does.
+//! does. [DirectoryPager] pages a whole directory, bounded in pages.
+
+use std::collections::HashSet;
 
 use pubky::{Method, PubkyHttpClient, PubkyResource, StatusCode};
 use reqwest::Url;
 
 use crate::events::remote_body::{event_feed_budget, read_capped, within, RECORD_FETCH_TIMEOUT};
 use crate::events::EventProcessorError;
+
+/// Pages through a shallow directory listing, one request per [Self::next]
+/// call, so a caller can take a request permit before each call and settle it
+/// from the result.
+///
+/// At most `max_pages` full pages are read. A homeserver chooses what each
+/// page holds, so after the last of them one more page of a single entry is
+/// read, only to learn whether the directory ends at the cap.
+pub struct DirectoryPager {
+    directory: PubkyResource,
+    limit: u16,
+    max_pages: usize,
+    cursor: Option<String>,
+    pages: usize,
+    seen: HashSet<String>,
+    done: bool,
+}
+
+/// What one [DirectoryPager::next] call found.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PageStep {
+    /// The entry names of one page that no earlier page of this pager held
+    /// (a homeserver may serve the same entries again; a repeat was handled
+    /// already). Subdirectories are left out. `last` is set for a short page:
+    /// the directory ends there and nothing more is read.
+    Names { names: Vec<String>, last: bool },
+    /// The homeserver answered 404 before the cap: the directory is not there
+    /// (or left during the paging).
+    Gone,
+    /// The directory ends at the cap: the single-entry page after `max_pages`
+    /// full pages was empty or 404. Also what `next` returns, without a
+    /// request, once paging has finished.
+    End,
+    /// The single-entry page after `max_pages` full pages has an entry: the
+    /// directory goes on past the cap, and nothing past it is read.
+    Truncated,
+}
+
+impl DirectoryPager {
+    /// A pager over `directory` (a `pubky://` directory ending with `/`) that
+    /// reads pages of `limit` entries and at most `max_pages` full pages.
+    pub fn new(directory: PubkyResource, limit: u16, max_pages: usize) -> Self {
+        DirectoryPager {
+            directory,
+            limit,
+            max_pages,
+            cursor: None,
+            pages: 0,
+            seen: HashSet::new(),
+            done: false,
+        }
+    }
+
+    /// Reads the next page with exactly one request, or returns
+    /// [PageStep::End] without one once paging has finished. A failed request
+    /// is an error and leaves the pager where it was.
+    pub async fn next(
+        &mut self,
+        client: &PubkyHttpClient,
+    ) -> Result<PageStep, EventProcessorError> {
+        if self.done {
+            return Ok(PageStep::End);
+        }
+        let (limit, cursor) = self.request();
+        let page = fetch_directory_page(client, &self.directory, limit, cursor).await?;
+        Ok(self.step(page))
+    }
+
+    /// The `limit` and `cursor` of the next request: a single entry once
+    /// `max_pages` full pages were read.
+    fn request(&self) -> (u16, Option<&str>) {
+        let limit = if self.at_cap() { 1 } else { self.limit };
+        (limit, self.cursor.as_deref())
+    }
+
+    /// Whether the next page is the check page past the cap.
+    fn at_cap(&self) -> bool {
+        self.pages == self.max_pages
+    }
+
+    /// Records the page the last request read (`None` for a 404) and decides
+    /// what it means.
+    fn step(&mut self, page: Option<Vec<PubkyResource>>) -> PageStep {
+        let at_cap = self.at_cap();
+        self.done = true;
+        let Some(entries) = page else {
+            return if at_cap {
+                PageStep::End
+            } else {
+                PageStep::Gone
+            };
+        };
+        if at_cap {
+            return if entries.is_empty() {
+                PageStep::End
+            } else {
+                PageStep::Truncated
+            };
+        }
+        self.pages += 1;
+        let names = entries
+            .iter()
+            .filter_map(entry_name)
+            .filter(|name| self.seen.insert(name.to_string()))
+            .map(str::to_string)
+            .collect();
+        self.cursor = next_cursor(&entries, self.limit);
+        self.done = self.cursor.is_none();
+        PageStep::Names {
+            names,
+            last: self.done,
+        }
+    }
+}
 
 /// One page of the shallow listing of `directory` (a `pubky://` directory
 /// ending with `/`), at most `limit` entries from after `cursor`, or `None`
@@ -451,5 +567,122 @@ mod tests {
             Some(cursor)
         );
         assert!(!url.query().unwrap_or_default().contains("://"), "{url}");
+    }
+
+    const PAGER_LIMIT: u16 = 3;
+    const PAGER_MAX_PAGES: usize = 2;
+
+    fn pager(owner: &pubky::PublicKey) -> DirectoryPager {
+        DirectoryPager::new(directory(owner), PAGER_LIMIT, PAGER_MAX_PAGES)
+    }
+
+    fn entries(owner: &pubky::PublicKey, names: &[&str]) -> Option<Vec<PubkyResource>> {
+        Some(
+            names
+                .iter()
+                .map(|name| {
+                    pubky_line(owner, &format!("{DIRECTORY_PATH}{name}"))
+                        .parse()
+                        .unwrap()
+                })
+                .collect(),
+        )
+    }
+
+    fn names(names: &[&str], last: bool) -> PageStep {
+        PageStep::Names {
+            names: names.iter().map(|name| name.to_string()).collect(),
+            last,
+        }
+    }
+
+    #[test]
+    fn a_short_page_is_the_last() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager(&owner);
+        assert_eq!(pager.request(), (PAGER_LIMIT, None));
+        assert_eq!(
+            pager.step(entries(&owner, &["a", "b"])),
+            names(&["a", "b"], true)
+        );
+        assert!(pager.done);
+
+        let mut pager = self::pager(&owner);
+        assert_eq!(pager.step(entries(&owner, &[])), names(&[], true));
+        assert!(pager.done);
+    }
+
+    #[test]
+    fn a_full_page_continues_after_its_last_entry() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager(&owner);
+        assert_eq!(
+            pager.step(entries(&owner, &["a", "b", "c"])),
+            names(&["a", "b", "c"], false)
+        );
+        assert!(!pager.done);
+        let cursor = pubky_line(&owner, &format!("{DIRECTORY_PATH}c"));
+        assert_eq!(pager.request(), (PAGER_LIMIT, Some(cursor.as_str())));
+    }
+
+    #[test]
+    fn names_repeated_across_pages_are_returned_once_and_subdirectories_skipped() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager(&owner);
+        assert_eq!(
+            pager.step(entries(&owner, &["a", "dir/", "b"])),
+            names(&["a", "b"], false)
+        );
+        assert_eq!(pager.step(entries(&owner, &["b", "a"])), names(&[], true));
+    }
+
+    #[test]
+    fn a_404_on_the_first_page_is_gone() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager(&owner);
+        assert_eq!(pager.step(None), PageStep::Gone);
+        assert!(pager.done);
+    }
+
+    /// A pager that has read `PAGER_MAX_PAGES` full pages.
+    fn pager_at_cap(owner: &pubky::PublicKey) -> DirectoryPager {
+        let mut pager = pager(owner);
+        assert_eq!(
+            pager.step(entries(owner, &["a", "b", "c"])),
+            names(&["a", "b", "c"], false)
+        );
+        assert_eq!(
+            pager.step(entries(owner, &["d", "e", "f"])),
+            names(&["d", "e", "f"], false)
+        );
+        pager
+    }
+
+    #[test]
+    fn the_page_after_the_cap_asks_for_one_entry_after_the_last_full_page() {
+        let owner = Keypair::random().public_key();
+        let pager = pager_at_cap(&owner);
+        let cursor = pubky_line(&owner, &format!("{DIRECTORY_PATH}f"));
+        assert_eq!(pager.request(), (1, Some(cursor.as_str())));
+    }
+
+    #[test]
+    fn a_directory_that_ends_at_the_cap_ends() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager_at_cap(&owner);
+        assert_eq!(pager.step(entries(&owner, &[])), PageStep::End);
+        assert!(pager.done);
+
+        let mut pager = pager_at_cap(&owner);
+        assert_eq!(pager.step(None), PageStep::End);
+        assert!(pager.done);
+    }
+
+    #[test]
+    fn an_entry_past_the_cap_truncates_the_directory() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager_at_cap(&owner);
+        assert_eq!(pager.step(entries(&owner, &["g"])), PageStep::Truncated);
+        assert!(pager.done);
     }
 }

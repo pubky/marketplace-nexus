@@ -1,5 +1,5 @@
 use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
-use crate::events::directory_page::{entry_name, fetch_directory_page, next_cursor};
+use crate::events::directory_page::{DirectoryPager, PageStep};
 use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
@@ -473,36 +473,10 @@ pub enum UserScanError {
 /// Review directory entries read per LIST page.
 const REVIEW_DIRECTORY_PAGE: u16 = 500;
 
-/// Most LIST pages read for one user's reviews directory (10,000 entries). A
-/// homeserver chooses what each page holds, so the paging is bounded here.
+/// Most full LIST pages read for one user's reviews directory (10,000
+/// entries). A homeserver chooses what each page holds, so the paging is
+/// bounded here.
 const MAX_REVIEW_DIRECTORY_PAGES: usize = 20;
-
-/// Paging state of one user's reviews directory scan.
-#[derive(Default)]
-struct ReviewDirectoryPages {
-    pages: usize,
-    seen: std::collections::HashSet<String>,
-}
-
-impl ReviewDirectoryPages {
-    /// Whether the next page is the one past [MAX_REVIEW_DIRECTORY_PAGES],
-    /// read only to learn whether the directory ends at the cap.
-    fn next_is_past_cap(&self) -> bool {
-        self.pages == MAX_REVIEW_DIRECTORY_PAGES
-    }
-
-    /// Records one page and returns its review ids that no earlier page of
-    /// this scan held. A homeserver may serve the same entries again; a
-    /// repeat is skipped and counted nowhere, since it was handled already.
-    fn add_page<'a>(&mut self, entries: &'a [PubkyResource]) -> Vec<&'a str> {
-        self.pages += 1;
-        entries
-            .iter()
-            .filter_map(entry_name)
-            .filter(|review_id| self.seen.insert(review_id.to_string()))
-            .collect()
-    }
-}
 
 /// One user's discovery pass through a request gate. Every LIST page and
 /// every record GET takes a permit from `gate`, and the tallies go to
@@ -524,33 +498,38 @@ pub async fn scan_user_reviews(
             .parse()
             .map_err(|e: pubky::Error| UserScanError::Failed(e.into()))?;
 
-    let mut pages = ReviewDirectoryPages::default();
-    let mut cursor: Option<String> = None;
+    let mut pager =
+        DirectoryPager::new(directory, REVIEW_DIRECTORY_PAGE, MAX_REVIEW_DIRECTORY_PAGES);
     loop {
-        let past_cap = pages.next_is_past_cap();
         let permit = gate.acquire().await.map_err(UserScanError::Stopped)?;
-        let page = fetch_directory_page(
-            pubky.client(),
-            &directory,
-            REVIEW_DIRECTORY_PAGE,
-            cursor.as_deref(),
-        )
-        .await;
-        let entries = match page {
-            Ok(Some(entries)) => {
+        let (review_ids, last) = match pager.next(pubky.client()).await {
+            Ok(PageStep::Names { names, last }) => {
                 permit.succeeded();
-                entries
+                (names, last)
             }
             // A user with no reviews directory answers 404. Other LIST
             // failures mean this user's homeserver is unreachable. Neither
-            // case may permanently block the one-shot migration. A 404 past
-            // the cap means the directory ended there.
-            Ok(None) => {
+            // case may permanently block the one-shot migration.
+            Ok(PageStep::Gone) => {
                 permit.succeeded();
-                if !past_cap {
-                    debug!("Review directory for user {} is gone", user_id);
-                    summary.gone += 1;
-                }
+                debug!("Review directory for user {} is gone", user_id);
+                summary.gone += 1;
+                return Ok(());
+            }
+            Ok(PageStep::End) => {
+                permit.succeeded();
+                return Ok(());
+            }
+            // Reviews ingested so far stay indexed. Every scan starts from
+            // the first page, so the entries past the cap are never
+            // backfilled: the directory is truncated at the cap.
+            Ok(PageStep::Truncated) => {
+                permit.succeeded();
+                warn!(
+                    "Review directory for user {} is truncated at {} pages; entries past it are not backfilled",
+                    user_id, MAX_REVIEW_DIRECTORY_PAGES
+                );
+                summary.failed += 1;
                 return Ok(());
             }
             Err(e) => {
@@ -564,21 +543,7 @@ pub async fn scan_user_reviews(
             }
         };
 
-        if past_cap {
-            // Reviews ingested so far stay indexed. Every scan starts from
-            // the first page, so the entries past the cap are never
-            // backfilled: the directory is truncated at the cap.
-            if !entries.is_empty() {
-                warn!(
-                    "Review directory for user {} is truncated at {} pages; entries past it are not backfilled",
-                    user_id, MAX_REVIEW_DIRECTORY_PAGES
-                );
-                summary.failed += 1;
-            }
-            return Ok(());
-        }
-
-        for review_id in pages.add_page(&entries) {
+        for review_id in &review_ids {
             if indexed.contains(review_id) {
                 summary.already_indexed += 1;
                 continue;
@@ -603,8 +568,7 @@ pub async fn scan_user_reviews(
             }
         }
 
-        cursor = next_cursor(&entries, REVIEW_DIRECTORY_PAGE);
-        if cursor.is_none() {
+        if last {
             return Ok(());
         }
     }
@@ -783,21 +747,15 @@ pub async fn fetch_review_record(
 
     let permit = gate.acquire().await.map_err(ReviewIngestError::Stopped)?;
     // The request and the body read share one deadline and the body is
-    // capped; a 404 is `None`. Every other failure, a timeout and an
-    // oversized body included, counts as an unreachable homeserver.
-    let blob = match fetch_record_capped(&uri, MAX_RECORD_BYTES).await {
-        Ok(Some(blob)) => {
-            permit.succeeded();
-            blob
-        }
-        Ok(None) => {
-            permit.succeeded();
-            return Ok(None);
-        }
-        Err(e) => {
-            permit.failed();
-            return Err(ReviewIngestError::Unreachable(e));
-        }
+    // capped; a 404 is `None`.
+    let (outcome, fetched) =
+        classify_record_fetch(fetch_record_capped(&uri, MAX_RECORD_BYTES).await);
+    match outcome {
+        PermitOutcome::Succeeded => permit.succeeded(),
+        PermitOutcome::Failed => permit.failed(),
+    }
+    let Some(blob) = fetched? else {
+        return Ok(None);
     };
 
     let resource = Resource::MarketplaceReview(review_id.to_string());
@@ -808,6 +766,40 @@ pub async fn fetch_review_record(
         _ => Err(ReviewIngestError::Invalid(EventProcessorError::generic(
             format!("Expected a marketplace review record at {uri}"),
         ))),
+    }
+}
+
+/// How a request settles its gate permit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermitOutcome {
+    /// The homeserver answered.
+    Succeeded,
+    /// The homeserver could not be reached or did not answer.
+    Failed,
+}
+
+/// Classifies the result of fetching one review record: how the request
+/// settles its permit, and the record (`None` for a 404) or why it failed.
+///
+/// [fetch_record_capped] returns [EventProcessorError::InvalidEventLine] only
+/// when `read_capped` refuses a body over its byte budget: the connector,
+/// request, deadline and body-stream failures are all
+/// [EventProcessorError::PubkyClientError]. An oversized body comes from a
+/// homeserver that answered, so the request succeeded and the record is
+/// invalid, like any other record that is not a review. Every other failure
+/// counts as an unreachable homeserver.
+fn classify_record_fetch(
+    result: Result<Option<Vec<u8>>, EventProcessorError>,
+) -> (PermitOutcome, Result<Option<Vec<u8>>, ReviewIngestError>) {
+    match result {
+        Ok(record) => (PermitOutcome::Succeeded, Ok(record)),
+        Err(e @ EventProcessorError::InvalidEventLine(_)) => {
+            (PermitOutcome::Succeeded, Err(ReviewIngestError::Invalid(e)))
+        }
+        Err(e) => (
+            PermitOutcome::Failed,
+            Err(ReviewIngestError::Unreachable(e)),
+        ),
     }
 }
 
@@ -912,40 +904,50 @@ pub async fn backfill_trust_buckets() -> Result<TrustBucketBackfill, EventProces
 }
 
 #[cfg(test)]
-mod review_directory_pages_tests {
+mod record_fetch_tests {
     use super::*;
 
-    fn page(owner: &pubky::PublicKey, names: &[&str]) -> Vec<PubkyResource> {
-        names
-            .iter()
-            .map(|name| {
-                marketplace_review_uri_builder(owner.z32(), name.to_string())
-                    .parse()
-                    .unwrap()
-            })
-            .collect()
-    }
-
     #[test]
-    fn review_ids_repeated_across_pages_are_returned_once() {
-        let owner = pubky::Keypair::random().public_key();
-        let mut pages = ReviewDirectoryPages::default();
-        assert_eq!(pages.add_page(&page(&owner, &["a", "b"])), ["a", "b"]);
-        assert_eq!(pages.add_page(&page(&owner, &["b", "c", "a"])), ["c"]);
-        assert_eq!(
-            pages.add_page(&page(&owner, &["a", "b"])),
-            Vec::<&str>::new()
+    fn an_oversized_record_is_an_answered_request_and_an_invalid_record() {
+        let (outcome, result) = classify_record_fetch(Err(EventProcessorError::InvalidEventLine(
+            "Record pubky://a/b exceeds the 2097152 byte limit".to_string(),
+        )));
+        assert_eq!(outcome, PermitOutcome::Succeeded);
+        assert!(
+            matches!(result, Err(ReviewIngestError::Invalid(_))),
+            "{result:?}"
         );
     }
 
     #[test]
-    fn only_the_page_after_the_cap_is_past_it() {
-        let owner = pubky::Keypair::random().public_key();
-        let mut pages = ReviewDirectoryPages::default();
-        for _ in 0..MAX_REVIEW_DIRECTORY_PAGES {
-            assert!(!pages.next_is_past_cap());
-            pages.add_page(&page(&owner, &["a"]));
+    fn a_timeout_or_client_error_is_a_failed_request_and_unreachable() {
+        for error in [
+            EventProcessorError::client_error("fetching pubky://a/b timed out after 30s".into()),
+            EventProcessorError::client_error("connection refused".into()),
+            EventProcessorError::PubkyClientError(
+                nexus_common::db::PubkyClientError::NotInitialized,
+            ),
+        ] {
+            let (outcome, result) = classify_record_fetch(Err(error));
+            assert_eq!(outcome, PermitOutcome::Failed);
+            assert!(
+                matches!(result, Err(ReviewIngestError::Unreachable(_))),
+                "{result:?}"
+            );
         }
-        assert!(pages.next_is_past_cap());
+    }
+
+    #[test]
+    fn a_missing_record_is_an_answered_request_and_gone() {
+        let (outcome, result) = classify_record_fetch(Ok(None));
+        assert_eq!(outcome, PermitOutcome::Succeeded);
+        assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[test]
+    fn a_record_is_an_answered_request() {
+        let (outcome, result) = classify_record_fetch(Ok(Some(b"{}".to_vec())));
+        assert_eq!(outcome, PermitOutcome::Succeeded);
+        assert_eq!(result.unwrap(), Some(b"{}".to_vec()));
     }
 }
