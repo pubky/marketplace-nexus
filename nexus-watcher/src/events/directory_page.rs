@@ -2,12 +2,14 @@
 //!
 //! A homeserver's answer is untrusted: `limit` is only a request to it. A page
 //! is read against a byte budget and a deadline, refused when it has more
-//! entries than were asked for, refused when any entry is not a resource
-//! inside the listed directory, and refused when a full page ends where the
-//! previous one did. Entries are parsed with the SDK's [PubkyResource] parser,
-//! the way the SDK's own LIST does.
+//! entries than were asked for, refused when any entry is not a direct child
+//! of the listed directory (a resource, or a subdirectory ending with `/`),
+//! and refused when a full page ends where the previous one did. Entries are
+//! parsed with the SDK's [PubkyResource] parser, the way the SDK's own LIST
+//! does.
 
-use pubky::{Method, PubkyHttpClient, PubkyResource, StatusCode};
+use nexus_common::db::{PubkyClientError, PubkyConnector};
+use pubky::{Method, PubkyResource, StatusCode};
 use reqwest::Url;
 
 use crate::events::remote_body::{event_feed_budget, read_capped, within, RECORD_FETCH_TIMEOUT};
@@ -17,26 +19,39 @@ use crate::events::EventProcessorError;
 /// ending with `/`), at most `limit` entries from after `cursor`, or `None`
 /// when the homeserver answers 404. The request and the whole body share
 /// [RECORD_FETCH_TIMEOUT].
+///
+/// The request goes over the direct Pubky transport, like the events poll.
+/// The SDK's ICANN-domain fallback is crate-private in pubky 0.9.3 and its
+/// public `get` cannot carry the LIST query, so a homeserver reachable only
+/// through that fallback reads as unreachable here.
 pub async fn fetch_directory_page(
-    client: &PubkyHttpClient,
     directory: &PubkyResource,
     limit: u16,
     cursor: Option<&str>,
 ) -> Result<Option<Vec<PubkyResource>>, EventProcessorError> {
     let url = page_url(directory, limit, cursor)?;
-    within(
-        RECORD_FETCH_TIMEOUT,
-        &format!("listing {}", directory.to_pubky_url()),
-        async {
-            let response = client
-                .request(Method::GET, &url)
-                .send()
-                .await
-                .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
-            read_directory_page(response, directory, limit, cursor).await
-        },
-    )
+    let pubky = PubkyConnector::get()?;
+    let read_page = async {
+        let response = pubky
+            .client()
+            .request(Method::GET, &url)
+            .send()
+            .await
+            .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
+        read_directory_page(response, directory, limit, cursor).await
+    };
+    // The page's own result rides inside `Ok`, so an `Err` from `within` is
+    // only its deadline, and the directory is named on that path alone.
+    within(RECORD_FETCH_TIMEOUT, "listing a directory page", async {
+        Ok(read_page.await)
+    })
     .await
+    .map_err(|timeout| match timeout {
+        EventProcessorError::PubkyClientError(PubkyClientError::ClientError(message)) => {
+            EventProcessorError::client_error(format!("{message}: {}", directory.to_pubky_url()))
+        }
+        other => other,
+    })?
 }
 
 /// The LIST URL of one shallow page, with its query built the way the SDK's
@@ -109,7 +124,8 @@ async fn read_directory_page(
 /// `pubky<owner>/` form) or `https://_pubky.<owner>/<path>` transport URLs.
 /// More than `limit` entries means the homeserver ignored the request, so the
 /// page is refused, and so is a page with any entry that is malformed, owned
-/// by someone else, or not inside `directory`, and a full page that ends at
+/// by someone else, or not a direct child of `directory` (a name, or a name
+/// ending with `/` for a subdirectory), and a full page that ends at
 /// `cursor` (paging would never advance).
 fn parse_directory_page(
     text: &str,
@@ -134,7 +150,7 @@ fn parse_directory_page(
                 .path
                 .as_str()
                 .strip_prefix(directory.path.as_str())
-                .is_some_and(|rest| !rest.is_empty());
+                .is_some_and(is_direct_child);
         if !inside {
             return Err(EventProcessorError::InvalidEventLine(format!(
                 "directory entry is not inside {}: {line}",
@@ -150,6 +166,14 @@ fn parse_directory_page(
         )));
     }
     Ok(entries)
+}
+
+/// Whether `rest`, an entry path after its directory's path, names a direct
+/// child: one non-empty segment, with at most a trailing `/` for a
+/// subdirectory. A nested path would read as the wrong entry name.
+fn is_direct_child(rest: &str) -> bool {
+    let name = rest.strip_suffix('/').unwrap_or(rest);
+    !name.is_empty() && !name.contains('/')
 }
 
 /// One entry line, parsed as the SDK's LIST parses it.
@@ -296,6 +320,23 @@ mod tests {
             let line = pubky_line(&owner, &path);
             assert_refused(parse_directory_page(&line, &dir, PAGE, None), &line);
         }
+    }
+
+    #[test]
+    fn nested_entries_are_refused_and_direct_subdirectories_kept() {
+        let owner = Keypair::random().public_key();
+        let dir = directory(&owner);
+        for path in [
+            format!("{DIRECTORY_PATH}x/y"),
+            format!("{DIRECTORY_PATH}x/y/"),
+        ] {
+            let line = pubky_line(&owner, &path);
+            assert_refused(parse_directory_page(&line, &dir, PAGE, None), &line);
+        }
+        let line = pubky_line(&owner, &format!("{DIRECTORY_PATH}x/"));
+        let entries = parse_directory_page(&line, &dir, PAGE, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entry_name(&entries[0]), None);
     }
 
     #[test]

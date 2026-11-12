@@ -5,7 +5,7 @@ use crate::events::remote_body::{fetch_record_capped, within, MAX_RECORD_BYTES};
 use crate::events::EventProcessorError;
 
 use nexus_common::db::queries::get::user_is_safe_to_delete;
-use nexus_common::db::{execute_graph_operation, OperationOutcome, PubkyConnector};
+use nexus_common::db::{execute_graph_operation, OperationOutcome};
 use nexus_common::models::{
     marketplace::{ListingDetails, ModeratedUser},
     traits::Collection,
@@ -311,17 +311,12 @@ async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventP
         async {
             let directory: PubkyResource =
                 listing_uri_builder(user_id.to_string(), String::new()).parse()?;
-            let pubky = PubkyConnector::get()?;
             let mut pages = ListingIdPages::default();
             let mut cursor: Option<String> = None;
             loop {
-                let Some(entries) = fetch_directory_page(
-                    pubky.client(),
-                    &directory,
-                    LISTING_RESTORE_PAGE,
-                    cursor.as_deref(),
-                )
-                .await?
+                let Some(entries) =
+                    fetch_directory_page(&directory, LISTING_RESTORE_PAGE, cursor.as_deref())
+                        .await?
                 else {
                     return Ok(pages.ids);
                 };

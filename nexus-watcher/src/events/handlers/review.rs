@@ -473,6 +473,10 @@ pub enum UserScanError {
 /// Review directory entries read per LIST page.
 const REVIEW_DIRECTORY_PAGE: u16 = 500;
 
+/// Most LIST pages read for one user's reviews directory (10,000 entries). A
+/// homeserver chooses what each page holds, so the paging is bounded here.
+const MAX_REVIEW_DIRECTORY_PAGES: usize = 20;
+
 /// One user's discovery pass through a request gate. Every LIST page and
 /// every record GET takes a permit from `gate`, and the tallies go to
 /// `summary`, which holds what was done so far when the gate stops the scan.
@@ -487,22 +491,18 @@ pub async fn scan_user_reviews(
         .into_iter()
         .collect();
 
-    let pubky = PubkyConnector::get().map_err(|e| UserScanError::Failed(e.into()))?;
+    // The page reader takes the connector itself; checking it here keeps a
+    // missing connector a failed scan rather than an unreachable homeserver.
+    PubkyConnector::get().map_err(|e| UserScanError::Failed(e.into()))?;
     let directory: PubkyResource =
         marketplace_review_uri_builder(user_id.to_string(), String::new())
             .parse()
             .map_err(|e: pubky::Error| UserScanError::Failed(e.into()))?;
 
     let mut cursor: Option<String> = None;
-    loop {
+    for _ in 0..MAX_REVIEW_DIRECTORY_PAGES {
         let permit = gate.acquire().await.map_err(UserScanError::Stopped)?;
-        let page = fetch_directory_page(
-            pubky.client(),
-            &directory,
-            REVIEW_DIRECTORY_PAGE,
-            cursor.as_deref(),
-        )
-        .await;
+        let page = fetch_directory_page(&directory, REVIEW_DIRECTORY_PAGE, cursor.as_deref()).await;
         let entries = match page {
             Ok(Some(entries)) => {
                 permit.succeeded();
@@ -558,6 +558,13 @@ pub async fn scan_user_reviews(
             return Ok(());
         }
     }
+    // Reviews ingested so far stay indexed; a re-run picks up the rest.
+    warn!(
+        "Review directory for user {} has more than {} pages; stopping",
+        user_id, MAX_REVIEW_DIRECTORY_PAGES
+    );
+    summary.failed += 1;
+    Ok(())
 }
 
 /// Why reading or ingesting one review record failed.
