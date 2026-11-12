@@ -2,7 +2,7 @@
 //! same graph as the one-shot migrations, once, resumably, and never resurrect
 //! a review the event feed deleted after the backfill read it.
 
-use super::review_trust_buckets::{buyer, market, Market, Order};
+use super::review_trust_buckets::{buyer, listing_summary, market, Market, Order};
 use super::utils::{attestor_pubky, test_attestor_key};
 use crate::event_processor::utils::watcher::WatcherTest;
 use anyhow::Result;
@@ -204,6 +204,12 @@ async fn the_trust_bucket_job_gives_the_migrations_graph_once() -> Result<()> {
         (2, 2, 5)
     );
     assert_eq!(summary.count, 2, "no review is counted twice");
+    let listing = listing_summary(&market).await;
+    assert_eq!(
+        listing.buckets[&attestor_id].first_iat,
+        Some(1_790_000_901),
+        "the listing aggregate is recomputed with its buckets too"
+    );
 
     // Once only: a second run sends nothing and changes nothing.
     let again = run(&job, options()).await;
@@ -470,6 +476,12 @@ async fn the_discovery_job_indexes_unseen_reviews_once_and_counts_each_outcome()
     assert_eq!(counters.failed, 0);
     let details = indexed(&buyer_id, &review_id).await.expect("indexed");
     assert_eq!(details.iat, Some(1_790_000_941));
+    assert!(
+        details.verified,
+        "the attestation verifies during the backfill ingest"
+    );
+    assert_eq!(details.rating_overall, 5);
+    assert_eq!(details.subject_id, market.seller_id);
     assert_eq!(seller_summary(&market.seller_id).await.unwrap().count, 1);
 
     // Once only: nothing is asked again, so the gone and unreachable users

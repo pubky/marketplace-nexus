@@ -299,7 +299,7 @@ Before pointing Shop at the production marketplace Nexus URL:
    - Confirm `GET /v0/shop/{seller_id}/reputation` returns 200 when at least one review exists, or 404 for an honestly new seller with no reviews.
 5. Backfill migrations, if needed after replay:
    - Run `ListingAuctionTermsReindex1787256279` only if auction rows missing term fields are detected.
-   - Run `ReviewBackfill1787905961` only after a substantial user set is indexed; it scans `MATCH (u:User)` and cannot discover users from an empty graph.
+   - Run `nexusd db backfill reviews --job review-discovery` (it replaces the retired `ReviewBackfill1787905961` migration) only after a substantial user set is indexed; it scans `MATCH (u:User)` and cannot discover users from an empty graph.
 
 ## Verification That Differed From The Brief
 
