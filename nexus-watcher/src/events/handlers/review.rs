@@ -1,7 +1,6 @@
 use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
-use crate::events::directory_page::fetch_directory_page;
+use crate::events::directory_page::{entry_name, fetch_directory_page, next_cursor};
 use crate::events::handlers::listing::is_homeserver_not_found;
-use crate::events::remote_body::{within, RECORD_FETCH_TIMEOUT};
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use nexus_common::db::reindex::{get_all_user_ids, get_indexed_review_ids};
@@ -490,23 +489,18 @@ pub async fn scan_user_reviews(
 
     let pubky = PubkyConnector::get().map_err(|e| UserScanError::Failed(e.into()))?;
     let directory: PubkyResource =
-        format!("pubky://{user_id}/pub/pubky.app/marketplace/v1/reviews/")
+        marketplace_review_uri_builder(user_id.to_string(), String::new())
             .parse()
             .map_err(|e: pubky::Error| UserScanError::Failed(e.into()))?;
 
     let mut cursor: Option<String> = None;
     loop {
         let permit = gate.acquire().await.map_err(UserScanError::Stopped)?;
-        // One deadline covers the request and the whole body of the page.
-        let page = within(
-            RECORD_FETCH_TIMEOUT,
-            &format!("listing the reviews of {user_id}"),
-            fetch_directory_page(
-                pubky.client(),
-                &directory,
-                REVIEW_DIRECTORY_PAGE,
-                cursor.as_deref(),
-            ),
+        let page = fetch_directory_page(
+            pubky.client(),
+            &directory,
+            REVIEW_DIRECTORY_PAGE,
+            cursor.as_deref(),
         )
         .await;
         let entries = match page {
@@ -533,25 +527,8 @@ pub async fn scan_user_reviews(
                 return Ok(());
             }
         };
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let full_page = entries.len() == usize::from(REVIEW_DIRECTORY_PAGE);
-        let last = entries.last().map(PubkyResource::to_pubky_url);
-        if full_page && last == cursor {
-            warn!(
-                "Review directory for user {} did not advance its cursor; skipping",
-                user_id
-            );
-            summary.unreachable += 1;
-            return Ok(());
-        }
 
-        for entry in &entries {
-            let url = entry.to_pubky_url();
-            let Some(review_id) = url.rsplit('/').next().filter(|id| !id.is_empty()) else {
-                continue;
-            };
+        for review_id in entries.iter().filter_map(entry_name) {
             if indexed.contains(review_id) {
                 summary.already_indexed += 1;
                 continue;
@@ -576,10 +553,10 @@ pub async fn scan_user_reviews(
             }
         }
 
-        if !full_page {
+        cursor = next_cursor(&entries, REVIEW_DIRECTORY_PAGE);
+        if cursor.is_none() {
             return Ok(());
         }
-        cursor = last;
     }
 }
 

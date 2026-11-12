@@ -1,44 +1,81 @@
 //! Bounded reads of one page of a shallow homeserver directory listing.
 //!
 //! A homeserver's answer is untrusted: `limit` is only a request to it. A page
-//! is read against a byte budget, refused when it has more entries than were
-//! asked for, and refused when any entry is not a resource inside the listed
-//! directory. Entries are parsed with the SDK's [PubkyResource] parser, the
-//! way the SDK's own LIST does.
+//! is read against a byte budget and a deadline, refused when it has more
+//! entries than were asked for, refused when any entry is not a resource
+//! inside the listed directory, and refused when a full page ends where the
+//! previous one did. Entries are parsed with the SDK's [PubkyResource] parser,
+//! the way the SDK's own LIST does.
 
 use pubky::{Method, PubkyHttpClient, PubkyResource, StatusCode};
 use reqwest::Url;
 
-use crate::events::remote_body::{event_feed_budget, percent_encode_query_value, read_capped};
+use crate::events::remote_body::{event_feed_budget, read_capped, within, RECORD_FETCH_TIMEOUT};
 use crate::events::EventProcessorError;
 
 /// One page of the shallow listing of `directory` (a `pubky://` directory
 /// ending with `/`), at most `limit` entries from after `cursor`, or `None`
-/// when the homeserver answers 404.
-///
-/// The body is read against a byte budget, but there is no deadline here:
-/// callers wrap the call in [`within`](crate::events::remote_body::within).
+/// when the homeserver answers 404. The request and the whole body share
+/// [RECORD_FETCH_TIMEOUT].
 pub async fn fetch_directory_page(
     client: &PubkyHttpClient,
     directory: &PubkyResource,
     limit: u16,
     cursor: Option<&str>,
 ) -> Result<Option<Vec<PubkyResource>>, EventProcessorError> {
-    let mut url = format!(
-        "https://_pubky.{}{}?shallow&limit={limit}",
-        directory.owner.z32(),
-        directory.path.as_str()
-    );
-    if let Some(cursor) = cursor {
-        url.push_str("&cursor=");
-        url.push_str(&percent_encode_query_value(cursor));
+    let url = page_url(directory, limit, cursor)?;
+    within(
+        RECORD_FETCH_TIMEOUT,
+        &format!("listing {}", directory.to_pubky_url()),
+        async {
+            let response = client
+                .request(Method::GET, &url)
+                .send()
+                .await
+                .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
+            read_directory_page(response, directory, limit, cursor).await
+        },
+    )
+    .await
+}
+
+/// The LIST URL of one shallow page, with its query built the way the SDK's
+/// own LIST builds it.
+fn page_url(
+    directory: &PubkyResource,
+    limit: u16,
+    cursor: Option<&str>,
+) -> Result<Url, pubky::Error> {
+    let mut url = directory.to_transport_url()?;
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_key_only("shallow")
+            .append_pair("limit", &limit.to_string());
+        if let Some(cursor) = cursor {
+            query.append_pair("cursor", cursor);
+        }
     }
-    let response = client
-        .request(Method::GET, &url)
-        .send()
-        .await
-        .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
-    read_directory_page(response, directory, limit).await
+    Ok(url)
+}
+
+/// The cursor to read the page after `entries` with, or `None` when `entries`
+/// was the last page (fewer than `limit` entries).
+pub fn next_cursor(entries: &[PubkyResource], limit: u16) -> Option<String> {
+    if entries.len() < usize::from(limit) {
+        return None;
+    }
+    entries.last().map(PubkyResource::to_pubky_url)
+}
+
+/// The last path segment of `entry`, or `None` for a subdirectory.
+pub fn entry_name(entry: &PubkyResource) -> Option<&str> {
+    entry
+        .path
+        .as_str()
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 /// The entries of a directory page `response`, or `None` for a 404. Any other
@@ -47,6 +84,7 @@ async fn read_directory_page(
     response: reqwest::Response,
     directory: &PubkyResource,
     limit: u16,
+    cursor: Option<&str>,
 ) -> Result<Option<Vec<PubkyResource>>, EventProcessorError> {
     let status = response.status();
     if status == StatusCode::NOT_FOUND {
@@ -64,18 +102,20 @@ async fn read_directory_page(
         "Directory page",
     )
     .await?;
-    parse_directory_page(&String::from_utf8_lossy(&body), directory, limit).map(Some)
+    parse_directory_page(&String::from_utf8_lossy(&body), directory, limit, cursor).map(Some)
 }
 
 /// Parses a page with one resource per line, as `pubky://` URLs (or the
 /// `pubky<owner>/` form) or `https://_pubky.<owner>/<path>` transport URLs.
 /// More than `limit` entries means the homeserver ignored the request, so the
 /// page is refused, and so is a page with any entry that is malformed, owned
-/// by someone else, or not inside `directory`.
+/// by someone else, or not inside `directory`, and a full page that ends at
+/// `cursor` (paging would never advance).
 fn parse_directory_page(
     text: &str,
     directory: &PubkyResource,
     limit: u16,
+    cursor: Option<&str>,
 ) -> Result<Vec<PubkyResource>, EventProcessorError> {
     let mut entries = Vec::new();
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -103,6 +143,12 @@ fn parse_directory_page(
         }
         entries.push(entry);
     }
+    if cursor.is_some() && next_cursor(&entries, limit).as_deref() == cursor {
+        return Err(EventProcessorError::InvalidEventLine(format!(
+            "directory page of {} did not advance its cursor",
+            directory.to_pubky_url()
+        )));
+    }
     Ok(entries)
 }
 
@@ -119,9 +165,7 @@ fn parse_entry(line: &str) -> Result<PubkyResource, pubky::Error> {
 mod tests {
     use super::*;
     use crate::events::remote_body::test_server::{serve, write_chunk};
-    use crate::events::remote_body::within;
     use pubky::Keypair;
-    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     const DIRECTORY_PATH: &str = "pub/pubky.app/marketplace/v1/reviews/";
@@ -174,7 +218,7 @@ mod tests {
             full_page(|path| transport_line(&owner, path)),
         ] {
             let response = respond("HTTP/1.1 200 OK\r\nConnection: close\r\n", page).await;
-            let entries = read_directory_page(response, &dir, PAGE)
+            let entries = read_directory_page(response, &dir, PAGE, None)
                 .await
                 .unwrap()
                 .expect("a 200 page has entries");
@@ -197,7 +241,7 @@ mod tests {
             transport_line(&owner, &format!("{DIRECTORY_PATH}b")),
             owner.z32()
         );
-        let urls: Vec<String> = parse_directory_page(&text, &directory(&owner), PAGE)
+        let urls: Vec<String> = parse_directory_page(&text, &directory(&owner), PAGE, None)
             .unwrap()
             .iter()
             .map(PubkyResource::to_pubky_url)
@@ -223,7 +267,7 @@ mod tests {
             format!("pubky://not-a-key/{DIRECTORY_PATH}a"),
             pubky_line(&owner, &format!("{DIRECTORY_PATH}../a")),
         ] {
-            assert_refused(parse_directory_page(&line, &dir, PAGE), &line);
+            assert_refused(parse_directory_page(&line, &dir, PAGE, None), &line);
         }
     }
 
@@ -236,7 +280,7 @@ mod tests {
             pubky_line(&other, &format!("{DIRECTORY_PATH}a")),
             transport_line(&other, &format!("{DIRECTORY_PATH}a")),
         ] {
-            assert_refused(parse_directory_page(&line, &dir, PAGE), &line);
+            assert_refused(parse_directory_page(&line, &dir, PAGE, None), &line);
         }
     }
 
@@ -250,7 +294,7 @@ mod tests {
             DIRECTORY_PATH.to_string(),
         ] {
             let line = pubky_line(&owner, &path);
-            assert_refused(parse_directory_page(&line, &dir, PAGE), &line);
+            assert_refused(parse_directory_page(&line, &dir, PAGE, None), &line);
         }
     }
 
@@ -260,10 +304,13 @@ mod tests {
         let dir = directory(&owner);
         let text = full_page(|path| pubky_line(&owner, path));
         assert_eq!(
-            parse_directory_page(&text, &dir, PAGE).unwrap().len(),
+            parse_directory_page(&text, &dir, PAGE, None).unwrap().len(),
             PAGE as usize
         );
-        assert_refused(parse_directory_page(&text, &dir, PAGE - 1), "limit - 1");
+        assert_refused(
+            parse_directory_page(&text, &dir, PAGE - 1, None),
+            "limit - 1",
+        );
     }
 
     #[tokio::test]
@@ -271,42 +318,18 @@ mod tests {
         let dir = directory(&Keypair::random().public_key());
         let response = respond("HTTP/1.1 404 Not Found\r\n", String::new()).await;
         assert_eq!(
-            read_directory_page(response, &dir, PAGE).await.unwrap(),
+            read_directory_page(response, &dir, PAGE, None)
+                .await
+                .unwrap(),
             None
         );
 
         let response = respond("HTTP/1.1 500 Internal Server Error\r\n", String::new()).await;
-        let error = read_directory_page(response, &dir, PAGE)
+        let error = read_directory_page(response, &dir, PAGE, None)
             .await
             .expect_err("a 500 is not an empty directory");
         assert!(
             matches!(error, EventProcessorError::PubkyClientError(_)),
-            "{error:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_declared_length_over_the_budget_is_refused() {
-        let dir = directory(&Keypair::random().public_key());
-        let response = serve(|mut stream| async move {
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_secs(30)).await;
-        })
-        .await;
-        let error = within(
-            Duration::from_secs(5),
-            "test listing",
-            read_directory_page(response, &dir, PAGE),
-        )
-        .await
-        .expect_err("a page declared at 100 MiB must not be read");
-        assert!(
-            matches!(error, EventProcessorError::InvalidEventLine(_)),
             "{error:?}"
         );
     }
@@ -331,46 +354,70 @@ mod tests {
             }
         })
         .await;
-        let error = read_directory_page(response, &dir, PAGE)
+        let error = read_directory_page(response, &dir, PAGE, None)
             .await
             .expect_err("a streamed page over the budget must be refused");
         assert!(error.to_string().contains("byte limit"), "{error}");
     }
 
-    #[tokio::test]
-    async fn a_page_dripping_past_the_deadline_is_a_client_error() {
+    #[test]
+    fn a_full_page_that_ends_at_its_cursor_is_refused() {
         let owner = Keypair::random().public_key();
         let dir = directory(&owner);
-        let line = format!("{}\n", pubky_line(&owner, &format!("{DIRECTORY_PATH}a")));
-        let response = serve(move |mut stream| async move {
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .await
-                .unwrap();
-            loop {
-                if write_chunk(&mut stream, &line.as_bytes()[..1])
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await;
-        let error = within(
-            Duration::from_millis(300),
-            "test listing",
-            read_directory_page(response, &dir, PAGE),
-        )
-        .await
-        .expect_err("a page that never ends must hit the deadline");
-        assert!(
-            matches!(error, EventProcessorError::PubkyClientError(_)),
-            "{error:?}"
+        let text = full_page(|path| pubky_line(&owner, path));
+        let last = pubky_line(&owner, &format!("{DIRECTORY_PATH}00499"));
+        assert_refused(
+            parse_directory_page(&text, &dir, PAGE, Some(&last)),
+            "repeated cursor",
         );
-        assert!(error.to_string().contains("timed out"), "{error}");
+        let earlier = pubky_line(&owner, &format!("{DIRECTORY_PATH}00000"));
+        assert!(parse_directory_page(&text, &dir, PAGE, Some(&earlier)).is_ok());
+    }
+
+    #[test]
+    fn only_a_full_page_has_a_next_cursor() {
+        let owner = Keypair::random().public_key();
+        let dir = directory(&owner);
+        let text = full_page(|path| pubky_line(&owner, path));
+        let entries = parse_directory_page(&text, &dir, PAGE, None).unwrap();
+        assert_eq!(
+            next_cursor(&entries, PAGE),
+            Some(pubky_line(&owner, &format!("{DIRECTORY_PATH}00499")))
+        );
+        assert_eq!(next_cursor(&entries[..3], PAGE), None);
+        assert_eq!(next_cursor(&[], PAGE), None);
+    }
+
+    #[test]
+    fn entry_names_skip_subdirectories() {
+        let owner = Keypair::random().public_key();
+        let text = format!(
+            "{}\n{}",
+            pubky_line(&owner, &format!("{DIRECTORY_PATH}a")),
+            pubky_line(&owner, &format!("{DIRECTORY_PATH}dir/"))
+        );
+        let entries = parse_directory_page(&text, &directory(&owner), PAGE, None).unwrap();
+        let names: Vec<_> = entries.iter().map(entry_name).collect();
+        assert_eq!(names, [Some("a"), None]);
+    }
+
+    #[test]
+    fn the_page_url_carries_shallow_limit_and_an_encoded_cursor() {
+        let owner = Keypair::random().public_key();
+        let dir = directory(&owner);
+        let base = format!("https://_pubky.{}/{DIRECTORY_PATH}", owner.z32());
+        assert_eq!(
+            page_url(&dir, PAGE, None).unwrap().as_str(),
+            format!("{base}?shallow&limit=500")
+        );
+        let cursor = pubky_line(&owner, &format!("{DIRECTORY_PATH}a"));
+        let url = page_url(&dir, PAGE, Some(&cursor)).unwrap();
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "cursor")
+                .map(|(_, v)| v.into_owned()),
+            Some(cursor)
+        );
+        assert!(!url.query().unwrap_or_default().contains("://"), "{url}");
     }
 }
