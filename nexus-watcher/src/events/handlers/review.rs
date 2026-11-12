@@ -1,5 +1,7 @@
 use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
+use crate::events::directory_page::fetch_directory_page;
 use crate::events::handlers::listing::is_homeserver_not_found;
+use crate::events::remote_body::{within, RECORD_FETCH_TIMEOUT};
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use nexus_common::db::reindex::{get_all_user_ids, get_indexed_review_ids};
@@ -11,6 +13,7 @@ use nexus_common::models::marketplace::{
 };
 use nexus_common::models::user::UserDetails;
 use nexus_common::types::DynError;
+use pubky::PubkyResource;
 use pubky_app_specs::{
     marketplace_review_uri_builder, PubkyAppMarketplaceReview, PubkyAppObject, PubkyAppReviewRole,
     PubkyId, Resource,
@@ -468,6 +471,9 @@ pub enum UserScanError {
     Failed(DynError),
 }
 
+/// Review directory entries read per LIST page.
+const REVIEW_DIRECTORY_PAGE: u16 = 500;
+
 /// One user's discovery pass through a request gate. Every LIST page and
 /// every record GET takes a permit from `gate`, and the tallies go to
 /// `summary`, which holds what was done so far when the gate stops the scan.
@@ -483,29 +489,35 @@ pub async fn scan_user_reviews(
         .collect();
 
     let pubky = PubkyConnector::get().map_err(|e| UserScanError::Failed(e.into()))?;
-    let storage = pubky.public_storage();
-    let directory = format!("pubky://{user_id}/pub/pubky.app/marketplace/v1/reviews/");
+    let directory: PubkyResource =
+        format!("pubky://{user_id}/pub/pubky.app/marketplace/v1/reviews/")
+            .parse()
+            .map_err(|e: pubky::Error| UserScanError::Failed(e.into()))?;
 
     let mut cursor: Option<String> = None;
     loop {
-        let mut request = storage
-            .list(directory.as_str())
-            .map_err(|e| UserScanError::Failed(e.into()))?
-            .shallow(true)
-            .limit(500);
-        if let Some(cursor_value) = &cursor {
-            request = request.cursor(cursor_value);
-        }
         let permit = gate.acquire().await.map_err(UserScanError::Stopped)?;
-        let entries = match request.send().await {
-            Ok(entries) => {
+        // One deadline covers the request and the whole body of the page.
+        let page = within(
+            RECORD_FETCH_TIMEOUT,
+            &format!("listing the reviews of {user_id}"),
+            fetch_directory_page(
+                pubky.client(),
+                &directory,
+                REVIEW_DIRECTORY_PAGE,
+                cursor.as_deref(),
+            ),
+        )
+        .await;
+        let entries = match page {
+            Ok(Some(entries)) => {
                 permit.succeeded();
                 entries
             }
             // A user with no reviews directory answers 404. Other LIST
             // failures mean this user's homeserver is unreachable. Neither
             // case may permanently block the one-shot migration.
-            Err(e) if is_homeserver_not_found(&e) => {
+            Ok(None) => {
                 permit.succeeded();
                 debug!("Review directory for user {} is gone", user_id);
                 summary.gone += 1;
@@ -522,6 +534,16 @@ pub async fn scan_user_reviews(
             }
         };
         if entries.is_empty() {
+            return Ok(());
+        }
+        let full_page = entries.len() == usize::from(REVIEW_DIRECTORY_PAGE);
+        let last = entries.last().map(PubkyResource::to_pubky_url);
+        if full_page && last == cursor {
+            warn!(
+                "Review directory for user {} did not advance its cursor; skipping",
+                user_id
+            );
+            summary.unreachable += 1;
             return Ok(());
         }
 
@@ -554,10 +576,10 @@ pub async fn scan_user_reviews(
             }
         }
 
-        if entries.len() < 500 {
+        if !full_page {
             return Ok(());
         }
-        cursor = entries.last().map(|entry| entry.to_pubky_url());
+        cursor = last;
     }
 }
 

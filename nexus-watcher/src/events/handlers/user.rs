@@ -1,9 +1,7 @@
 use super::listing::{self, ModerationChecks};
 use super::{review, shop};
-use crate::events::remote_body::{
-    event_feed_budget, fetch_record_capped, percent_encode_query_value, read_capped, within,
-    MAX_RECORD_BYTES,
-};
+use crate::events::directory_page::fetch_directory_page;
+use crate::events::remote_body::{fetch_record_capped, within, MAX_RECORD_BYTES};
 use crate::events::EventProcessorError;
 
 use nexus_common::db::queries::get::user_is_safe_to_delete;
@@ -13,7 +11,7 @@ use nexus_common::models::{
     traits::Collection,
     user::{UserCounts, UserDetails, UserSearch, USER_DELETED_SENTINEL},
 };
-use pubky::Method;
+use pubky::PubkyResource;
 use pubky_app_specs::{
     listing_uri_builder, shop_uri_builder, user_uri_builder, PubkyAppObject, PubkyAppUser, PubkyId,
     Resource,
@@ -317,78 +315,6 @@ impl ListingIdPages {
 /// every listing record. Each step has its own tighter deadline.
 const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 
-/// One page of a shallow directory listing as `pubky://<owner>/<path>` URLs.
-///
-/// A homeserver answers with one resource per line, as `pubky://` URLs or
-/// `https://_pubky.<owner>/<path>` transport URLs. More lines than the page
-/// size means the homeserver ignored the `limit`, so the page is refused.
-fn parse_directory_page(text: &str) -> Result<Vec<String>, EventProcessorError> {
-    let mut urls = Vec::new();
-    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if urls.len() == LISTING_RESTORE_PAGE as usize {
-            return Err(EventProcessorError::InvalidEventLine(format!(
-                "directory page has more than {LISTING_RESTORE_PAGE} entries"
-            )));
-        }
-        let url = if line.starts_with("pubky://") {
-            line.to_string()
-        } else if let Some(rest) = line
-            .strip_prefix("https://")
-            .or_else(|| line.strip_prefix("http://"))
-        {
-            let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-            let owner = host.strip_prefix("_pubky.").ok_or_else(|| {
-                EventProcessorError::InvalidEventLine(format!(
-                    "directory entry is not a Pubky resource: {line}"
-                ))
-            })?;
-            format!("pubky://{owner}/{path}")
-        } else {
-            return Err(EventProcessorError::InvalidEventLine(format!(
-                "directory entry is not a URL: {line}"
-            )));
-        };
-        urls.push(url);
-    }
-    Ok(urls)
-}
-
-/// One page of the user's listings directory, or `None` when the homeserver
-/// answers 404. The body is read against a byte budget.
-async fn list_directory_page(
-    directory: &str,
-    cursor: Option<&str>,
-) -> Result<Option<Vec<String>>, EventProcessorError> {
-    let resource = directory.strip_prefix("pubky://").unwrap_or(directory);
-    let mut url = format!("https://_pubky.{resource}?shallow&limit={LISTING_RESTORE_PAGE}");
-    if let Some(cursor) = cursor {
-        url.push_str("&cursor=");
-        url.push_str(&percent_encode_query_value(cursor));
-    }
-    let response = PubkyConnector::get()?
-        .client()
-        .request(Method::GET, &url)
-        .send()
-        .await
-        .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
-    let status = response.status();
-    if status == pubky::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(EventProcessorError::client_error(format!(
-            "listing {directory} answered {status}"
-        )));
-    }
-    let body = read_capped(
-        response,
-        event_feed_budget(LISTING_RESTORE_PAGE as u32),
-        "Listings directory page",
-    )
-    .await?;
-    parse_directory_page(&String::from_utf8_lossy(&body)).map(Some)
-}
-
 /// The ids of every listing record in the user's listings directory on their
 /// homeserver (cursor-paginated, bounded by [MAX_RESTORED_LISTINGS],
 /// [LISTING_DIRECTORY_TIMEOUT] and a byte budget per page). A user with no
@@ -398,13 +324,23 @@ async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventP
         LISTING_DIRECTORY_TIMEOUT,
         &format!("listing the listings of {user_id}"),
         async {
-            let directory = listing_uri_builder(user_id.to_string(), String::new());
+            let directory: PubkyResource =
+                listing_uri_builder(user_id.to_string(), String::new()).parse()?;
+            let pubky = PubkyConnector::get()?;
             let mut pages = ListingIdPages::default();
             let mut cursor: Option<String> = None;
             loop {
-                let Some(urls) = list_directory_page(&directory, cursor.as_deref()).await? else {
+                let Some(entries) = fetch_directory_page(
+                    pubky.client(),
+                    &directory,
+                    LISTING_RESTORE_PAGE,
+                    cursor.as_deref(),
+                )
+                .await?
+                else {
                     return Ok(pages.ids);
                 };
+                let urls: Vec<String> = entries.iter().map(PubkyResource::to_pubky_url).collect();
                 match pages.add_page(&urls)? {
                     Some(next) => cursor = Some(next),
                     None => return Ok(pages.ids),
@@ -418,48 +354,6 @@ async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventP
 #[cfg(test)]
 mod listing_id_pages_tests {
     use super::*;
-
-    const OWNER: &str = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
-
-    #[test]
-    fn directory_pages_accept_pubky_and_transport_urls() {
-        let text = format!(
-            "pubky://{OWNER}/pub/x/a\nhttps://_pubky.{OWNER}/pub/x/b\n\nhttp://_pubky.{OWNER}/pub/x/dir/\n"
-        );
-        assert_eq!(
-            parse_directory_page(&text).unwrap(),
-            [
-                format!("pubky://{OWNER}/pub/x/a"),
-                format!("pubky://{OWNER}/pub/x/b"),
-                format!("pubky://{OWNER}/pub/x/dir/"),
-            ]
-        );
-    }
-
-    #[test]
-    fn directory_pages_refuse_other_lines() {
-        for line in ["garbage", "https://example.com/pub/x", "ftp://a/b"] {
-            assert!(
-                matches!(
-                    parse_directory_page(line),
-                    Err(EventProcessorError::InvalidEventLine(_))
-                ),
-                "{line}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_page_longer_than_the_limit_is_refused() {
-        let line = format!("pubky://{OWNER}/pub/x/a\n");
-        let page = line.repeat(LISTING_RESTORE_PAGE as usize);
-        assert_eq!(
-            parse_directory_page(&page).unwrap().len(),
-            LISTING_RESTORE_PAGE as usize
-        );
-        let over = line.repeat(LISTING_RESTORE_PAGE as usize + 1);
-        assert!(parse_directory_page(&over).is_err());
-    }
 
     fn page(prefix: &str, count: usize) -> Vec<String> {
         (0..count)
