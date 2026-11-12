@@ -8,8 +8,7 @@
 //! parsed with the SDK's [PubkyResource] parser, the way the SDK's own LIST
 //! does.
 
-use nexus_common::db::{PubkyClientError, PubkyConnector};
-use pubky::{Method, PubkyResource, StatusCode};
+use pubky::{Method, PubkyHttpClient, PubkyResource, StatusCode};
 use reqwest::Url;
 
 use crate::events::remote_body::{event_feed_budget, read_capped, within, RECORD_FETCH_TIMEOUT};
@@ -25,33 +24,25 @@ use crate::events::EventProcessorError;
 /// public `get` cannot carry the LIST query, so a homeserver reachable only
 /// through that fallback reads as unreachable here.
 pub async fn fetch_directory_page(
+    client: &PubkyHttpClient,
     directory: &PubkyResource,
     limit: u16,
     cursor: Option<&str>,
 ) -> Result<Option<Vec<PubkyResource>>, EventProcessorError> {
     let url = page_url(directory, limit, cursor)?;
-    let pubky = PubkyConnector::get()?;
-    let read_page = async {
-        let response = pubky
-            .client()
-            .request(Method::GET, &url)
-            .send()
-            .await
-            .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
-        read_directory_page(response, directory, limit, cursor).await
-    };
-    // The page's own result rides inside `Ok`, so an `Err` from `within` is
-    // only its deadline, and the directory is named on that path alone.
-    within(RECORD_FETCH_TIMEOUT, "listing a directory page", async {
-        Ok(read_page.await)
-    })
+    within(
+        RECORD_FETCH_TIMEOUT,
+        &format!("listing {}", directory.to_pubky_url()),
+        async {
+            let response = client
+                .request(Method::GET, &url)
+                .send()
+                .await
+                .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
+            read_directory_page(response, directory, limit, cursor).await
+        },
+    )
     .await
-    .map_err(|timeout| match timeout {
-        EventProcessorError::PubkyClientError(PubkyClientError::ClientError(message)) => {
-            EventProcessorError::client_error(format!("{message}: {}", directory.to_pubky_url()))
-        }
-        other => other,
-    })?
 }
 
 /// The LIST URL of one shallow page, with its query built the way the SDK's

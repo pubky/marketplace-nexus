@@ -5,7 +5,7 @@ use crate::events::remote_body::{fetch_record_capped, within, MAX_RECORD_BYTES};
 use crate::events::EventProcessorError;
 
 use nexus_common::db::queries::get::user_is_safe_to_delete;
-use nexus_common::db::{execute_graph_operation, OperationOutcome};
+use nexus_common::db::{execute_graph_operation, OperationOutcome, PubkyConnector};
 use nexus_common::models::{
     marketplace::{ListingDetails, ModeratedUser},
     traits::Collection,
@@ -268,20 +268,32 @@ async fn fetch_record(uri: &str) -> Result<Option<Vec<u8>>, EventProcessorError>
 /// by a homeserver the seller chooses, so its length is bounded here.
 const MAX_RESTORED_LISTINGS: usize = 10_000;
 
+/// Most listings directory pages read for one seller: enough for
+/// [MAX_RESTORED_LISTINGS] distinct ids and one more page. Ids are
+/// de-duplicated, so a homeserver repeating its pages never reaches that cap.
+const MAX_LISTING_DIRECTORY_PAGES: usize =
+    MAX_RESTORED_LISTINGS / LISTING_RESTORE_PAGE as usize + 1;
+
 /// Budget for paging a whole listings directory.
 const LISTING_DIRECTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Accumulates the entries of a listings directory, refusing a homeserver
-/// that serves more ids than [MAX_RESTORED_LISTINGS].
+/// that serves more ids than [MAX_RESTORED_LISTINGS] or more pages than
+/// [MAX_LISTING_DIRECTORY_PAGES].
 #[derive(Default)]
 struct ListingIdPages {
     ids: Vec<String>,
     seen: std::collections::HashSet<String>,
+    pages: usize,
 }
 
 impl ListingIdPages {
-    /// Adds the listing ids of one page of entries.
-    fn add_page(&mut self, entries: &[PubkyResource]) -> Result<(), EventProcessorError> {
+    /// Adds the listing ids of one page of entries and returns the cursor of
+    /// the page after it, or `None` when this page was the last.
+    fn add_page(
+        &mut self,
+        entries: &[PubkyResource],
+    ) -> Result<Option<String>, EventProcessorError> {
         for listing_id in entries.iter().filter_map(entry_name) {
             if self.seen.insert(listing_id.to_string()) {
                 if self.ids.len() == MAX_RESTORED_LISTINGS {
@@ -292,7 +304,14 @@ impl ListingIdPages {
                 self.ids.push(listing_id.to_string());
             }
         }
-        Ok(())
+        self.pages += 1;
+        let cursor = next_cursor(entries, LISTING_RESTORE_PAGE);
+        if cursor.is_some() && self.pages == MAX_LISTING_DIRECTORY_PAGES {
+            return Err(EventProcessorError::InvalidEventLine(format!(
+                "listings directory has more than {MAX_LISTING_DIRECTORY_PAGES} pages"
+            )));
+        }
+        Ok(cursor)
     }
 }
 
@@ -302,8 +321,8 @@ const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800
 
 /// The ids of every listing record in the user's listings directory on their
 /// homeserver (cursor-paginated, bounded by [MAX_RESTORED_LISTINGS],
-/// [LISTING_DIRECTORY_TIMEOUT] and a byte budget per page). A user with no
-/// directory has none.
+/// [MAX_LISTING_DIRECTORY_PAGES], [LISTING_DIRECTORY_TIMEOUT] and a byte
+/// budget per page). A user with no directory has none.
 async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventProcessorError> {
     within(
         LISTING_DIRECTORY_TIMEOUT,
@@ -311,17 +330,21 @@ async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventP
         async {
             let directory: PubkyResource =
                 listing_uri_builder(user_id.to_string(), String::new()).parse()?;
+            let pubky = PubkyConnector::get()?;
             let mut pages = ListingIdPages::default();
             let mut cursor: Option<String> = None;
             loop {
-                let Some(entries) =
-                    fetch_directory_page(&directory, LISTING_RESTORE_PAGE, cursor.as_deref())
-                        .await?
+                let Some(entries) = fetch_directory_page(
+                    pubky.client(),
+                    &directory,
+                    LISTING_RESTORE_PAGE,
+                    cursor.as_deref(),
+                )
+                .await?
                 else {
                     return Ok(pages.ids);
                 };
-                pages.add_page(&entries)?;
-                cursor = next_cursor(&entries, LISTING_RESTORE_PAGE);
+                cursor = pages.add_page(&entries)?;
                 if cursor.is_none() {
                     return Ok(pages.ids);
                 }
@@ -372,7 +395,7 @@ mod listing_id_pages_tests {
     #[test]
     fn more_ids_than_the_budget_are_refused() {
         let mut pages = ListingIdPages::default();
-        let mut result = Ok(());
+        let mut result = Ok(None);
         for chunk in 0..=(MAX_RESTORED_LISTINGS / LISTING_RESTORE_PAGE as usize) {
             result = pages.add_page(&page(&format!("c{chunk}-"), LISTING_RESTORE_PAGE as usize));
             if result.is_err() {
@@ -382,5 +405,25 @@ mod listing_id_pages_tests {
         let error = result.expect_err("an endless directory must be cut off");
         assert!(error.to_string().contains("more than"), "{error}");
         assert_eq!(pages.ids.len(), MAX_RESTORED_LISTINGS);
+    }
+
+    #[test]
+    fn repeated_full_pages_are_cut_off_at_the_page_cap() {
+        let full = page("a", LISTING_RESTORE_PAGE as usize);
+        let mut pages = ListingIdPages::default();
+        for _ in 1..MAX_LISTING_DIRECTORY_PAGES {
+            assert!(pages.add_page(&full).unwrap().is_some());
+        }
+        let error = pages
+            .add_page(&full)
+            .expect_err("a directory that keeps paging must be cut off");
+        assert!(error.to_string().contains("pages"), "{error}");
+        assert_eq!(pages.ids.len(), LISTING_RESTORE_PAGE as usize);
+
+        let mut pages = ListingIdPages::default();
+        for _ in 1..MAX_LISTING_DIRECTORY_PAGES {
+            pages.add_page(&full).unwrap();
+        }
+        assert_eq!(pages.add_page(&page("b", 3)).unwrap(), None);
     }
 }

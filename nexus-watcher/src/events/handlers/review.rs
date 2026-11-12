@@ -1,6 +1,6 @@
 use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
 use crate::events::directory_page::{entry_name, fetch_directory_page, next_cursor};
-use crate::events::handlers::listing::is_homeserver_not_found;
+use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use nexus_common::db::reindex::{get_all_user_ids, get_indexed_review_ids};
@@ -477,6 +477,33 @@ const REVIEW_DIRECTORY_PAGE: u16 = 500;
 /// homeserver chooses what each page holds, so the paging is bounded here.
 const MAX_REVIEW_DIRECTORY_PAGES: usize = 20;
 
+/// Paging state of one user's reviews directory scan.
+#[derive(Default)]
+struct ReviewDirectoryPages {
+    pages: usize,
+    seen: std::collections::HashSet<String>,
+}
+
+impl ReviewDirectoryPages {
+    /// Whether the next page is the one past [MAX_REVIEW_DIRECTORY_PAGES],
+    /// read only to learn whether the directory ends at the cap.
+    fn next_is_past_cap(&self) -> bool {
+        self.pages == MAX_REVIEW_DIRECTORY_PAGES
+    }
+
+    /// Records one page and returns its review ids that no earlier page of
+    /// this scan held. A homeserver may serve the same entries again; a
+    /// repeat is skipped and counted nowhere, since it was handled already.
+    fn add_page<'a>(&mut self, entries: &'a [PubkyResource]) -> Vec<&'a str> {
+        self.pages += 1;
+        entries
+            .iter()
+            .filter_map(entry_name)
+            .filter(|review_id| self.seen.insert(review_id.to_string()))
+            .collect()
+    }
+}
+
 /// One user's discovery pass through a request gate. Every LIST page and
 /// every record GET takes a permit from `gate`, and the tallies go to
 /// `summary`, which holds what was done so far when the gate stops the scan.
@@ -491,18 +518,24 @@ pub async fn scan_user_reviews(
         .into_iter()
         .collect();
 
-    // The page reader takes the connector itself; checking it here keeps a
-    // missing connector a failed scan rather than an unreachable homeserver.
-    PubkyConnector::get().map_err(|e| UserScanError::Failed(e.into()))?;
+    let pubky = PubkyConnector::get().map_err(|e| UserScanError::Failed(e.into()))?;
     let directory: PubkyResource =
         marketplace_review_uri_builder(user_id.to_string(), String::new())
             .parse()
             .map_err(|e: pubky::Error| UserScanError::Failed(e.into()))?;
 
+    let mut pages = ReviewDirectoryPages::default();
     let mut cursor: Option<String> = None;
-    for _ in 0..MAX_REVIEW_DIRECTORY_PAGES {
+    loop {
+        let past_cap = pages.next_is_past_cap();
         let permit = gate.acquire().await.map_err(UserScanError::Stopped)?;
-        let page = fetch_directory_page(&directory, REVIEW_DIRECTORY_PAGE, cursor.as_deref()).await;
+        let page = fetch_directory_page(
+            pubky.client(),
+            &directory,
+            REVIEW_DIRECTORY_PAGE,
+            cursor.as_deref(),
+        )
+        .await;
         let entries = match page {
             Ok(Some(entries)) => {
                 permit.succeeded();
@@ -510,11 +543,14 @@ pub async fn scan_user_reviews(
             }
             // A user with no reviews directory answers 404. Other LIST
             // failures mean this user's homeserver is unreachable. Neither
-            // case may permanently block the one-shot migration.
+            // case may permanently block the one-shot migration. A 404 past
+            // the cap means the directory ended there.
             Ok(None) => {
                 permit.succeeded();
-                debug!("Review directory for user {} is gone", user_id);
-                summary.gone += 1;
+                if !past_cap {
+                    debug!("Review directory for user {} is gone", user_id);
+                    summary.gone += 1;
+                }
                 return Ok(());
             }
             Err(e) => {
@@ -528,7 +564,21 @@ pub async fn scan_user_reviews(
             }
         };
 
-        for review_id in entries.iter().filter_map(entry_name) {
+        if past_cap {
+            // Reviews ingested so far stay indexed. Every scan starts from
+            // the first page, so the entries past the cap are never
+            // backfilled: the directory is truncated at the cap.
+            if !entries.is_empty() {
+                warn!(
+                    "Review directory for user {} is truncated at {} pages; entries past it are not backfilled",
+                    user_id, MAX_REVIEW_DIRECTORY_PAGES
+                );
+                summary.failed += 1;
+            }
+            return Ok(());
+        }
+
+        for review_id in pages.add_page(&entries) {
             if indexed.contains(review_id) {
                 summary.already_indexed += 1;
                 continue;
@@ -558,13 +608,6 @@ pub async fn scan_user_reviews(
             return Ok(());
         }
     }
-    // Reviews ingested so far stay indexed; a re-run picks up the rest.
-    warn!(
-        "Review directory for user {} has more than {} pages; stopping",
-        user_id, MAX_REVIEW_DIRECTORY_PAGES
-    );
-    summary.failed += 1;
-    Ok(())
 }
 
 /// Why reading or ingesting one review record failed.
@@ -739,34 +782,21 @@ pub async fn fetch_review_record(
     let uri = marketplace_review_uri_builder(user_id.to_string(), review_id.to_string());
 
     let permit = gate.acquire().await.map_err(ReviewIngestError::Stopped)?;
-    let pubky = match PubkyConnector::get() {
-        Ok(pubky) => pubky,
-        Err(e) => {
-            permit.failed();
-            return Err(ReviewIngestError::Unreachable(e.into()));
+    // The request and the body read share one deadline and the body is
+    // capped; a 404 is `None`. Every other failure, a timeout and an
+    // oversized body included, counts as an unreachable homeserver.
+    let blob = match fetch_record_capped(&uri, MAX_RECORD_BYTES).await {
+        Ok(Some(blob)) => {
+            permit.succeeded();
+            blob
         }
-    };
-    let response = match pubky.public_storage().get(&uri).await {
-        Ok(response) => response,
-        Err(e) if is_homeserver_not_found(&e) => {
+        Ok(None) => {
             permit.succeeded();
             return Ok(None);
         }
         Err(e) => {
             permit.failed();
-            return Err(ReviewIngestError::Unreachable(e.into()));
-        }
-    };
-    let blob = match response.bytes().await {
-        Ok(blob) => {
-            permit.succeeded();
-            blob
-        }
-        Err(e) => {
-            permit.failed();
-            return Err(ReviewIngestError::Unreachable(
-                EventProcessorError::client_error(e.to_string()),
-            ));
+            return Err(ReviewIngestError::Unreachable(e));
         }
     };
 
@@ -879,4 +909,43 @@ pub async fn backfill_trust_buckets() -> Result<TrustBucketBackfill, EventProces
     }
     summary.aggregates = subjects.len() + listings.len();
     Ok(summary)
+}
+
+#[cfg(test)]
+mod review_directory_pages_tests {
+    use super::*;
+
+    fn page(owner: &pubky::PublicKey, names: &[&str]) -> Vec<PubkyResource> {
+        names
+            .iter()
+            .map(|name| {
+                marketplace_review_uri_builder(owner.z32(), name.to_string())
+                    .parse()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn review_ids_repeated_across_pages_are_returned_once() {
+        let owner = pubky::Keypair::random().public_key();
+        let mut pages = ReviewDirectoryPages::default();
+        assert_eq!(pages.add_page(&page(&owner, &["a", "b"])), ["a", "b"]);
+        assert_eq!(pages.add_page(&page(&owner, &["b", "c", "a"])), ["c"]);
+        assert_eq!(
+            pages.add_page(&page(&owner, &["a", "b"])),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn only_the_page_after_the_cap_is_past_it() {
+        let owner = pubky::Keypair::random().public_key();
+        let mut pages = ReviewDirectoryPages::default();
+        for _ in 0..MAX_REVIEW_DIRECTORY_PAGES {
+            assert!(!pages.next_is_past_cap());
+            pages.add_page(&page(&owner, &["a"]));
+        }
+        assert!(pages.next_is_past_cap());
+    }
 }
