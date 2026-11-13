@@ -6,7 +6,8 @@
 //! of the listed directory (a resource, or a subdirectory ending with `/`),
 //! and refused when a full page ends where the previous one did. Entries are
 //! parsed with the SDK's [PubkyResource] parser, the way the SDK's own LIST
-//! does. [DirectoryPager] pages a whole directory, bounded in pages.
+//! does. [DirectoryPager] pages a whole directory, bounded in distinct names
+//! and in pages.
 
 use std::collections::HashSet;
 
@@ -20,12 +21,23 @@ use crate::events::EventProcessorError;
 /// call, so a caller can take a request permit before each call and settle it
 /// from the result.
 ///
-/// At most `max_pages` full pages are read. A homeserver chooses what each
-/// page holds, so after the last of them one more page of a single entry is
-/// read, only to learn whether the directory ends at the cap.
+/// At most `max_names` distinct entry names are returned; subdirectories and
+/// names a homeserver serves again do not count. A homeserver chooses what
+/// each page holds, so once the budget is spent the pager reads pages of a
+/// single entry, only to learn whether the directory has another name: an
+/// empty page or a 404 ends it, a new name truncates it, and a subdirectory
+/// or a repeat is skipped and the next single entry read.
+///
+/// A homeserver that serves only subdirectories or repeats would never spend
+/// the budget, so the pages are bounded too: at most
+/// `2 * ceil(max_names / limit) + PAGE_BOUND_SLACK` pages (room for every name
+/// with as many entries again of subdirectories or repeats, and a few
+/// single-entry pages), then one single-entry page that truncates the
+/// directory if it has any entry.
 pub struct DirectoryPager {
     directory: PubkyResource,
     limit: u16,
+    max_names: usize,
     max_pages: usize,
     cursor: Option<String>,
     pages: usize,
@@ -33,34 +45,46 @@ pub struct DirectoryPager {
     done: bool,
 }
 
+/// Single-entry pages, beyond room for the names and as many subdirectories
+/// or repeats, that a [DirectoryPager] reads before it gives up.
+const PAGE_BOUND_SLACK: usize = 4;
+
 /// What one [DirectoryPager::next] call found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PageStep {
     /// The entry names of one page that no earlier page of this pager held
     /// (a homeserver may serve the same entries again; a repeat was handled
-    /// already). Subdirectories are left out. `last` is set for a short page:
-    /// the directory ends there and nothing more is read.
+    /// already), never more than the budget in all. Subdirectories are left
+    /// out. `last` is set for a short page: the directory ends there and
+    /// nothing more is read.
     Names { names: Vec<String>, last: bool },
-    /// The homeserver answered 404 before the cap: the directory is not there
-    /// (or left during the paging).
+    /// The homeserver answered 404 before the budget was spent: the directory
+    /// is not there. A 404 after earlier pages reads the same, as a directory
+    /// deleted during the paging, so the names returned so far are the whole
+    /// directory.
     Gone,
-    /// The directory ends at the cap: the single-entry page after `max_pages`
-    /// full pages was empty or 404. Also what `next` returns, without a
+    /// The directory ends at the budget or the page bound: the single-entry
+    /// page after it was empty or 404. Also what `next` returns, without a
     /// request, once paging has finished.
     End,
-    /// The single-entry page after `max_pages` full pages has an entry: the
-    /// directory goes on past the cap, and nothing past it is read.
+    /// The directory has a name past the budget, or an entry past the page
+    /// bound, and nothing past it is read.
     Truncated,
 }
 
 impl DirectoryPager {
     /// A pager over `directory` (a `pubky://` directory ending with `/`) that
-    /// reads pages of `limit` entries and at most `max_pages` full pages.
-    pub fn new(directory: PubkyResource, limit: u16, max_pages: usize) -> Self {
+    /// reads pages of `limit` entries and returns at most `max_names`
+    /// distinct entry names.
+    pub fn new(directory: PubkyResource, limit: u16, max_names: usize) -> Self {
+        let full_pages = max_names.div_ceil(usize::from(limit).max(1));
         DirectoryPager {
             directory,
             limit,
-            max_pages,
+            max_names,
+            max_pages: full_pages
+                .saturating_mul(2)
+                .saturating_add(PAGE_BOUND_SLACK),
             cursor: None,
             pages: 0,
             seen: HashSet::new(),
@@ -83,45 +107,75 @@ impl DirectoryPager {
         Ok(self.step(page))
     }
 
-    /// The `limit` and `cursor` of the next request: a single entry once
-    /// `max_pages` full pages were read.
+    /// The `limit` and `cursor` of the next request.
     fn request(&self) -> (u16, Option<&str>) {
-        let limit = if self.at_cap() { 1 } else { self.limit };
-        (limit, self.cursor.as_deref())
+        (self.page_limit(), self.cursor.as_deref())
     }
 
-    /// Whether the next page is the check page past the cap.
-    fn at_cap(&self) -> bool {
-        self.pages == self.max_pages
+    /// A single entry once the budget is spent or the page bound reached.
+    fn page_limit(&self) -> u16 {
+        if self.budget_spent() || self.at_page_bound() {
+            1
+        } else {
+            self.limit
+        }
+    }
+
+    /// Whether `max_names` distinct names were returned.
+    fn budget_spent(&self) -> bool {
+        self.seen.len() >= self.max_names
+    }
+
+    /// Whether `max_pages` pages were read, so the next is the last.
+    fn at_page_bound(&self) -> bool {
+        self.pages >= self.max_pages
     }
 
     /// Records the page the last request read (`None` for a 404) and decides
     /// what it means.
     fn step(&mut self, page: Option<Vec<PubkyResource>>) -> PageStep {
-        let at_cap = self.at_cap();
+        let checking = self.budget_spent();
+        let at_page_bound = self.at_page_bound();
+        let limit = self.page_limit();
+        self.pages += 1;
         self.done = true;
         let Some(entries) = page else {
-            return if at_cap {
+            return if checking || at_page_bound {
                 PageStep::End
             } else {
                 PageStep::Gone
             };
         };
-        if at_cap {
-            return if entries.is_empty() {
-                PageStep::End
-            } else {
-                PageStep::Truncated
-            };
+        if (checking || at_page_bound) && entries.is_empty() {
+            return PageStep::End;
         }
-        self.pages += 1;
-        let names = entries
-            .iter()
-            .filter_map(entry_name)
-            .filter(|name| self.seen.insert(name.to_string()))
-            .map(str::to_string)
-            .collect();
-        self.cursor = next_cursor(&entries, self.limit);
+        if at_page_bound {
+            return PageStep::Truncated;
+        }
+        let mut names = Vec::new();
+        let mut cursor = next_cursor(&entries, limit);
+        for (index, entry) in entries.iter().enumerate() {
+            let Some(name) = entry_name(entry) else {
+                continue;
+            };
+            if self.seen.contains(name) {
+                continue;
+            }
+            if self.budget_spent() {
+                // A new name past the budget. On a single-entry page after
+                // the budget it truncates the directory. Mid-page, the names
+                // before it are returned and the single-entry pages go on
+                // from the entry before it, so the next one finds it.
+                match entries[..index].last() {
+                    Some(before) if !checking => cursor = Some(before.to_pubky_url()),
+                    _ => return PageStep::Truncated,
+                }
+                break;
+            }
+            self.seen.insert(name.to_string());
+            names.push(name.to_string());
+        }
+        self.cursor = cursor;
         self.done = self.cursor.is_none();
         PageStep::Names {
             names,
@@ -139,7 +193,7 @@ impl DirectoryPager {
 /// The SDK's ICANN-domain fallback is crate-private in pubky 0.9.3 and its
 /// public `get` cannot carry the LIST query, so a homeserver reachable only
 /// through that fallback reads as unreachable here.
-pub async fn fetch_directory_page(
+async fn fetch_directory_page(
     client: &PubkyHttpClient,
     directory: &PubkyResource,
     limit: u16,
@@ -183,7 +237,7 @@ fn page_url(
 
 /// The cursor to read the page after `entries` with, or `None` when `entries`
 /// was the last page (fewer than `limit` entries).
-pub fn next_cursor(entries: &[PubkyResource], limit: u16) -> Option<String> {
+fn next_cursor(entries: &[PubkyResource], limit: u16) -> Option<String> {
     if entries.len() < usize::from(limit) {
         return None;
     }
@@ -191,7 +245,7 @@ pub fn next_cursor(entries: &[PubkyResource], limit: u16) -> Option<String> {
 }
 
 /// The last path segment of `entry`, or `None` for a subdirectory.
-pub fn entry_name(entry: &PubkyResource) -> Option<&str> {
+fn entry_name(entry: &PubkyResource) -> Option<&str> {
     entry
         .path
         .as_str()
@@ -570,10 +624,10 @@ mod tests {
     }
 
     const PAGER_LIMIT: u16 = 3;
-    const PAGER_MAX_PAGES: usize = 2;
+    const PAGER_MAX_NAMES: usize = 6;
 
     fn pager(owner: &pubky::PublicKey) -> DirectoryPager {
-        DirectoryPager::new(directory(owner), PAGER_LIMIT, PAGER_MAX_PAGES)
+        DirectoryPager::new(directory(owner), PAGER_LIMIT, PAGER_MAX_NAMES)
     }
 
     fn entries(owner: &pubky::PublicKey, names: &[&str]) -> Option<Vec<PubkyResource>> {
@@ -594,6 +648,10 @@ mod tests {
             names: names.iter().map(|name| name.to_string()).collect(),
             last,
         }
+    }
+
+    fn entry_url(owner: &pubky::PublicKey, name: &str) -> String {
+        pubky_line(owner, &format!("{DIRECTORY_PATH}{name}"))
     }
 
     #[test]
@@ -621,7 +679,7 @@ mod tests {
             names(&["a", "b", "c"], false)
         );
         assert!(!pager.done);
-        let cursor = pubky_line(&owner, &format!("{DIRECTORY_PATH}c"));
+        let cursor = entry_url(&owner, "c");
         assert_eq!(pager.request(), (PAGER_LIMIT, Some(cursor.as_str())));
     }
 
@@ -644,8 +702,20 @@ mod tests {
         assert!(pager.done);
     }
 
-    /// A pager that has read `PAGER_MAX_PAGES` full pages.
-    fn pager_at_cap(owner: &pubky::PublicKey) -> DirectoryPager {
+    #[test]
+    fn a_404_after_earlier_pages_is_gone() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager(&owner);
+        assert_eq!(
+            pager.step(entries(&owner, &["a", "b", "c"])),
+            names(&["a", "b", "c"], false)
+        );
+        assert_eq!(pager.step(None), PageStep::Gone);
+        assert!(pager.done);
+    }
+
+    /// A pager that has returned `PAGER_MAX_NAMES` names in full pages.
+    fn pager_at_budget(owner: &pubky::PublicKey) -> DirectoryPager {
         let mut pager = pager(owner);
         assert_eq!(
             pager.step(entries(owner, &["a", "b", "c"])),
@@ -659,30 +729,122 @@ mod tests {
     }
 
     #[test]
-    fn the_page_after_the_cap_asks_for_one_entry_after_the_last_full_page() {
+    fn the_page_after_the_budget_asks_for_one_entry_after_the_last_full_page() {
         let owner = Keypair::random().public_key();
-        let pager = pager_at_cap(&owner);
-        let cursor = pubky_line(&owner, &format!("{DIRECTORY_PATH}f"));
+        let pager = pager_at_budget(&owner);
+        let cursor = entry_url(&owner, "f");
         assert_eq!(pager.request(), (1, Some(cursor.as_str())));
     }
 
     #[test]
-    fn a_directory_that_ends_at_the_cap_ends() {
+    fn a_directory_that_ends_at_the_budget_ends() {
         let owner = Keypair::random().public_key();
-        let mut pager = pager_at_cap(&owner);
+        let mut pager = pager_at_budget(&owner);
         assert_eq!(pager.step(entries(&owner, &[])), PageStep::End);
         assert!(pager.done);
 
-        let mut pager = pager_at_cap(&owner);
+        let mut pager = pager_at_budget(&owner);
         assert_eq!(pager.step(None), PageStep::End);
         assert!(pager.done);
     }
 
     #[test]
-    fn an_entry_past_the_cap_truncates_the_directory() {
+    fn a_new_name_past_the_budget_truncates_the_directory() {
         let owner = Keypair::random().public_key();
-        let mut pager = pager_at_cap(&owner);
+        let mut pager = pager_at_budget(&owner);
         assert_eq!(pager.step(entries(&owner, &["g"])), PageStep::Truncated);
+        assert!(pager.done);
+    }
+
+    #[test]
+    fn subdirectories_and_repeats_do_not_count_toward_the_budget() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager(&owner);
+        assert_eq!(
+            pager.step(entries(&owner, &["a", "dir/", "b"])),
+            names(&["a", "b"], false)
+        );
+        assert_eq!(
+            pager.step(entries(&owner, &["b", "c", "d"])),
+            names(&["c", "d"], false)
+        );
+        let cursor = entry_url(&owner, "d");
+        assert_eq!(pager.request(), (PAGER_LIMIT, Some(cursor.as_str())));
+        assert_eq!(
+            pager.step(entries(&owner, &["e", "x/", "f"])),
+            names(&["e", "f"], false)
+        );
+        let cursor = entry_url(&owner, "f");
+        assert_eq!(pager.request(), (1, Some(cursor.as_str())));
+        assert_eq!(pager.step(entries(&owner, &[])), PageStep::End);
+    }
+
+    #[test]
+    fn a_subdirectory_or_repeat_after_the_budget_reads_on() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager_at_budget(&owner);
+        assert_eq!(pager.step(entries(&owner, &["sub/"])), names(&[], false));
+        let cursor = entry_url(&owner, "sub/");
+        assert_eq!(pager.request(), (1, Some(cursor.as_str())));
+        assert_eq!(pager.step(entries(&owner, &["a"])), names(&[], false));
+        let cursor = entry_url(&owner, "a");
+        assert_eq!(pager.request(), (1, Some(cursor.as_str())));
+        assert_eq!(pager.step(entries(&owner, &[])), PageStep::End);
+
+        let mut pager = pager_at_budget(&owner);
+        assert_eq!(pager.step(entries(&owner, &["sub/"])), names(&[], false));
+        assert_eq!(pager.step(entries(&owner, &["g"])), PageStep::Truncated);
+    }
+
+    #[test]
+    fn a_page_past_the_budget_returns_names_up_to_it_and_reads_on_from_there() {
+        let owner = Keypair::random().public_key();
+        for last_page in [&["f", "g", "h"][..], &["f", "g"][..]] {
+            let mut pager = pager(&owner);
+            assert_eq!(
+                pager.step(entries(&owner, &["a", "b", "c"])),
+                names(&["a", "b", "c"], false)
+            );
+            assert_eq!(
+                pager.step(entries(&owner, &["d", "x/", "e"])),
+                names(&["d", "e"], false)
+            );
+            assert_eq!(pager.step(entries(&owner, last_page)), names(&["f"], false));
+            let cursor = entry_url(&owner, "f");
+            assert_eq!(pager.request(), (1, Some(cursor.as_str())));
+            assert_eq!(pager.step(entries(&owner, &["g"])), PageStep::Truncated);
+        }
+    }
+
+    /// A pager that has read its page bound of pages and spent only half its
+    /// budget, the rest of each page being repeats and subdirectories.
+    fn pager_at_page_bound(owner: &pubky::PublicKey) -> DirectoryPager {
+        let mut pager = pager(owner);
+        assert_eq!(pager.max_pages, 2 * 2 + PAGE_BOUND_SLACK);
+        assert_eq!(
+            pager.step(entries(owner, &["a", "b", "c"])),
+            names(&["a", "b", "c"], false)
+        );
+        for _ in 1..pager.max_pages {
+            assert_eq!(
+                pager.step(entries(owner, &["a", "d1/", "d2/"])),
+                names(&[], false)
+            );
+        }
+        let cursor = entry_url(owner, "d2/");
+        assert_eq!(pager.request(), (1, Some(cursor.as_str())));
+        pager
+    }
+
+    #[test]
+    fn the_page_bound_truncates_a_directory_that_never_spends_the_budget() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager_at_page_bound(&owner);
+        assert_eq!(pager.step(entries(&owner, &["d3/"])), PageStep::Truncated);
+        assert!(pager.done);
+
+        let mut pager = pager_at_page_bound(&owner);
+        assert_eq!(pager.step(entries(&owner, &[])), PageStep::End);
         assert!(pager.done);
     }
 }

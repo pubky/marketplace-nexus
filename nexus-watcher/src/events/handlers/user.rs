@@ -268,11 +268,6 @@ async fn fetch_record(uri: &str) -> Result<Option<Vec<u8>>, EventProcessorError>
 /// by a homeserver the seller chooses, so its length is bounded here.
 const MAX_RESTORED_LISTINGS: usize = 10_000;
 
-/// Most full listings directory pages read for one seller: room for
-/// [MAX_RESTORED_LISTINGS] entries. Each page yields at most
-/// [LISTING_RESTORE_PAGE] distinct ids, so the ids stay within that cap.
-const MAX_LISTING_DIRECTORY_PAGES: usize = MAX_RESTORED_LISTINGS / LISTING_RESTORE_PAGE as usize;
-
 /// Budget for paging a whole listings directory.
 const LISTING_DIRECTORY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -281,9 +276,10 @@ const LISTING_DIRECTORY_TIMEOUT: std::time::Duration = std::time::Duration::from
 const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// The ids of every listing record in the user's listings directory on their
-/// homeserver (cursor-paginated, bounded by [MAX_LISTING_DIRECTORY_PAGES],
-/// [LISTING_DIRECTORY_TIMEOUT] and a byte budget per page). A user with no
-/// directory has none; a directory with more than [MAX_RESTORED_LISTINGS]
+/// homeserver (cursor-paginated, bounded by [MAX_RESTORED_LISTINGS] distinct
+/// ids, [LISTING_DIRECTORY_TIMEOUT] and a byte budget per page). A user with no
+/// directory has none, and a 404 on a later page ends the listing like a
+/// deleted directory; a directory with more than [MAX_RESTORED_LISTINGS]
 /// entries is refused.
 async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventProcessorError> {
     within(
@@ -294,25 +290,72 @@ async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventP
                 listing_uri_builder(user_id.to_string(), String::new()).parse()?;
             let pubky = PubkyConnector::get()?;
             let mut pager =
-                DirectoryPager::new(directory, LISTING_RESTORE_PAGE, MAX_LISTING_DIRECTORY_PAGES);
+                DirectoryPager::new(directory, LISTING_RESTORE_PAGE, MAX_RESTORED_LISTINGS);
             let mut ids = Vec::new();
             loop {
-                match pager.next(pubky.client()).await? {
-                    PageStep::Names { names, last } => {
-                        ids.extend(names);
-                        if last {
-                            return Ok(ids);
-                        }
-                    }
-                    PageStep::Gone | PageStep::End => return Ok(ids),
-                    PageStep::Truncated => {
-                        return Err(EventProcessorError::InvalidEventLine(format!(
-                            "listings directory has more than {MAX_RESTORED_LISTINGS} entries"
-                        )))
-                    }
+                let step = pager.next(pubky.client()).await?;
+                if add_listing_page(&mut ids, step)? {
+                    return Ok(ids);
                 }
             }
         },
     )
     .await
+}
+
+/// Adds the ids one listings directory [PageStep] found to `ids`. Returns
+/// whether the listing is complete: after its last page, a 404 (even after
+/// earlier pages, read as a deleted directory) or its end at the cap. A
+/// directory past the cap is an error.
+fn add_listing_page(ids: &mut Vec<String>, step: PageStep) -> Result<bool, EventProcessorError> {
+    match step {
+        PageStep::Names { names, last } => {
+            ids.extend(names);
+            Ok(last)
+        }
+        PageStep::Gone | PageStep::End => Ok(true),
+        PageStep::Truncated => Err(EventProcessorError::InvalidEventLine(format!(
+            "listings directory has more than {MAX_RESTORED_LISTINGS} entries"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(names: &[&str], last: bool) -> PageStep {
+        PageStep::Names {
+            names: names.iter().map(|name| name.to_string()).collect(),
+            last,
+        }
+    }
+
+    #[test]
+    fn a_full_page_adds_its_ids_and_the_last_page_completes_the_listing() {
+        let mut ids = Vec::new();
+        assert!(!add_listing_page(&mut ids, names(&["a", "b"], false)).unwrap());
+        assert!(add_listing_page(&mut ids, names(&["c"], true)).unwrap());
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn a_404_or_the_end_at_the_cap_completes_the_listing_with_the_ids_so_far() {
+        for step in [PageStep::Gone, PageStep::End] {
+            let mut ids = vec!["a".to_string()];
+            assert!(add_listing_page(&mut ids, step).unwrap());
+            assert_eq!(ids, ["a"]);
+        }
+    }
+
+    #[test]
+    fn a_directory_past_the_cap_is_refused() {
+        let mut ids = vec!["a".to_string()];
+        let error = add_listing_page(&mut ids, PageStep::Truncated)
+            .expect_err("a truncated listings directory must not restore part of it");
+        assert!(
+            matches!(error, EventProcessorError::InvalidEventLine(_)),
+            "{error:?}"
+        );
+    }
 }

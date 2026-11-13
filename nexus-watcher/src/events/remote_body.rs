@@ -36,17 +36,29 @@ const MAX_PREALLOCATION_BYTES: usize = 1024 * 1024;
 /// A declared `Content-Length` over the budget is refused before any body byte
 /// is read; an undeclared or understated length is caught while streaming.
 pub async fn read_capped(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max_bytes: usize,
     what: &str,
 ) -> Result<Vec<u8>, EventProcessorError> {
-    let too_large = || {
-        EventProcessorError::InvalidEventLine(format!("{what} exceeds the {max_bytes} byte limit"))
-    };
+    read_within_budget(response, max_bytes)
+        .await?
+        .ok_or_else(|| too_large(what, max_bytes))
+}
 
+/// The error for a body of `what` over its `max_bytes` budget.
+fn too_large(what: &str, max_bytes: usize) -> EventProcessorError {
+    EventProcessorError::InvalidEventLine(format!("{what} exceeds the {max_bytes} byte limit"))
+}
+
+/// The whole body of `response`, or `None` when it is over `max_bytes`, as
+/// [read_capped] reads it. An error means the body could not be read.
+async fn read_within_budget(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, EventProcessorError> {
     let declared = response.content_length();
     if declared.is_some_and(|len| len > max_bytes as u64) {
-        return Err(too_large());
+        return Ok(None);
     }
     let mut body = Vec::with_capacity(
         declared
@@ -60,11 +72,11 @@ pub async fn read_capped(
         .map_err(|e| EventProcessorError::client_error(e.to_string()))?
     {
         if body.len() + chunk.len() > max_bytes {
-            return Err(too_large());
+            return Ok(None);
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    Ok(Some(body))
 }
 
 /// Runs `fetch` against `deadline`; a fetch that outlives it is a client error.
@@ -89,19 +101,46 @@ pub async fn fetch_record_capped(
     uri: &str,
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, EventProcessorError> {
+    match fetch_record_outcome(uri, max_bytes).await? {
+        RecordFetch::Found(body) => Ok(Some(body)),
+        RecordFetch::NotFound => Ok(None),
+        RecordFetch::TooLarge(e) => Err(e),
+    }
+}
+
+/// What the homeserver answered for one record.
+#[derive(Debug)]
+pub enum RecordFetch {
+    /// The record's body, inside its byte budget.
+    Found(Vec<u8>),
+    /// The homeserver answered 404.
+    NotFound,
+    /// The homeserver answered with a body over the byte budget; the error is
+    /// the one [fetch_record_capped] returns for it.
+    TooLarge(EventProcessorError),
+}
+
+/// Fetches the record at `uri` as [fetch_record_capped] does, but tells a body
+/// over `max_bytes` apart from a failed request: the error case is only a
+/// homeserver that could not be reached or did not answer in time.
+pub async fn fetch_record_outcome(
+    uri: &str,
+    max_bytes: usize,
+) -> Result<RecordFetch, EventProcessorError> {
     let pubky = nexus_common::db::PubkyConnector::get()?;
     within(RECORD_FETCH_TIMEOUT, &format!("fetching {uri}"), async {
         let response = match pubky.public_storage().get(uri).await {
             Ok(response) => response,
             Err(e) if is_homeserver_not_found(&e) => {
                 debug!("Record {uri} is not on its homeserver");
-                return Ok(None);
+                return Ok(RecordFetch::NotFound);
             }
             Err(e) => return Err(e.into()),
         };
-        read_capped(response, max_bytes, &format!("Record {uri}"))
-            .await
-            .map(Some)
+        Ok(match read_within_budget(response, max_bytes).await? {
+            Some(body) => RecordFetch::Found(body),
+            None => RecordFetch::TooLarge(too_large(&format!("Record {uri}"), max_bytes)),
+        })
     })
     .await
 }
@@ -216,6 +255,20 @@ mod tests {
             .expect_err("a body declared at 100 MiB must not be read");
         assert!(matches!(error, EventProcessorError::InvalidEventLine(_)));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_budget_reads_as_too_large_not_as_a_failure() {
+        let response = serve(|mut stream| async move {
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(read_within_budget(response, 4).await.unwrap(), None);
     }
 
     #[tokio::test]

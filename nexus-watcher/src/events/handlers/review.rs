@@ -1,6 +1,6 @@
 use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
 use crate::events::directory_page::{DirectoryPager, PageStep};
-use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
+use crate::events::remote_body::{fetch_record_outcome, RecordFetch, MAX_RECORD_BYTES};
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
 use nexus_common::db::reindex::{get_all_user_ids, get_indexed_review_ids};
@@ -473,14 +473,14 @@ pub enum UserScanError {
 /// Review directory entries read per LIST page.
 const REVIEW_DIRECTORY_PAGE: u16 = 500;
 
-/// Most full LIST pages read for one user's reviews directory (10,000
-/// entries). A homeserver chooses what each page holds, so the paging is
-/// bounded here.
-const MAX_REVIEW_DIRECTORY_PAGES: usize = 20;
+/// Most review ids read from one user's reviews directory. A homeserver
+/// chooses what each page holds, so the paging is bounded here.
+const MAX_REVIEW_ENTRIES: usize = 10_000;
 
 /// One user's discovery pass through a request gate. Every LIST page and
 /// every record GET takes a permit from `gate`, and the tallies go to
 /// `summary`, which holds what was done so far when the gate stops the scan.
+/// A 404 on a later directory page ends the scan like a deleted directory.
 pub async fn scan_user_reviews(
     gate: &dyn RequestGate,
     user_id: &str,
@@ -498,8 +498,7 @@ pub async fn scan_user_reviews(
             .parse()
             .map_err(|e: pubky::Error| UserScanError::Failed(e.into()))?;
 
-    let mut pager =
-        DirectoryPager::new(directory, REVIEW_DIRECTORY_PAGE, MAX_REVIEW_DIRECTORY_PAGES);
+    let mut pager = DirectoryPager::new(directory, REVIEW_DIRECTORY_PAGE, MAX_REVIEW_ENTRIES);
     loop {
         let permit = gate.acquire().await.map_err(UserScanError::Stopped)?;
         let (review_ids, last) = match pager.next(pubky.client()).await {
@@ -507,9 +506,11 @@ pub async fn scan_user_reviews(
                 permit.succeeded();
                 (names, last)
             }
-            // A user with no reviews directory answers 404. Other LIST
-            // failures mean this user's homeserver is unreachable. Neither
-            // case may permanently block the one-shot migration.
+            // A user with no reviews directory answers 404. A 404 after
+            // earlier pages reads as a directory deleted during the scan, as
+            // before the paging was bounded. Other LIST failures mean this
+            // user's homeserver is unreachable. Neither case may permanently
+            // block the one-shot migration.
             Ok(PageStep::Gone) => {
                 permit.succeeded();
                 debug!("Review directory for user {} is gone", user_id);
@@ -526,8 +527,8 @@ pub async fn scan_user_reviews(
             Ok(PageStep::Truncated) => {
                 permit.succeeded();
                 warn!(
-                    "Review directory for user {} is truncated at {} pages; entries past it are not backfilled",
-                    user_id, MAX_REVIEW_DIRECTORY_PAGES
+                    "Review directory for user {} is truncated at {} entries; entries past it are not backfilled",
+                    user_id, MAX_REVIEW_ENTRIES
                 );
                 summary.failed += 1;
                 return Ok(());
@@ -749,7 +750,7 @@ pub async fn fetch_review_record(
     // The request and the body read share one deadline and the body is
     // capped; a 404 is `None`.
     let (outcome, fetched) =
-        classify_record_fetch(fetch_record_capped(&uri, MAX_RECORD_BYTES).await);
+        classify_record_fetch(fetch_record_outcome(&uri, MAX_RECORD_BYTES).await);
     match outcome {
         PermitOutcome::Succeeded => permit.succeeded(),
         PermitOutcome::Failed => permit.failed(),
@@ -781,19 +782,16 @@ enum PermitOutcome {
 /// Classifies the result of fetching one review record: how the request
 /// settles its permit, and the record (`None` for a 404) or why it failed.
 ///
-/// [fetch_record_capped] returns [EventProcessorError::InvalidEventLine] only
-/// when `read_capped` refuses a body over its byte budget: the connector,
-/// request, deadline and body-stream failures are all
-/// [EventProcessorError::PubkyClientError]. An oversized body comes from a
-/// homeserver that answered, so the request succeeded and the record is
-/// invalid, like any other record that is not a review. Every other failure
-/// counts as an unreachable homeserver.
+/// An oversized body comes from a homeserver that answered, so the request
+/// succeeded and the record is invalid, like any other record that is not a
+/// review. Every error counts as an unreachable homeserver.
 fn classify_record_fetch(
-    result: Result<Option<Vec<u8>>, EventProcessorError>,
+    result: Result<RecordFetch, EventProcessorError>,
 ) -> (PermitOutcome, Result<Option<Vec<u8>>, ReviewIngestError>) {
     match result {
-        Ok(record) => (PermitOutcome::Succeeded, Ok(record)),
-        Err(e @ EventProcessorError::InvalidEventLine(_)) => {
+        Ok(RecordFetch::Found(record)) => (PermitOutcome::Succeeded, Ok(Some(record))),
+        Ok(RecordFetch::NotFound) => (PermitOutcome::Succeeded, Ok(None)),
+        Ok(RecordFetch::TooLarge(e)) => {
             (PermitOutcome::Succeeded, Err(ReviewIngestError::Invalid(e)))
         }
         Err(e) => (
@@ -909,8 +907,10 @@ mod record_fetch_tests {
 
     #[test]
     fn an_oversized_record_is_an_answered_request_and_an_invalid_record() {
-        let (outcome, result) = classify_record_fetch(Err(EventProcessorError::InvalidEventLine(
-            "Record pubky://a/b exceeds the 2097152 byte limit".to_string(),
+        let (outcome, result) = classify_record_fetch(Ok(RecordFetch::TooLarge(
+            EventProcessorError::InvalidEventLine(
+                "Record pubky://a/b exceeds the 2097152 byte limit".to_string(),
+            ),
         )));
         assert_eq!(outcome, PermitOutcome::Succeeded);
         assert!(
@@ -920,8 +920,9 @@ mod record_fetch_tests {
     }
 
     #[test]
-    fn a_timeout_or_client_error_is_a_failed_request_and_unreachable() {
+    fn any_fetch_error_is_a_failed_request_and_unreachable() {
         for error in [
+            EventProcessorError::InvalidEventLine("not a size refusal".into()),
             EventProcessorError::client_error("fetching pubky://a/b timed out after 30s".into()),
             EventProcessorError::client_error("connection refused".into()),
             EventProcessorError::PubkyClientError(
@@ -939,14 +940,14 @@ mod record_fetch_tests {
 
     #[test]
     fn a_missing_record_is_an_answered_request_and_gone() {
-        let (outcome, result) = classify_record_fetch(Ok(None));
+        let (outcome, result) = classify_record_fetch(Ok(RecordFetch::NotFound));
         assert_eq!(outcome, PermitOutcome::Succeeded);
         assert!(matches!(result, Ok(None)), "{result:?}");
     }
 
     #[test]
     fn a_record_is_an_answered_request() {
-        let (outcome, result) = classify_record_fetch(Ok(Some(b"{}".to_vec())));
+        let (outcome, result) = classify_record_fetch(Ok(RecordFetch::Found(b"{}".to_vec())));
         assert_eq!(outcome, PermitOutcome::Succeeded);
         assert_eq!(result.unwrap(), Some(b"{}".to_vec()));
     }
