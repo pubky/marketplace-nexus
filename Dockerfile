@@ -1,7 +1,7 @@
 # ========================
 # Build Stage
 # ========================
-FROM rust:1.90.0-alpine3.22@sha256:b4b54b176a74db7e5c68fdfe6029be39a02ccbcfe72b6e5a3e18e2c61b57ae26 AS builder
+FROM rust:1.99.1-alpine3.22@sha256:9a744dc47d1ac2a7d17fc3cedfc8b4928b1696dfcba3274ab25bfb40988a9ff0 AS builder
 
 # Build platform argument (x86_64 or aarch64) (default: x86_64)
 ARG TARGETARCH
