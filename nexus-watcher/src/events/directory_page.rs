@@ -67,9 +67,37 @@ pub enum PageStep {
     /// page after it was empty or 404. Also what `next` returns, without a
     /// request, once paging has finished.
     End,
-    /// The directory has a name past the budget, or an entry past the page
-    /// bound, and nothing past it is read.
+    /// The directory has a new name past the budget, so it holds more than
+    /// `max_names` names, and nothing past it is read.
     Truncated,
+    /// The directory has an entry past the page bound, and nothing past it is
+    /// read. The pages so far were mostly subdirectories or repeats, so this
+    /// does not mean the directory holds more than `max_names` names.
+    PageBoundReached,
+}
+
+/// Why a directory page could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum PageError {
+    /// The homeserver answered and its page was refused: a body over the
+    /// byte budget, more entries than asked for, an entry that is malformed,
+    /// owned by someone else or not a direct child, or a full page that ends
+    /// at its cursor.
+    #[error("directory page refused: {0}")]
+    Refused(EventProcessorError),
+    /// The request could not be sent, the body could not be read, the
+    /// homeserver answered with a status other than success or 404, or it
+    /// did not answer in time.
+    #[error("{0}")]
+    Unreachable(EventProcessorError),
+}
+
+impl From<PageError> for EventProcessorError {
+    fn from(error: PageError) -> Self {
+        match error {
+            PageError::Refused(e) | PageError::Unreachable(e) => e,
+        }
+    }
 }
 
 impl DirectoryPager {
@@ -93,12 +121,9 @@ impl DirectoryPager {
     }
 
     /// Reads the next page with exactly one request, or returns
-    /// [PageStep::End] without one once paging has finished. A failed request
-    /// is an error and leaves the pager where it was.
-    pub async fn next(
-        &mut self,
-        client: &PubkyHttpClient,
-    ) -> Result<PageStep, EventProcessorError> {
+    /// [PageStep::End] without one once paging has finished. A page that
+    /// could not be read is an error and leaves the pager where it was.
+    pub async fn next(&mut self, client: &PubkyHttpClient) -> Result<PageStep, PageError> {
         if self.done {
             return Ok(PageStep::End);
         }
@@ -150,7 +175,7 @@ impl DirectoryPager {
             return PageStep::End;
         }
         if at_page_bound {
-            return PageStep::Truncated;
+            return PageStep::PageBoundReached;
         }
         let mut names = Vec::new();
         let mut cursor = next_cursor(&entries, limit);
@@ -187,7 +212,8 @@ impl DirectoryPager {
 /// One page of the shallow listing of `directory` (a `pubky://` directory
 /// ending with `/`), at most `limit` entries from after `cursor`, or `None`
 /// when the homeserver answers 404. The request and the whole body share
-/// [RECORD_FETCH_TIMEOUT].
+/// [RECORD_FETCH_TIMEOUT]; a request that outlives it is
+/// [PageError::Unreachable], as is a page URL that cannot be built.
 ///
 /// The request goes over the direct Pubky transport, like the events poll.
 /// The SDK's ICANN-domain fallback is crate-private in pubky 0.9.3 and its
@@ -198,8 +224,8 @@ async fn fetch_directory_page(
     directory: &PubkyResource,
     limit: u16,
     cursor: Option<&str>,
-) -> Result<Option<Vec<PubkyResource>>, EventProcessorError> {
-    let url = page_url(directory, limit, cursor)?;
+) -> Result<Option<Vec<PubkyResource>>, PageError> {
+    let url = page_url(directory, limit, cursor).map_err(|e| PageError::Unreachable(e.into()))?;
     within(
         RECORD_FETCH_TIMEOUT,
         &format!("listing {}", directory.to_pubky_url()),
@@ -209,10 +235,11 @@ async fn fetch_directory_page(
                 .send()
                 .await
                 .map_err(|e| EventProcessorError::client_error(e.to_string()))?;
-            read_directory_page(response, directory, limit, cursor).await
+            Ok(read_directory_page(response, directory, limit, cursor).await)
         },
     )
     .await
+    .map_err(PageError::Unreachable)?
 }
 
 /// The LIST URL of one shallow page, with its query built the way the SDK's
@@ -255,30 +282,40 @@ fn entry_name(entry: &PubkyResource) -> Option<&str> {
 }
 
 /// The entries of a directory page `response`, or `None` for a 404. Any other
-/// non-success status is a client error.
+/// non-success status, and a body that could not be read, is
+/// [PageError::Unreachable]; a body over the byte budget or a page
+/// [parse_directory_page] refuses is [PageError::Refused].
 async fn read_directory_page(
     response: reqwest::Response,
     directory: &PubkyResource,
     limit: u16,
     cursor: Option<&str>,
-) -> Result<Option<Vec<PubkyResource>>, EventProcessorError> {
+) -> Result<Option<Vec<PubkyResource>>, PageError> {
     let status = response.status();
     if status == StatusCode::NOT_FOUND {
         return Ok(None);
     }
     if !status.is_success() {
-        return Err(EventProcessorError::client_error(format!(
-            "listing {} answered {status}",
-            directory.to_pubky_url()
+        return Err(PageError::Unreachable(EventProcessorError::client_error(
+            format!("listing {} answered {status}", directory.to_pubky_url()),
         )));
     }
+    // read_capped refuses a body over the budget with InvalidEventLine and
+    // reports a body it could not read (a transport failure) as a client
+    // error; it returns no other error.
     let body = read_capped(
         response,
         event_feed_budget(u32::from(limit)),
         "Directory page",
     )
-    .await?;
-    parse_directory_page(&String::from_utf8_lossy(&body), directory, limit, cursor).map(Some)
+    .await
+    .map_err(|e| match e {
+        EventProcessorError::InvalidEventLine(_) => PageError::Refused(e),
+        e => PageError::Unreachable(e),
+    })?;
+    parse_directory_page(&String::from_utf8_lossy(&body), directory, limit, cursor)
+        .map(Some)
+        .map_err(PageError::Refused)
 }
 
 /// Parses a page with one resource per line, as `pubky://` URLs (or the
@@ -516,7 +553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn not_found_is_none_and_a_server_error_is_a_client_error() {
+    async fn not_found_is_none_and_a_server_error_is_unreachable() {
         let dir = directory(&Keypair::random().public_key());
         let response = respond("HTTP/1.1 404 Not Found\r\n", String::new()).await;
         assert_eq!(
@@ -531,7 +568,50 @@ mod tests {
             .await
             .expect_err("a 500 is not an empty directory");
         assert!(
-            matches!(error, EventProcessorError::PubkyClientError(_)),
+            matches!(
+                error,
+                PageError::Unreachable(EventProcessorError::PubkyClientError(_))
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_the_parser_refuses_is_refused() {
+        let dir = directory(&Keypair::random().public_key());
+        let response = respond(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n",
+            "garbage".to_string(),
+        )
+        .await;
+        let error = read_directory_page(response, &dir, PAGE, None)
+            .await
+            .expect_err("a malformed page must be refused");
+        assert!(matches!(error, PageError::Refused(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_body_cut_short_is_unreachable() {
+        let owner = Keypair::random().public_key();
+        let dir = directory(&owner);
+        let line = pubky_line(&owner, &format!("{DIRECTORY_PATH}a"));
+        let response = serve(move |mut stream| async move {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                line.len() * 2
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(line.as_bytes()).await.unwrap();
+        })
+        .await;
+        let error = read_directory_page(response, &dir, PAGE, None)
+            .await
+            .expect_err("a body cut short was not read");
+        assert!(
+            matches!(
+                error,
+                PageError::Unreachable(EventProcessorError::PubkyClientError(_))
+            ),
             "{error:?}"
         );
     }
@@ -559,6 +639,7 @@ mod tests {
         let error = read_directory_page(response, &dir, PAGE, None)
             .await
             .expect_err("a streamed page over the budget must be refused");
+        assert!(matches!(error, PageError::Refused(_)), "{error:?}");
         assert!(error.to_string().contains("byte limit"), "{error}");
     }
 
@@ -837,14 +918,31 @@ mod tests {
     }
 
     #[test]
-    fn the_page_bound_truncates_a_directory_that_never_spends_the_budget() {
+    fn the_page_bound_stops_a_directory_that_never_spends_the_budget() {
         let owner = Keypair::random().public_key();
         let mut pager = pager_at_page_bound(&owner);
-        assert_eq!(pager.step(entries(&owner, &["d3/"])), PageStep::Truncated);
+        assert_eq!(
+            pager.step(entries(&owner, &["d3/"])),
+            PageStep::PageBoundReached
+        );
         assert!(pager.done);
 
         let mut pager = pager_at_page_bound(&owner);
         assert_eq!(pager.step(entries(&owner, &[])), PageStep::End);
+        assert!(pager.done);
+    }
+
+    #[test]
+    fn the_page_bound_after_the_budget_is_reported_as_the_page_bound() {
+        let owner = Keypair::random().public_key();
+        let mut pager = pager_at_budget(&owner);
+        while !pager.at_page_bound() {
+            assert_eq!(pager.step(entries(&owner, &["a"])), names(&[], false));
+        }
+        assert_eq!(
+            pager.step(entries(&owner, &["b"])),
+            PageStep::PageBoundReached
+        );
         assert!(pager.done);
     }
 }

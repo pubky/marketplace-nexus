@@ -280,7 +280,8 @@ const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800
 /// ids, [LISTING_DIRECTORY_TIMEOUT] and a byte budget per page). A user with no
 /// directory has none, and a 404 on a later page ends the listing like a
 /// deleted directory; a directory with more than [MAX_RESTORED_LISTINGS]
-/// entries is refused.
+/// entries, or one that does not end within the pager's page bound, is
+/// refused.
 async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventProcessorError> {
     within(
         LISTING_DIRECTORY_TIMEOUT,
@@ -306,7 +307,7 @@ async fn homeserver_listing_ids(user_id: &PubkyId) -> Result<Vec<String>, EventP
 /// Adds the ids one listings directory [PageStep] found to `ids`. Returns
 /// whether the listing is complete: after its last page, a 404 (even after
 /// earlier pages, read as a deleted directory) or its end at the cap. A
-/// directory past the cap is an error.
+/// directory past the cap or the page bound is an error.
 fn add_listing_page(ids: &mut Vec<String>, step: PageStep) -> Result<bool, EventProcessorError> {
     match step {
         PageStep::Names { names, last } => {
@@ -317,6 +318,10 @@ fn add_listing_page(ids: &mut Vec<String>, step: PageStep) -> Result<bool, Event
         PageStep::Truncated => Err(EventProcessorError::InvalidEventLine(format!(
             "listings directory has more than {MAX_RESTORED_LISTINGS} entries"
         ))),
+        PageStep::PageBoundReached => Err(EventProcessorError::InvalidEventLine(
+            "listings directory did not end within its page bound (subdirectories or repeated entries)"
+                .to_string(),
+        )),
     }
 }
 
@@ -349,13 +354,21 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_past_the_cap_is_refused() {
-        let mut ids = vec!["a".to_string()];
-        let error = add_listing_page(&mut ids, PageStep::Truncated)
-            .expect_err("a truncated listings directory must not restore part of it");
-        assert!(
-            matches!(error, EventProcessorError::InvalidEventLine(_)),
-            "{error:?}"
-        );
+    fn a_directory_past_the_cap_or_the_page_bound_is_refused() {
+        for (step, message) in [
+            (PageStep::Truncated, "more than 10000 entries"),
+            (
+                PageStep::PageBoundReached,
+                "did not end within its page bound",
+            ),
+        ] {
+            let mut ids = vec!["a".to_string()];
+            let error = add_listing_page(&mut ids, step)
+                .expect_err("a truncated listings directory must not restore part of it");
+            assert!(
+                matches!(&error, EventProcessorError::InvalidEventLine(text) if text.contains(message)),
+                "{error:?}"
+            );
+        }
     }
 }

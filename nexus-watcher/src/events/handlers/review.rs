@@ -1,5 +1,5 @@
 use crate::backfill::gate::{GateStop, RequestGate, Unthrottled};
-use crate::events::directory_page::{DirectoryPager, PageStep};
+use crate::events::directory_page::{DirectoryPager, PageError, PageStep};
 use crate::events::remote_body::{fetch_record_outcome, RecordFetch, MAX_RECORD_BYTES};
 use crate::events::retry::event::RetryEvent;
 use crate::events::EventProcessorError;
@@ -377,7 +377,8 @@ pub struct ReviewBackfill {
     /// Users whose reviews directory could not be reached. They are logged
     /// and skipped without blocking this one-shot migration.
     pub unreachable: usize,
-    /// Reviews that could not be fetched, parsed, or ingested this pass.
+    /// Reviews that could not be fetched, parsed, or ingested this pass, plus
+    /// users whose reviews directory was refused or cut short.
     pub failed: usize,
 }
 
@@ -480,7 +481,9 @@ const MAX_REVIEW_ENTRIES: usize = 10_000;
 /// One user's discovery pass through a request gate. Every LIST page and
 /// every record GET takes a permit from `gate`, and the tallies go to
 /// `summary`, which holds what was done so far when the gate stops the scan.
-/// A 404 on a later directory page ends the scan like a deleted directory.
+/// A 404 on a later directory page ends the scan like a deleted directory,
+/// and a directory page that could not be read ends it too (see
+/// `tally_page_error`).
 pub async fn scan_user_reviews(
     gate: &dyn RequestGate,
     user_id: &str,
@@ -509,8 +512,8 @@ pub async fn scan_user_reviews(
             // A user with no reviews directory answers 404. A 404 after
             // earlier pages reads as a directory deleted during the scan, as
             // before the paging was bounded. Other LIST failures mean this
-            // user's homeserver is unreachable. Neither case may permanently
-            // block the one-shot migration.
+            // user's homeserver is unreachable or its page was refused. No
+            // case may permanently block the one-shot migration.
             Ok(PageStep::Gone) => {
                 permit.succeeded();
                 debug!("Review directory for user {} is gone", user_id);
@@ -533,13 +536,32 @@ pub async fn scan_user_reviews(
                 summary.failed += 1;
                 return Ok(());
             }
-            Err(e) => {
-                permit.failed();
+            Ok(PageStep::PageBoundReached) => {
+                permit.succeeded();
                 warn!(
-                    "Review directory for user {} is unreachable; skipping: {:?}",
-                    user_id, e
+                    "Review directory for user {} did not end within its page bound (subdirectories or repeated entries); entries past it are not backfilled",
+                    user_id
                 );
-                summary.unreachable += 1;
+                summary.failed += 1;
+                return Ok(());
+            }
+            Err(e) => {
+                match tally_page_error(&e, summary) {
+                    PermitOutcome::Succeeded => {
+                        permit.succeeded();
+                        warn!(
+                            "Review directory page for user {} was refused; skipping the rest of the user: {:?}",
+                            user_id, e
+                        );
+                    }
+                    PermitOutcome::Failed => {
+                        permit.failed();
+                        warn!(
+                            "Review directory for user {} is unreachable; skipping: {:?}",
+                            user_id, e
+                        );
+                    }
+                }
                 return Ok(());
             }
         };
@@ -571,6 +593,25 @@ pub async fn scan_user_reviews(
 
         if last {
             return Ok(());
+        }
+    }
+}
+
+/// Counts a reviews directory page that could not be read in `summary` and
+/// returns how its request settles the permit. A refused page came from a
+/// homeserver that answered, so the request succeeded and the user's scan
+/// failed, as with an oversized record; it must not count toward the request
+/// gate's consecutive failures. A page that could not be fetched counts the
+/// user as unreachable and the request as failed.
+fn tally_page_error(error: &PageError, summary: &mut ReviewBackfill) -> PermitOutcome {
+    match error {
+        PageError::Refused(_) => {
+            summary.failed += 1;
+            PermitOutcome::Succeeded
+        }
+        PageError::Unreachable(_) => {
+            summary.unreachable += 1;
+            PermitOutcome::Failed
         }
     }
 }
@@ -943,6 +984,33 @@ mod record_fetch_tests {
         let (outcome, result) = classify_record_fetch(Ok(RecordFetch::NotFound));
         assert_eq!(outcome, PermitOutcome::Succeeded);
         assert!(matches!(result, Ok(None)), "{result:?}");
+    }
+
+    #[test]
+    fn a_refused_directory_page_is_an_answered_request_and_a_failed_user() {
+        let mut summary = ReviewBackfill::default();
+        let outcome = tally_page_error(
+            &PageError::Refused(EventProcessorError::InvalidEventLine(
+                "Directory page exceeds the 4096 byte limit".into(),
+            )),
+            &mut summary,
+        );
+        assert_eq!(outcome, PermitOutcome::Succeeded);
+        assert_eq!((summary.failed, summary.unreachable), (1, 0));
+    }
+
+    #[test]
+    fn an_unreadable_directory_page_is_a_failed_request_and_an_unreachable_user() {
+        for error in [
+            EventProcessorError::client_error("listing pubky://a/ timed out after 30s".into()),
+            EventProcessorError::client_error("connection refused".into()),
+            EventProcessorError::client_error("listing pubky://a/ answered 500".into()),
+        ] {
+            let mut summary = ReviewBackfill::default();
+            let outcome = tally_page_error(&PageError::Unreachable(error), &mut summary);
+            assert_eq!(outcome, PermitOutcome::Failed);
+            assert_eq!((summary.failed, summary.unreachable), (0, 1));
+        }
     }
 
     #[test]
