@@ -8,6 +8,7 @@ use remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
+mod directory_page;
 pub mod handlers;
 mod moderation;
 pub mod remote_body;
