@@ -2,6 +2,12 @@ use crate::db::get_redis_conn;
 use crate::db::kv::RedisResult;
 use deadpool_redis::redis::AsyncCommands;
 
+const MAX_SSCAN_COUNT: usize = 1_000;
+
+fn sscan_count(limit: usize) -> usize {
+    limit.min(MAX_SSCAN_COUNT)
+}
+
 /// Adds elements to a Redis set.
 ///
 /// This function adds elements to the specified Redis set. If the set doesn't exist,
@@ -84,7 +90,7 @@ pub async fn get_range(
             .arg(&index_key)
             .arg(&cursor)
             .arg("COUNT")
-            .arg(limit)
+            .arg(sscan_count(limit))
             .query_async(&mut redis_conn)
             .await?;
 
@@ -370,4 +376,22 @@ pub async fn get_random_members(
         .await?;
 
     Ok(Some(random_members))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sscan_count_keeps_small_limits() {
+        assert_eq!(sscan_count(0), 0);
+        assert_eq!(sscan_count(40), 40);
+        assert_eq!(sscan_count(MAX_SSCAN_COUNT), MAX_SSCAN_COUNT);
+    }
+
+    #[test]
+    fn sscan_count_caps_large_limits() {
+        assert_eq!(sscan_count(MAX_SSCAN_COUNT + 1), MAX_SSCAN_COUNT);
+        assert_eq!(sscan_count(usize::MAX), MAX_SSCAN_COUNT);
+    }
 }

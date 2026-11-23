@@ -6,7 +6,7 @@ use crate::{Error, Result};
 use axum::extract::Query;
 use axum::Json;
 use nexus_common::models::user::{UserIdStream, UserStream, UserStreamInput, UserStreamSource};
-use nexus_common::types::{Pagination, StreamReach, Timeframe};
+use nexus_common::types::{bounded_page_skip, Pagination, StreamReach, Timeframe};
 use serde::Deserialize;
 use tracing::debug;
 use utoipa::{OpenApi, ToSchema};
@@ -153,7 +153,7 @@ pub async fn stream_username_search_handler(
         return Err(Error::invalid_input("Username cannot be empty"));
     }
 
-    let skip = query.pagination.skip.unwrap_or(0);
+    let skip = query.pagination.bounded_skip();
     let limit = query.pagination.bounded_limit(20);
 
     debug!("GET {STREAM_USERS_USERNAME_SEARCH_ROUTE}?username={username}");
@@ -247,7 +247,7 @@ fn build_user_stream_input(
     } = query;
 
     let source = source.unwrap_or(UserStreamSource::Followers);
-    let skip = skip.unwrap_or(0);
+    let skip = bounded_page_skip(skip);
     let limit = limit.unwrap_or(5).min(20);
     let timeframe = timeframe.unwrap_or(Timeframe::AllTime);
 

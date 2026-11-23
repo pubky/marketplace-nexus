@@ -153,8 +153,8 @@ pub async fn get_range(
 
     let min_score = min_score.unwrap_or(f64::MIN);
     let max_score = max_score.unwrap_or(f64::MAX);
-    let skip = skip.unwrap_or(0) as isize;
-    let limit = limit.unwrap_or(1000) as isize;
+    let skip = isize::try_from(skip.unwrap_or(0)).unwrap_or(isize::MAX);
+    let limit = isize::try_from(limit.unwrap_or(1000)).unwrap_or(isize::MAX);
 
     // ZRANGE with the WITHSCORES option retrieves both: the elements and their scores
     let elements: Vec<(String, f64)> = match sorting {
@@ -192,8 +192,8 @@ pub async fn get_lex_range(
 ) -> RedisResult<Option<Vec<String>>> {
     let mut redis_conn = get_redis_conn().await?;
     let index_key = format!("{prefix}:{key}");
-    let skip = skip.unwrap_or(0) as isize;
-    let limit = limit.unwrap_or(1000) as isize;
+    let skip = isize::try_from(skip.unwrap_or(0)).unwrap_or(isize::MAX);
+    let limit = isize::try_from(limit.unwrap_or(1000)).unwrap_or(isize::MAX);
 
     let elements: Vec<String> = redis_conn
         .zrangebylex_limit(index_key, min, max, skip, limit)

@@ -12,6 +12,17 @@ use crate::types::StreamSorting;
 use crate::types::Timeframe;
 use pubky_app_specs::{PubkyAppListingState, PubkyAppPostKind};
 
+const MAX_QUERY_SKIP: usize = 10_000;
+const MAX_QUERY_LIMIT: usize = 1_000;
+
+fn bounded_query_skip(skip: usize) -> usize {
+    skip.min(MAX_QUERY_SKIP)
+}
+
+fn bounded_query_limit(limit: usize) -> usize {
+    limit.min(MAX_QUERY_LIMIT)
+}
+
 // Retrieve post node by post id and author id
 pub fn get_post_by_id(author_id: &str, post_id: &str) -> Query {
     Query::new(
@@ -462,9 +473,11 @@ pub fn get_user_followers(user_id: &str, skip: Option<usize>, limit: Option<usiz
                 COLLECT(follower.id) AS follower_ids",
     );
     if let Some(skip_value) = skip {
+        let skip_value = bounded_query_skip(skip_value);
         query_string.push_str(&format!(" SKIP {skip_value}"));
     }
     if let Some(limit_value) = limit {
+        let limit_value = bounded_query_limit(limit_value);
         query_string.push_str(&format!(" LIMIT {limit_value}"));
     }
     Query::new("get_user_followers", &query_string).param("user_id", user_id)
@@ -478,9 +491,11 @@ pub fn get_user_following(user_id: &str, skip: Option<usize>, limit: Option<usiz
                 COLLECT(following.id) AS following_ids",
     );
     if let Some(skip_value) = skip {
+        let skip_value = bounded_query_skip(skip_value);
         query_string.push_str(&format!(" SKIP {skip_value}"));
     }
     if let Some(limit_value) = limit {
+        let limit_value = bounded_query_limit(limit_value);
         query_string.push_str(&format!(" LIMIT {limit_value}"));
     }
     Query::new("get_user_following", &query_string).param("user_id", user_id)
@@ -551,8 +566,8 @@ pub fn get_tag_taggers_by_reach(
     Query::new("get_tag_taggers_by_reach", &cypher)
         .param("label", label)
         .param("user_id", user_id)
-        .param("skip", skip as i64)
-        .param("limit", limit as i64)
+        .param("skip", bounded_query_skip(skip) as i64)
+        .param("limit", bounded_query_limit(limit) as i64)
 }
 
 pub fn get_hot_tags_by_reach(
@@ -588,12 +603,12 @@ pub fn get_hot_tags_by_reach(
     ",
         stream_reach_to_graph_subquery(&reach),
         input_tagged_type,
-        tags_query.taggers_limit
+        bounded_query_limit(tags_query.taggers_limit)
     );
     Query::new("get_hot_tags_by_reach", &cypher)
         .param("user_id", user_id)
-        .param("skip", tags_query.skip as i64)
-        .param("limit", tags_query.limit as i64)
+        .param("skip", bounded_query_skip(tags_query.skip) as i64)
+        .param("limit", bounded_query_limit(tags_query.limit) as i64)
         .param("from", from)
         .param("to", to)
 }
@@ -625,11 +640,12 @@ pub fn get_global_hot_tags(tags_query: &HotTagsInputDTO) -> Query {
         SKIP $skip LIMIT $limit
         RETURN COLLECT(hot_tag) as hot_tags
     ",
-        input_tagged_type, tags_query.taggers_limit
+        input_tagged_type,
+        bounded_query_limit(tags_query.taggers_limit)
     );
     Query::new("get_global_hot_tags", &cypher)
-        .param("skip", tags_query.skip as i64)
-        .param("limit", tags_query.limit as i64)
+        .param("skip", bounded_query_skip(tags_query.skip) as i64)
+        .param("limit", bounded_query_limit(tags_query.limit) as i64)
         .param("from", from)
         .param("to", to)
 }
@@ -678,8 +694,8 @@ pub fn get_influencers_by_reach(
     );
     Query::new("get_influencers_by_reach", &cypher)
         .param("user_id", user_id)
-        .param("skip", skip as i64)
-        .param("limit", limit as i64)
+        .param("skip", bounded_query_skip(skip) as i64)
+        .param("limit", bounded_query_limit(limit) as i64)
         .param("from", from)
         .param("to", to)
 }
@@ -716,8 +732,8 @@ pub fn get_global_influencers(skip: usize, limit: usize, timeframe: &Timeframe) 
         RETURN COLLECT([influencer.id, influencer.score]) as influencers
     ",
     )
-    .param("skip", skip as i64)
-    .param("limit", limit as i64)
+    .param("skip", bounded_query_skip(skip) as i64)
+    .param("limit", bounded_query_limit(limit) as i64)
     .param("from", from)
     .param("to", to)
 }
@@ -880,9 +896,11 @@ pub fn post_stream(
 
     // Apply skip and limit
     if let Some(skip) = pagination.skip {
+        let skip = bounded_query_skip(skip);
         cypher.push_str(&format!("SKIP {skip}\n"));
     }
     if let Some(limit) = pagination.limit {
+        let limit = bounded_query_limit(limit);
         cypher.push_str(&format!("LIMIT {limit}\n"));
     }
 
@@ -1266,9 +1284,11 @@ pub fn drop_stream(
     ));
 
     if let Some(skip) = pagination.skip {
+        let skip = bounded_query_skip(skip);
         cypher.push_str(&format!("SKIP {skip}\n"));
     }
     if let Some(limit) = pagination.limit {
+        let limit = bounded_query_limit(limit);
         cypher.push_str(&format!("LIMIT {limit}\n"));
     }
 
@@ -1435,9 +1455,11 @@ pub fn listing_stream(
     ));
 
     if let Some(skip) = pagination.skip {
+        let skip = bounded_query_skip(skip);
         cypher.push_str(&format!("SKIP {skip}\n"));
     }
     if let Some(limit) = pagination.limit {
+        let limit = bounded_query_limit(limit);
         cypher.push_str(&format!("LIMIT {limit}\n"));
     }
 
@@ -1635,7 +1657,7 @@ pub fn recommend_users(user_id: &str, limit: usize) -> Query {
     ",
     )
     .param("user_id", user_id.to_string())
-    .param("limit", limit as i64)
+    .param("limit", bounded_query_limit(limit) as i64)
 }
 
 /// Retrieve specific tag created by the user
@@ -2103,5 +2125,26 @@ mod listing_stream_state_tests {
         }
         let cypher = stream_cypher(None, 1_790_000_000_000);
         assert!(!cypher.contains("1790000000000"), "{cypher}");
+    }
+}
+
+#[cfg(test)]
+mod query_page_tests {
+    use super::*;
+
+    #[test]
+    fn query_page_values_keep_values_inside_bounds() {
+        assert_eq!(bounded_query_skip(10), 10);
+        assert_eq!(bounded_query_limit(100), 100);
+        assert_eq!(bounded_query_skip(MAX_QUERY_SKIP), MAX_QUERY_SKIP);
+        assert_eq!(bounded_query_limit(MAX_QUERY_LIMIT), MAX_QUERY_LIMIT);
+    }
+
+    #[test]
+    fn query_page_values_clamp_large_values() {
+        assert_eq!(bounded_query_skip(MAX_QUERY_SKIP + 1), MAX_QUERY_SKIP);
+        assert_eq!(bounded_query_limit(MAX_QUERY_LIMIT + 1), MAX_QUERY_LIMIT);
+        assert_eq!(bounded_query_skip(usize::MAX), MAX_QUERY_SKIP);
+        assert_eq!(bounded_query_limit(usize::MAX), MAX_QUERY_LIMIT);
     }
 }

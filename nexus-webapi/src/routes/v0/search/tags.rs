@@ -39,7 +39,7 @@ pub async fn search_tags_by_prefix_handler(
     let validated_prefix = sanitize_validate(&prefix)?;
 
     let mut pagination = query.pagination;
-    pagination.skip.get_or_insert_default();
+    pagination.skip = Some(pagination.bounded_skip());
     pagination.limit = Some(pagination.bounded_limit(20));
 
     debug!(
