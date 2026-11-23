@@ -12,6 +12,16 @@ pub const NAME: &str = "nexus.api";
 pub const DEFAULT_LOCAL_IP: [u8; 4] = [127, 0, 0, 1];
 pub const DEFAULT_ICANN_LOCAL_PORT: u16 = 8080;
 pub const DEFAULT_PUBKY_LOCAL_PORT: u16 = 8081;
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MAX_BODY_SIZE_BYTES: usize = 1024 * 1024;
+
+const fn default_request_timeout_secs() -> u64 {
+    DEFAULT_REQUEST_TIMEOUT_SECS
+}
+
+const fn default_max_body_size_bytes() -> usize {
+    DEFAULT_MAX_BODY_SIZE_BYTES
+}
 
 /// Configuration settings for the Nexus Watcher service
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +30,10 @@ pub struct ApiConfig {
     pub public_ip: IpAddr,
     pub public_addr: SocketAddr,
     pub pubky_listen_socket: SocketAddr,
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    #[serde(default = "default_max_body_size_bytes")]
+    pub max_body_size_bytes: usize,
     #[serde(default = "default_stack")]
     pub stack: StackConfig,
 }
@@ -31,6 +45,8 @@ impl Default for ApiConfig {
             public_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             public_addr: SocketAddr::from((DEFAULT_LOCAL_IP, DEFAULT_ICANN_LOCAL_PORT)),
             pubky_listen_socket: SocketAddr::from((DEFAULT_LOCAL_IP, DEFAULT_PUBKY_LOCAL_PORT)),
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            max_body_size_bytes: DEFAULT_MAX_BODY_SIZE_BYTES,
             stack: StackConfig::default(),
         }
     }
@@ -49,3 +65,23 @@ impl From<DaemonConfig> for ApiConfig {
 
 #[async_trait]
 impl ConfigLoader<ApiConfig> for ApiConfig {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_limits_default_when_absent() {
+        let config: ApiConfig = toml::from_str(
+            r#"
+            name = "nexus.api"
+            public_ip = "127.0.0.1"
+            public_addr = "127.0.0.1:8080"
+            pubky_listen_socket = "127.0.0.1:8081"
+            "#,
+        )
+        .expect("config parses");
+        assert_eq!(config.request_timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
+        assert_eq!(config.max_body_size_bytes, DEFAULT_MAX_BODY_SIZE_BYTES);
+    }
+}

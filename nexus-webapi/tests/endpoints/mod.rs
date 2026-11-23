@@ -3,6 +3,8 @@ use crate::utils::{host_url, server::TestServiceServer};
 use anyhow::Result;
 use axum::http::Method;
 
+mod bounds;
+mod middleware;
 mod openapi;
 
 #[tokio_shared_rt::test(shared)]
