@@ -16,14 +16,15 @@ use nexus_common::models::{
     traits::Collection,
     user::UserDetails,
 };
-use nexus_common::{ApiConfig, MediaConfig, StackConfig};
+use nexus_common::ApiConfig;
 use nexus_webapi::routes::{app_routes, build_app, AppState};
-use nexus_webapi::{api_context::ApiContextBuilder, NexusApiBuilder};
 use pubky::Keypair;
 use pubky_app_specs::PubkyId;
 use tempfile::TempDir;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 use tower::ServiceExt;
+
+use crate::utils::server::TestServiceServer;
 
 fn state() -> Result<(TempDir, AppState)> {
     let temp_dir = TempDir::new()?;
@@ -38,39 +39,15 @@ struct MediaRouterState {
     state: AppState,
 }
 
-static MEDIA_ROUTER_STACK: OnceCell<()> = OnceCell::const_new();
 static MEDIA_ROUTER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
-const MEDIA_REQUEST_TIMEOUT_SECS: u64 = 2;
 
+/// The media settings are process-wide and the first stack start sets them. Every
+/// test in this binary starts the stack through the shared test server, so they are
+/// the defaults, and the router gets the default request timeout above them.
 async fn media_router_state() -> Result<MediaRouterState> {
+    TestServiceServer::get_test_server().await;
     let temp_dir = TempDir::new_in(".")?;
     let files_path = temp_dir.path().join("files");
-    MEDIA_ROUTER_STACK
-        .get_or_try_init(|| async {
-            let api_config = ApiConfig {
-                request_timeout_secs: MEDIA_REQUEST_TIMEOUT_SECS,
-                stack: StackConfig {
-                    files_path: files_path.clone(),
-                    media: MediaConfig {
-                        max_concurrency: 1,
-                        process_timeout_secs: 1,
-                    },
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let api_context = ApiContextBuilder::from_config_dir(temp_dir.path().join("config"))
-                .api_config(api_config)
-                .try_build()
-                .await
-                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
-            NexusApiBuilder::new(api_context)
-                .init_stack()
-                .await
-                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await?;
     Ok(MediaRouterState {
         _temp_dir: temp_dir,
         state: AppState {
@@ -83,7 +60,7 @@ fn media_router(state: AppState) -> Router {
     build_app(
         app_routes(state.clone()),
         state,
-        MEDIA_REQUEST_TIMEOUT_SECS,
+        ApiConfig::default().request_timeout_secs,
         1024 * 1024,
     )
 }
@@ -240,7 +217,7 @@ async fn test_request_timeout_response_has_cors_header() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio_shared_rt::test(shared)]
 async fn test_file_variant_slots_held_returns_503_with_retry_after() -> Result<()> {
     let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
     let test_state = media_router_state().await?;
@@ -270,7 +247,7 @@ async fn test_file_variant_slots_held_returns_503_with_retry_after() -> Result<(
     Ok(())
 }
 
-#[tokio::test]
+#[tokio_shared_rt::test(shared)]
 async fn test_avatar_slots_held_serves_original() -> Result<()> {
     let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
     let test_state = media_router_state().await?;
@@ -303,7 +280,7 @@ async fn test_avatar_slots_held_serves_original() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio_shared_rt::test(shared)]
 async fn test_file_variant_declared_type_mismatch_returns_400() -> Result<()> {
     let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
     let test_state = media_router_state().await?;
