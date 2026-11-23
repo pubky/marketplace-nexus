@@ -106,7 +106,22 @@ async fn test_graph_stream_skip_above_bound_is_empty() -> Result<()> {
     let bound_page = get_request(&format!(
         "/v0/stream/posts/keys?author_id={author}&source=author&sorting=timeline&kind=short&skip={SKIP_BOUND}&limit=1"
     ))
+    .await;
+    let next_page = get_request(&format!(
+        "/v0/stream/posts/keys?author_id={author}&source=author&sorting=timeline&kind=short&skip={}&limit=1",
+        SKIP_BOUND + 1
+    ))
+    .await;
+    // Other suites compare post streams whose ties follow the graph's scan order.
+    exec_single_row(Query::new(
+        "remove_graph_skip_stream",
+        "MATCH (author:User {id: 'bounds_graph_skip_author'})
+         OPTIONAL MATCH (author)-[:AUTHORED]->(post:Post)
+         DETACH DELETE post, author",
+    ))
     .await?;
+
+    let bound_page = bound_page?;
     assert_eq!(
         bound_page["post_keys"].as_array().expect("post keys").len(),
         1
@@ -115,12 +130,7 @@ async fn test_graph_stream_skip_above_bound_is_empty() -> Result<()> {
         bound_page["post_keys"][0],
         format!("{author}:bounds-graph-post-0")
     );
-
-    let next_page = get_request(&format!(
-        "/v0/stream/posts/keys?author_id={author}&source=author&sorting=timeline&kind=short&skip={}&limit=1",
-        SKIP_BOUND + 1
-    ))
-    .await?;
+    let next_page = next_page?;
     assert!(next_page["post_keys"]
         .as_array()
         .expect("post keys")

@@ -16,7 +16,7 @@ use nexus_common::models::{
     traits::Collection,
     user::UserDetails,
 };
-use nexus_common::ApiConfig;
+use nexus_common::{get_files_dir_test_pathbuf, ApiConfig};
 use nexus_webapi::routes::{app_routes, build_app, AppState};
 use pubky::Keypair;
 use pubky_app_specs::PubkyId;
@@ -34,26 +34,23 @@ fn state() -> Result<(TempDir, AppState)> {
     Ok((temp_dir, state))
 }
 
-struct MediaRouterState {
-    _temp_dir: TempDir,
-    state: AppState,
-}
-
 static MEDIA_ROUTER_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// The media settings are process-wide and the first stack start sets them. Every
-/// test in this binary starts the stack through the shared test server, so they are
-/// the defaults, and the router gets the default request timeout above them.
-async fn media_router_state() -> Result<MediaRouterState> {
+/// The media settings, the database connections and the static file root are
+/// process-wide, and the first use sets them. These tests go through the shared test
+/// server and its files directory, so the media settings are the defaults and the
+/// router gets the default request timeout above them.
+async fn media_router_state() -> AppState {
     TestServiceServer::get_test_server().await;
-    let temp_dir = TempDir::new_in(".")?;
-    let files_path = temp_dir.path().join("files");
-    Ok(MediaRouterState {
-        _temp_dir: temp_dir,
-        state: AppState {
-            files_path: Arc::new(files_path),
-        },
-    })
+    AppState {
+        files_path: Arc::new(get_files_dir_test_pathbuf()),
+    }
+}
+
+async fn remove_media_file(state: &AppState, file: &FileDetails) -> Result<()> {
+    file.delete().await?;
+    tokio::fs::remove_dir_all(state.files_path.join(&file.owner_id)).await?;
+    Ok(())
 }
 
 fn media_router(state: AppState) -> Router {
@@ -220,16 +217,10 @@ async fn test_request_timeout_response_has_cors_header() -> Result<()> {
 #[tokio_shared_rt::test(shared)]
 async fn test_file_variant_slots_held_returns_503_with_retry_after() -> Result<()> {
     let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
-    let test_state = media_router_state().await?;
-    let file = index_media_file(
-        &test_state.state,
-        "2ZKBUSY000001",
-        "image/png",
-        &png_body().await?,
-    )
-    .await?;
+    let state = media_router_state().await;
+    let file = index_media_file(&state, "2ZKBUSY000001", "image/png", &png_body().await?).await?;
     let held = acquire_all_conversion_slots().await;
-    let response = media_router(test_state.state.clone())
+    let response = media_router(state.clone())
         .oneshot(
             Request::builder()
                 .uri(format!("/static/files/{}/{}/small", file.owner_id, file.id))
@@ -237,7 +228,7 @@ async fn test_file_variant_slots_held_returns_503_with_retry_after() -> Result<(
         )
         .await?;
     drop(held);
-    file.delete().await?;
+    remove_media_file(&state, &file).await?;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
@@ -250,12 +241,12 @@ async fn test_file_variant_slots_held_returns_503_with_retry_after() -> Result<(
 #[tokio_shared_rt::test(shared)]
 async fn test_avatar_slots_held_serves_original() -> Result<()> {
     let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
-    let test_state = media_router_state().await?;
+    let state = media_router_state().await;
     let png = png_body().await?;
-    let file = index_media_file(&test_state.state, "2ZKAVATAR0001", "image/png", &png).await?;
+    let file = index_media_file(&state, "2ZKAVATAR0001", "image/png", &png).await?;
     index_avatar(&file).await?;
     let held = acquire_all_conversion_slots().await;
-    let response = media_router(test_state.state.clone())
+    let response = media_router(state.clone())
         .oneshot(
             Request::builder()
                 .uri(format!("/static/avatar/{}", file.owner_id))
@@ -271,7 +262,7 @@ async fn test_avatar_slots_held_serves_original() -> Result<()> {
         .to_str()?
         .to_string();
     let body = to_bytes(response.into_body(), png.len() + 1024).await?;
-    file.delete().await?;
+    remove_media_file(&state, &file).await?;
     UserDetails::delete(&file.owner_id).await?;
 
     assert_eq!(status, StatusCode::OK);
@@ -283,22 +274,22 @@ async fn test_avatar_slots_held_serves_original() -> Result<()> {
 #[tokio_shared_rt::test(shared)]
 async fn test_file_variant_declared_type_mismatch_returns_400() -> Result<()> {
     let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
-    let test_state = media_router_state().await?;
+    let state = media_router_state().await;
     let file = index_media_file(
-        &test_state.state,
+        &state,
         "2ZKTYPE000001",
         "image/png",
         &[0xFF, 0xD8, 0xFF, 0x00],
     )
     .await?;
-    let response = media_router(test_state.state.clone())
+    let response = media_router(state.clone())
         .oneshot(
             Request::builder()
                 .uri(format!("/static/files/{}/{}/small", file.owner_id, file.id))
                 .body(Body::empty())?,
         )
         .await?;
-    file.delete().await?;
+    remove_media_file(&state, &file).await?;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     Ok(())
