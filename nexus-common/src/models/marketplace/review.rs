@@ -110,7 +110,11 @@ impl ReviewDetails {
     /// running the offline attestation verification recipe (parse →
     /// signature → binding). A failed verification never rejects the record:
     /// unverified reviews are indexed and labeled (ratified D5).
-    pub fn from_homeserver(review: &PubkyAppMarketplaceReview, reviewer_id: &PubkyId) -> Self {
+    pub fn from_homeserver(
+        review: &PubkyAppMarketplaceReview,
+        reviewer_id: &PubkyId,
+        subject_id: &PubkyId,
+    ) -> Self {
         let (verified, attestor_id, order_ref, iat, price_weight) =
             match PubkyAppPurchaseAttestation::verify_for_review(review) {
                 Ok(attestation) => (
@@ -127,7 +131,7 @@ impl ReviewDetails {
             review_id: review.review_id.clone(),
             uri: marketplace_review_uri_builder(reviewer_id.to_string(), review.review_id.clone()),
             reviewer_id: reviewer_id.to_string(),
-            subject_id: review.subject_pubky.clone(),
+            subject_id: subject_id.to_string(),
             listing_owner_id: review.listing_owner_pubky.clone(),
             listing_id: review.listing_id.clone(),
             role: review.role,

@@ -1,11 +1,12 @@
 use super::utils::{
-    attestor_pubky, sign_attestation, test_attestation_claims, test_attestor_key, test_listing,
-    test_review, test_review_response, test_shop,
+    attestor_pubky, canonical_pubky_alias, sign_attestation, test_attestation_claims,
+    test_attestor_key, test_listing, test_review, test_review_response, test_shop,
 };
 use crate::event_processor::utils::watcher::WatcherTest;
 use anyhow::Result;
 use ed25519_dalek::SigningKey;
 use nexus_common::db::kv::SortOrder;
+use nexus_common::models::event::EventType;
 use nexus_common::models::marketplace::{
     ListingStream, ListingStreamFilters, ListingStreamSorting, ReputationSummary, ReviewDetails,
     ReviewResponseDetails, ReviewStream, ShopView,
@@ -14,10 +15,11 @@ use nexus_common::types::Pagination;
 use nexus_watcher::events::handlers::review::{
     backfill_reviews_for_user, ingest_review_from_homeserver,
 };
+use nexus_watcher::events::retry::event::RetryEvent;
 use pubky::Keypair;
 use pubky_app_specs::{
-    traits::HasPath, PubkyAppListingCondition, PubkyAppReviewRole, PubkyAppShop, PubkyAppUser,
-    PubkyId,
+    marketplace_review_uri_builder, traits::HasPath, PubkyAppListingCondition, PubkyAppReviewRole,
+    PubkyAppShop, PubkyAppUser, PubkyId,
 };
 
 fn test_user(name: &str) -> PubkyAppUser {
@@ -46,6 +48,179 @@ async fn seller_stream(seller_id: &str) -> Option<ListingStream> {
     )
     .await
     .unwrap()
+}
+
+async fn assert_no_review_retry(reviewer_id: &str, review_id: &str) -> Result<()> {
+    let uri = marketplace_review_uri_builder(reviewer_id.to_string(), review_id.to_string());
+    let retry_key = format!(
+        "{}:{}",
+        EventType::Put,
+        RetryEvent::generate_index_key(&uri).expect("review retry key")
+    );
+    assert!(RetryEvent::check_uri(&retry_key).await?.is_none());
+    assert!(RetryEvent::get_from_index(&retry_key).await?.is_none());
+    Ok(())
+}
+
+async fn assert_review_not_indexed_or_retried(reviewer_id: &str, review_id: &str) -> Result<()> {
+    assert!(ReviewDetails::get_from_index(reviewer_id, review_id)
+        .await?
+        .is_none());
+    assert_no_review_retry(reviewer_id, review_id).await
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn review_of_self_is_not_indexed_or_retried() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let user_kp = Keypair::random();
+    let user_id = test
+        .create_user(&user_kp, &test_user("Watcher:Review:Self"))
+        .await?;
+    let review = test_review(
+        &user_id,
+        &user_id,
+        &user_id,
+        "listing",
+        5,
+        "Self review.",
+        &"a".repeat(64),
+    );
+    let (review_id, _review_path) = test.create_review(&user_kp, &review).await?;
+
+    assert_review_not_indexed_or_retried(&user_id, &review_id).await?;
+    assert!(ReviewStream::get_by_subject(
+        &user_id,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+        Pagination::default(),
+    )
+    .await?
+    .is_none());
+    assert!(
+        ReputationSummary::get_by_subject(&user_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await?
+            .is_none()
+    );
+
+    test.cleanup_user(&user_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn review_with_owner_alias_as_subject_is_not_indexed_or_retried() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let user_kp = Keypair::random();
+    let user_id = test
+        .create_user(&user_kp, &test_user("Watcher:Review:SelfAlias"))
+        .await?;
+    let subject_alias = canonical_pubky_alias(&user_id).expect("a canonical owner alias");
+    assert_eq!(
+        PubkyId::try_from(subject_alias.as_str())
+            .unwrap()
+            .to_string(),
+        user_id
+    );
+    let review = test_review(
+        &user_id,
+        &subject_alias,
+        &user_id,
+        "listing",
+        5,
+        "Self review with another spelling.",
+        &"a".repeat(64),
+    );
+    let (review_id, _review_path) = test.create_review(&user_kp, &review).await?;
+
+    assert_review_not_indexed_or_retried(&user_id, &review_id).await?;
+    assert!(ReviewStream::get_by_subject(
+        &user_id,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+        Pagination::default(),
+    )
+    .await?
+    .is_none());
+
+    test.cleanup_user(&user_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn review_with_subject_alias_uses_the_canonical_subject() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let seller_kp = Keypair::random();
+    let seller_id = test
+        .create_user(&seller_kp, &test_user("Watcher:Review:SubjectAlias:Seller"))
+        .await?;
+    let listing = test_listing(
+        &seller_id,
+        "Aliased subject listing",
+        "electronics",
+        PubkyAppListingCondition::Good,
+        20_000,
+    );
+    let (listing_id, _listing_path) = test.create_listing(&seller_kp, &listing).await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(&buyer_kp, &test_user("Watcher:Review:SubjectAlias:Buyer"))
+        .await?;
+    let subject_alias = canonical_pubky_alias(&seller_id).expect("a canonical subject alias");
+    let review = test_review(
+        &buyer_id,
+        &subject_alias,
+        &seller_id,
+        &listing_id,
+        4,
+        "The subject uses another spelling.",
+        &"a".repeat(64),
+    );
+    let (review_id, _review_path) = test.create_review(&buyer_kp, &review).await?;
+
+    let indexed = ReviewDetails::get_from_index(&buyer_id, &review_id)
+        .await?
+        .expect("the review should be indexed");
+    assert_eq!(indexed.subject_id, seller_id);
+    assert_no_review_retry(&buyer_id, &review_id).await?;
+    let stream = ReviewStream::get_by_subject(
+        &seller_id,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+        Pagination::default(),
+    )
+    .await?
+    .expect("the canonical subject stream should contain the review");
+    assert_eq!(stream.0.len(), 1);
+    assert_eq!(stream.0[0].review.review_id, review_id);
+    assert!(ReviewStream::get_by_subject(
+        &subject_alias,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+        Pagination::default(),
+    )
+    .await?
+    .is_none());
+    let summary =
+        ReputationSummary::get_by_subject(&seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await?
+            .expect("the canonical subject reputation should exist");
+    assert_eq!(summary.count, 1);
+    assert_eq!(summary.verified_count, 0);
+    assert_eq!(summary.avg, 4.0);
+    assert!(ReputationSummary::get_by_subject(
+        &subject_alias,
+        PubkyAppReviewRole::BuyerReviewingSeller,
+    )
+    .await?
+    .is_none());
+    let listing_stream =
+        ReviewStream::get_by_listing(&seller_id, &listing_id, Pagination::default())
+            .await?
+            .expect("the listing stream should contain the review");
+    assert_eq!(listing_stream.0.len(), 1);
+    let listing_summary = ReputationSummary::get_by_listing(&seller_id, &listing_id)
+        .await?
+        .expect("the listing reputation should exist");
+    assert_eq!(listing_summary.count, 1);
+
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&seller_kp).await?;
+    Ok(())
 }
 
 #[tokio_shared_rt::test(shared)]

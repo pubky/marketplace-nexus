@@ -10,7 +10,7 @@ use pubky_app_specs::{
     PubkyAppListingState, PubkyAppListingVariant, PubkyAppMarketplaceDrop,
     PubkyAppMarketplaceLocation, PubkyAppMarketplaceReview, PubkyAppMoney,
     PubkyAppPurchaseAttestationClaims, PubkyAppReturnPolicy, PubkyAppReviewRatings,
-    PubkyAppReviewResponse, PubkyAppReviewRole, PubkyAppShop, PURCHASE_ATTESTATION_TYP,
+    PubkyAppReviewResponse, PubkyAppReviewRole, PubkyAppShop, PubkyId, PURCHASE_ATTESTATION_TYP,
 };
 
 use crate::event_processor::utils::watcher::WatcherTest;
@@ -289,6 +289,22 @@ pub fn sign_attestation(claims: &PubkyAppPurchaseAttestationClaims, key: &Signin
         "{signing_input}.{}",
         base64url_encode(&signature.to_bytes())
     )
+}
+
+pub fn canonical_pubky_alias(canonical: &str) -> Option<String> {
+    const Z32_ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+    assert_eq!(canonical.len(), 52);
+    Z32_ALPHABET
+        .iter()
+        .filter(|character| **character != canonical.as_bytes()[51])
+        .map(|character| {
+            let mut spelling = canonical.as_bytes().to_vec();
+            spelling[51] = *character;
+            String::from_utf8(spelling).unwrap()
+        })
+        .find(|spelling| {
+            PubkyId::try_from(spelling.as_str()).is_ok_and(|parsed| parsed.to_string() == canonical)
+        })
 }
 
 /// Builds a valid buyer-reviewing-seller review record. The caller assigns
