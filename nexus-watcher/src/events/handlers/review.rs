@@ -41,6 +41,16 @@ pub async fn sync_put(
     index_review(review, user_id, review_id).await
 }
 
+fn validate_review_subject(review: &PubkyAppMarketplaceReview) -> Result<(), EventProcessorError> {
+    if review.owner_pubky == review.subject_pubky {
+        return Err(EventProcessorError::InvalidEventLine(format!(
+            "Review owner {} and subject must differ",
+            review.owner_pubky
+        )));
+    }
+    Ok(())
+}
+
 /// The ingest [`sync_put`] runs, without marking the review as touched. For
 /// callers that fence their own read against the event feed
 /// ([`ingest_read_review`]); the feed itself goes through [`sync_put`].
@@ -59,6 +69,7 @@ pub async fn index_review(
             review.owner_pubky, user_id
         )));
     }
+    validate_review_subject(&review)?;
 
     let mut details = ReviewDetails::from_homeserver(&review, &user_id);
     // An edit keeps its supersession state until resolve_order_twins
@@ -940,6 +951,52 @@ pub async fn backfill_trust_buckets() -> Result<TrustBucketBackfill, EventProces
     }
     summary.aggregates = subjects.len() + listings.len();
     Ok(summary)
+}
+
+#[cfg(test)]
+mod review_validation_tests {
+    use super::*;
+    use pubky_app_specs::PubkyAppReviewRatings;
+
+    fn self_review(role: PubkyAppReviewRole) -> PubkyAppMarketplaceReview {
+        let owner = pubky::Keypair::random().public_key().to_z32();
+        PubkyAppMarketplaceReview::new(
+            owner.clone(),
+            1,
+            "2026-08-20T12:00:00Z".to_string(),
+            "2026-08-20T12:00:00Z".to_string(),
+            String::new(),
+            owner.clone(),
+            owner,
+            "listing".to_string(),
+            role,
+            PubkyAppReviewRatings {
+                overall: 5,
+                item_accuracy: None,
+                shipping: None,
+                communication: None,
+            },
+            "Arrived as described.".to_string(),
+            String::new(),
+        )
+    }
+
+    #[test]
+    fn owner_and_subject_differ_for_every_review_role() {
+        for role in [
+            PubkyAppReviewRole::BuyerReviewingSeller,
+            PubkyAppReviewRole::SellerReviewingBuyer,
+        ] {
+            let mut review = self_review(role);
+            assert!(matches!(
+                validate_review_subject(&review),
+                Err(EventProcessorError::InvalidEventLine(_))
+            ));
+
+            review.subject_pubky = pubky::Keypair::random().public_key().to_z32();
+            assert!(validate_review_subject(&review).is_ok());
+        }
+    }
 }
 
 #[cfg(test)]

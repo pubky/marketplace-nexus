@@ -1720,6 +1720,13 @@ const SELLER_FIELDS_ONCE_PER_ORDER: &str = "coalesce(r.seller_fields_counted, tr
 /// [`crate::models::marketplace::ReviewModerationState::Excluded`]).
 const REPUTATION_NOT_EXCLUDED: &str = "coalesce(r.moderation, '') <> 'excluded'";
 
+const GROUP_REPUTATION_REVIEWS: &str = "
+        WITH reviewer, r
+        ORDER BY r.created_at DESC, r.review_id DESC
+        WITH CASE WHEN r.verified THEN 'v:' + r.review_id
+             ELSE 'u:' + reviewer.id + ':' + coalesce(r.listing_id, '')
+             END AS review_group, collect(r)[0] AS r";
+
 /// The reviewer's other verified review edges in one role that carry the
 /// same attested order `(attestor_id, order_ref)` for the same listing: a
 /// legacy record and its order-scoped twin embed the same attestation. Item
@@ -1751,15 +1758,17 @@ pub fn review_order_twins(
     .param("listing_id", listing_id.to_string())
 }
 
-/// Aggregates every `REVIEWED` edge pointing at a subject in one role into
-/// the reputation summary row, leaving out legacy records superseded by
-/// their order-scoped twin and reviews moderation excluded. Seller fields
-/// count once per attested order.
+/// Builds the reputation summary for one subject and role. Verified records
+/// count individually; unverified records use the latest record per author and
+/// listing. Superseded and excluded records are removed before selection.
+/// Seller fields count once per attested order.
 pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
     let cypher = format!(
-        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
-        WHERE r.role = $role AND coalesce(r.superseded, false) = false
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
+        WHERE reviewer.id <> subject.id AND r.role = $role
+            AND coalesce(r.superseded, false) = false
             AND {REPUTATION_NOT_EXCLUDED}
+        {GROUP_REPUTATION_REVIEWS}
         {}",
         reputation_return(SELLER_FIELDS_ONCE_PER_ORDER)
     );
@@ -1775,10 +1784,12 @@ pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
 /// which anchors the scan.
 pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
     let cypher = format!(
-        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
-        WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
+        WHERE reviewer.id <> subject.id AND r.role = 'buyer_reviewing_seller'
+            AND r.listing_id = $listing_id
             AND coalesce(r.superseded, false) = false
             AND {REPUTATION_NOT_EXCLUDED}
+        {GROUP_REPUTATION_REVIEWS}
         {}",
         reputation_return("true")
     );
@@ -1812,8 +1823,8 @@ fn review_counting_rows(scope_match: &str, seller_fields: &str) -> String {
 /// [`review_counting_rows`]).
 pub fn subject_counting_rows(subject_id: &str, role: &str) -> Query {
     let cypher = review_counting_rows(
-        "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
-        WHERE r.role = $role",
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $subject_id})
+        WHERE reviewer.id <> subject.id AND r.role = $role",
         SELLER_FIELDS_ONCE_PER_ORDER,
     );
     Query::new("subject_counting_rows", &cypher)
@@ -1825,8 +1836,9 @@ pub fn subject_counting_rows(subject_id: &str, role: &str) -> Query {
 /// [`review_counting_rows`]).
 pub fn listing_counting_rows(listing_owner_id: &str, listing_id: &str) -> Query {
     let cypher = review_counting_rows(
-        "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $listing_owner_id})
-        WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $listing_owner_id})
+        WHERE reviewer.id <> subject.id AND r.role = 'buyer_reviewing_seller'
+            AND r.listing_id = $listing_id",
         "true",
     );
     Query::new("listing_counting_rows", &cypher)
