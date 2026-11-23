@@ -1726,7 +1726,7 @@ const REPUTATION_NOT_EXCLUDED: &str = "coalesce(r.moderation, '') <> 'excluded'"
 const GROUP_REPUTATION_REVIEWS: &str = "
         WITH reviewer, r
         ORDER BY r.created_at DESC, r.review_id DESC
-        WITH CASE WHEN r.verified THEN 'v:' + r.review_id
+        WITH CASE WHEN r.verified THEN 'v:' + reviewer.id + ':' + r.review_id
              ELSE 'u:' + reviewer.id + ':' + coalesce(r.listing_id, '')
              END AS review_group, collect(r)[0] AS r";
 
@@ -1879,12 +1879,12 @@ pub fn filtered_review_rows(
     }
     match scope {
         ReviewStreamScope::Subject { .. } => cypher.push_str(
-            "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
-            WHERE r.role = $role",
+            "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $subject_id})
+            WHERE reviewer.id <> subject.id AND r.role = $role",
         ),
         ReviewStreamScope::Listing { .. } => cypher.push_str(
-            "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
-            WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
+            "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $subject_id})
+            WHERE reviewer.id <> subject.id AND r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
         ),
     }
     cypher.push_str("\n    AND coalesce(r.superseded, false) = false");

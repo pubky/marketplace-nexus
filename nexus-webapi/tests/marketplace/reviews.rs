@@ -332,6 +332,88 @@ async fn test_same_user_edges_do_not_shape_reputation() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn test_verified_records_from_different_reviewers_count_separately() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let first_reviewer = random_id();
+    let second_reviewer = random_id();
+    let attestor = random_id();
+    let review_id = random_id();
+    for user in [&seller, &first_reviewer, &second_reviewer] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = [
+        review(
+            &first_reviewer,
+            &seller,
+            &review_id,
+            5,
+            Some((&attestor, &random_id(), 1_790_002_000, 2)),
+            now,
+        ),
+        review(
+            &second_reviewer,
+            &seller,
+            &review_id,
+            3,
+            Some((&attestor, &random_id(), 1_790_002_001, 4)),
+            now + 1,
+        ),
+    ];
+    put_graph_reviews(&reviews).await?;
+
+    let (subject, listing) = recompute_pair(&seller, LISTING_ID).await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.verified_count, 2);
+        assert_eq!(summary.unverified_count, 0);
+        assert_eq!(summary.avg, 4.0);
+        assert_eq!(summary.histogram, [0, 0, 1, 0, 1]);
+        assert_eq!(summary.attestors.get(&attestor), Some(&2));
+        let bucket = summary.buckets.get(&attestor).expect("attestor bucket");
+        assert_eq!(bucket.orders, 2);
+        assert_eq!(bucket.buyers, 2);
+        assert_eq!(bucket.sum_buyer_means, 8.0);
+        assert_eq!(bucket.histogram, [0, 0, 1, 0, 1]);
+    }
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_filtered_streams_leave_out_same_user_edges() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let reviewer = random_id();
+    let listing_id = random_id();
+    for user in [&seller, &reviewer] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = [
+        listing_review(&seller, &seller, &listing_id, 1, None, now),
+        listing_review(&reviewer, &seller, &listing_id, 5, None, now + 1),
+    ];
+    put_graph_reviews(&reviews).await?;
+    for details in &reviews {
+        details.put_to_index(false).await?;
+    }
+
+    for route in [
+        format!("/v0/shop/{seller}/reviews?sort=newest"),
+        format!("/v0/listing/{seller}/{listing_id}/reviews?sort=newest"),
+    ] {
+        let body = get_request(&route).await?;
+        let stream = body["reviews"].as_array().expect("filtered reviews");
+        assert_eq!(stream.len(), 1, "{route}");
+        assert_eq!(stream[0]["review"]["reviewer_id"], reviewer);
+    }
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn test_unverified_records_collapse_to_latest_per_user_and_listing() -> Result<()> {
     crate::utils::host_url().await;
     let seller = random_id();
