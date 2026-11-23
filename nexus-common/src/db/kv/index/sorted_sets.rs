@@ -1,5 +1,6 @@
 use crate::db::get_redis_conn;
 use crate::db::kv::RedisResult;
+use crate::types::MAX_PAGE_SKIP;
 use redis::AsyncCommands;
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -143,6 +144,10 @@ pub async fn get_range(
     limit: Option<usize>,
     sorting: SortOrder,
 ) -> RedisResult<Option<Vec<(String, f64)>>> {
+    if skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+        return Ok(Some(Vec::new()));
+    }
+
     let mut redis_conn = get_redis_conn().await?;
     let index_key = format!("{prefix}:{key}");
 
@@ -190,6 +195,10 @@ pub async fn get_lex_range(
     skip: Option<usize>,
     limit: Option<usize>,
 ) -> RedisResult<Option<Vec<String>>> {
+    if skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+        return Ok(Some(Vec::new()));
+    }
+
     let mut redis_conn = get_redis_conn().await?;
     let index_key = format!("{prefix}:{key}");
     let skip = isize::try_from(skip.unwrap_or(0)).unwrap_or(isize::MAX);
@@ -246,4 +255,40 @@ pub async fn del(prefix: &str, key: &str, values: &[&str]) -> RedisResult<()> {
     // Remove the elements from the sorted set
     let _: () = redis_conn.zrem(index_key, values).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn score_range_above_the_skip_bound_returns_an_empty_page() {
+        let page = get_range(
+            "Missing",
+            "score",
+            None,
+            None,
+            Some(MAX_PAGE_SKIP + 1),
+            Some(1),
+            SortOrder::Descending,
+        )
+        .await
+        .expect("empty page");
+        assert_eq!(page, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn lex_range_above_the_skip_bound_returns_an_empty_page() {
+        let page = get_lex_range(
+            "Missing",
+            "lex",
+            "[a",
+            "(z",
+            Some(MAX_PAGE_SKIP + 1),
+            Some(1),
+        )
+        .await
+        .expect("empty page");
+        assert_eq!(page, Some(Vec::new()));
+    }
 }

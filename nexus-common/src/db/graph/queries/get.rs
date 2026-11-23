@@ -16,7 +16,10 @@ const MAX_QUERY_SKIP: usize = 10_000;
 const MAX_QUERY_LIMIT: usize = 1_000;
 
 fn bounded_query_skip(skip: usize) -> usize {
-    skip.min(MAX_QUERY_SKIP)
+    if skip > MAX_QUERY_SKIP {
+        return (i64::MAX as usize) - MAX_QUERY_LIMIT;
+    }
+    skip
 }
 
 fn bounded_query_limit(limit: usize) -> usize {
@@ -2153,10 +2156,12 @@ mod query_page_tests {
     }
 
     #[test]
-    fn query_page_values_clamp_large_values() {
-        assert_eq!(bounded_query_skip(MAX_QUERY_SKIP + 1), MAX_QUERY_SKIP);
+    fn query_page_values_above_the_skip_bound_use_an_empty_offset() {
+        let empty_offset = (i64::MAX as usize) - MAX_QUERY_LIMIT;
+        assert_eq!(bounded_query_skip(MAX_QUERY_SKIP + 1), empty_offset);
+        assert_eq!(bounded_query_skip(usize::MAX), empty_offset);
+        assert_eq!(empty_offset + MAX_QUERY_LIMIT, i64::MAX as usize);
         assert_eq!(bounded_query_limit(MAX_QUERY_LIMIT + 1), MAX_QUERY_LIMIT);
-        assert_eq!(bounded_query_skip(usize::MAX), MAX_QUERY_SKIP);
         assert_eq!(bounded_query_limit(usize::MAX), MAX_QUERY_LIMIT);
     }
 }

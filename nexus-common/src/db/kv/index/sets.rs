@@ -1,5 +1,6 @@
 use crate::db::get_redis_conn;
 use crate::db::kv::RedisResult;
+use crate::types::MAX_PAGE_SKIP;
 use deadpool_redis::redis::AsyncCommands;
 
 const MAX_SSCAN_COUNT: usize = 1_000;
@@ -75,6 +76,10 @@ pub async fn get_range(
     skip: Option<usize>,
     limit: Option<usize>,
 ) -> RedisResult<Option<Vec<String>>> {
+    if skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+        return Ok(Some(Vec::new()));
+    }
+
     let mut redis_conn = get_redis_conn().await?;
 
     let index_key = format!("{prefix}:{key}");
@@ -393,5 +398,13 @@ mod tests {
     fn sscan_count_caps_large_limits() {
         assert_eq!(sscan_count(MAX_SSCAN_COUNT + 1), MAX_SSCAN_COUNT);
         assert_eq!(sscan_count(usize::MAX), MAX_SSCAN_COUNT);
+    }
+
+    #[tokio::test]
+    async fn set_range_above_the_skip_bound_returns_an_empty_page() {
+        let page = get_range("Missing", "set", Some(MAX_PAGE_SKIP + 1), Some(1))
+            .await
+            .expect("empty page");
+        assert_eq!(page, Some(Vec::new()));
     }
 }

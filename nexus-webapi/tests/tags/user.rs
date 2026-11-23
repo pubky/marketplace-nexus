@@ -1,10 +1,12 @@
 use anyhow::Result;
 use axum::http::StatusCode;
+use deadpool_redis::redis::AsyncCommands;
+use nexus_common::db::get_redis_conn;
 use nexus_webapi::routes::v0::TaggersInfoResponse;
 
 use crate::{
     tags::PEER_PUBKY,
-    utils::{get_request, invalid_get_request},
+    utils::{get_request, invalid_get_request, server::TestServiceServer},
 };
 
 use super::utils::{analyse_tag_details_structure, compare_tag_details, TagMockup};
@@ -12,6 +14,8 @@ use super::utils::{analyse_tag_details_structure, compare_tag_details, TagMockup
 // Arst user from test/tags.cypher
 pub const PUBKY_PEER: &str = "5f4e8eoogmkhqeyo5ijdix3ma6rw9byj8m36yrjp78pnxxc379to";
 const PUBKY_LABEL: &str = "pubky";
+const GRAPH_PAGE_USER: &str = "mwsnc3qzej8hks6motdeyj8ag7gzaf3ft5emcjzk9wn5erxg968y";
+const GRAPH_PAGE_LABELS: [&str; 6] = ["privacy", "pubky", "pkarr", "p2p", "hike", "cycle"];
 
 #[tokio_shared_rt::test(shared)]
 async fn test_full_user_tags_endpoint() -> Result<()> {
@@ -32,6 +36,37 @@ async fn test_full_user_tags_endpoint() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio_shared_rt::test(shared)]
+async fn test_user_tags_cold_and_warm_pages_have_matching_order() -> Result<()> {
+    TestServiceServer::get_test_server().await;
+    let mut redis_conn = get_redis_conn().await?;
+    let sorted_set_key = format!("Sorted:Users:Tag:{GRAPH_PAGE_USER}");
+    let _: () = redis_conn.del(sorted_set_key).await?;
+    for label in GRAPH_PAGE_LABELS {
+        let set_key = format!("User:Taggers:{GRAPH_PAGE_USER}:{label}");
+        let _: () = redis_conn.del(set_key).await?;
+    }
+
+    let path = format!("/v0/user/{GRAPH_PAGE_USER}/tags?limit_tags=6&limit_taggers=0");
+    let cold_page = get_request(&path).await?;
+    let warm_page = get_request(&path).await?;
+    assert_eq!(cold_page, warm_page);
+
+    let tags = cold_page.as_array().expect("Tag list should be an array");
+    let labels: Vec<&str> = tags
+        .iter()
+        .map(|tag| tag["label"].as_str().expect("tag label"))
+        .collect();
+    let counts: Vec<u64> = tags
+        .iter()
+        .map(|tag| tag["taggers_count"].as_u64().expect("taggers count"))
+        .collect();
+    assert_eq!(labels, GRAPH_PAGE_LABELS);
+    assert_eq!(counts, [3, 1, 1, 1, 1, 1]);
+    Ok(())
+}
+
 #[tokio_shared_rt::test(shared)]
 async fn test_user_tags_with_viewer_id() -> Result<()> {
     let path = format!(

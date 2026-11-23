@@ -37,7 +37,9 @@ and every query string the API receives.
 - The tag, follower, following, friends, search and username-stream endpoints cap
   a requested page at 1,000 items (`limit`, `limit_tags`, `limit_taggers`) on the
   indexed path. A cache miss is served from the graph and returns the full set;
-  other list endpoints keep their own limits.
+  other list endpoints keep their own limits. Offsets above 10,000 (`skip` or
+  `skip_tags`) return an empty page; exactly 10,000 still selects the page at
+  that offset.
 - Static files (`/static/files/...`, avatars) are always served with
   `X-Content-Type-Options: nosniff`. Images (SVG excluded), video, audio, PDF,
   plain text, JSON and `application/octet-stream` (which browsers download) are

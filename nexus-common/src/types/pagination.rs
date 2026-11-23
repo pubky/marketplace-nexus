@@ -8,8 +8,12 @@ use utoipa::ToSchema;
 pub const MAX_PAGE_LIMIT: usize = 1_000;
 pub const MAX_PAGE_SKIP: usize = 10_000;
 
+/// Returns an offset that yields an empty page when `requested` exceeds [MAX_PAGE_SKIP].
 pub fn bounded_page_skip(requested: Option<usize>) -> usize {
-    requested.unwrap_or(0).min(MAX_PAGE_SKIP)
+    match requested {
+        Some(skip) if skip > MAX_PAGE_SKIP => usize::MAX,
+        skip => skip.unwrap_or(0),
+    }
 }
 
 /// `requested`, or `default` when absent, never above [MAX_PAGE_LIMIT].
@@ -119,12 +123,12 @@ mod tests {
     }
 
     #[test]
-    fn a_skip_above_the_bound_is_clamped() {
+    fn a_skip_above_the_bound_requests_an_empty_page() {
         let page = Pagination {
             skip: Some(usize::MAX),
             ..Default::default()
         };
-        assert_eq!(page.bounded_skip(), MAX_PAGE_SKIP);
-        assert_eq!(bounded_page_skip(Some(MAX_PAGE_SKIP + 1)), MAX_PAGE_SKIP);
+        assert_eq!(page.bounded_skip(), usize::MAX);
+        assert_eq!(bounded_page_skip(Some(MAX_PAGE_SKIP + 1)), usize::MAX);
     }
 }

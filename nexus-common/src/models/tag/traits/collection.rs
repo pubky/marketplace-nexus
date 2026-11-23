@@ -4,7 +4,7 @@ use crate::db::{
     execute_graph_operation, fetch_row_from_graph, queries, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
-use crate::types::{bounded_page_limit, Pagination};
+use crate::types::{bounded_page_limit, bounded_page_skip, Pagination};
 use async_trait::async_trait;
 use tracing::error;
 
@@ -19,13 +19,20 @@ const CACHE_TTL: i64 = 3 * 60 * 60;
 pub(crate) const MAX_TAG_PAGE: usize = 100;
 pub(crate) const MAX_TAG_SKIP: usize = 10_000;
 
+fn tag_skip(requested: Option<usize>) -> usize {
+    match bounded_page_skip(requested) {
+        skip if skip > MAX_TAG_SKIP => usize::MAX,
+        skip => skip,
+    }
+}
+
 pub(crate) fn tag_page(
     skip_tags: Option<usize>,
     limit_tags: Option<usize>,
     limit_taggers: Option<usize>,
 ) -> (usize, usize, usize) {
     (
-        skip_tags.unwrap_or(0).min(MAX_TAG_SKIP),
+        tag_skip(skip_tags),
         limit_tags.unwrap_or(5).min(MAX_TAG_PAGE),
         limit_taggers.unwrap_or(5).min(MAX_TAG_PAGE),
     )
@@ -33,17 +40,22 @@ pub(crate) fn tag_page(
 
 pub(crate) fn taggers_page(pagination: &Pagination) -> (usize, usize) {
     (
-        pagination.bounded_skip().min(MAX_TAG_SKIP),
+        tag_skip(pagination.skip),
         bounded_page_limit(pagination.limit, 40).min(MAX_TAG_PAGE),
     )
 }
 
 fn page_tag_details(
-    tags: Vec<TagDetails>,
+    mut tags: Vec<TagDetails>,
     skip_tags: usize,
     limit_tags: usize,
     limit_taggers: usize,
 ) -> Vec<TagDetails> {
+    tags.sort_by(|a, b| {
+        b.taggers_count
+            .cmp(&a.taggers_count)
+            .then_with(|| b.label.cmp(&a.label))
+    });
     tags.into_iter()
         .skip(skip_tags)
         .take(limit_tags)
@@ -575,31 +587,31 @@ mod tests {
     }
 
     #[test]
-    fn tag_page_clamps_values_above_bounds() {
+    fn tag_page_above_the_skip_bound_requests_an_empty_page() {
         assert_eq!(
             tag_page(Some(MAX_TAG_SKIP + 1), Some(101), Some(101)),
-            (MAX_TAG_SKIP, MAX_TAG_PAGE, MAX_TAG_PAGE)
+            (usize::MAX, MAX_TAG_PAGE, MAX_TAG_PAGE)
         );
         let pagination = Pagination {
             skip: Some(MAX_TAG_SKIP + 1),
             limit: Some(101),
             ..Default::default()
         };
-        assert_eq!(taggers_page(&pagination), (MAX_TAG_SKIP, MAX_TAG_PAGE));
+        assert_eq!(taggers_page(&pagination), (usize::MAX, MAX_TAG_PAGE));
     }
 
     #[test]
-    fn tag_page_clamps_maximum_values() {
+    fn tag_page_maximum_skip_requests_an_empty_page() {
         assert_eq!(
             tag_page(Some(usize::MAX), Some(usize::MAX), Some(usize::MAX)),
-            (MAX_TAG_SKIP, MAX_TAG_PAGE, MAX_TAG_PAGE)
+            (usize::MAX, MAX_TAG_PAGE, MAX_TAG_PAGE)
         );
         let pagination = Pagination {
             skip: Some(usize::MAX),
             limit: Some(usize::MAX),
             ..Default::default()
         };
-        assert_eq!(taggers_page(&pagination), (MAX_TAG_SKIP, MAX_TAG_PAGE));
+        assert_eq!(taggers_page(&pagination), (usize::MAX, MAX_TAG_PAGE));
     }
 
     #[test]
@@ -617,5 +629,21 @@ mod tests {
         assert_eq!(page[0].label, "1");
         assert_eq!(page[0].taggers, ["a"]);
         assert_eq!(page[0].taggers_count, 2);
+    }
+
+    #[test]
+    fn graph_tag_page_sorts_counts_and_labels_before_slicing() {
+        let tags = ["p2p", "privacy", "cycle", "pubky", "pkarr"]
+            .into_iter()
+            .map(|label| TagDetails {
+                label: label.into(),
+                taggers: vec!["a".into()],
+                taggers_count: if label == "privacy" { 3 } else { 1 },
+                relationship: false,
+            })
+            .collect();
+        let page = page_tag_details(tags, 1, 4, 1);
+        let labels: Vec<&str> = page.iter().map(|tag| tag.label.as_str()).collect();
+        assert_eq!(labels, ["pubky", "pkarr", "p2p", "cycle"]);
     }
 }
