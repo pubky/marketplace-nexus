@@ -4,7 +4,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock, Mutex, OnceLock,
     },
     time::{Duration, SystemTime},
 };
@@ -21,6 +21,7 @@ use tokio::{
 use crate::{
     media::{processors::MediaProcessorError, FileVariant},
     models::file::FileDetails,
+    MediaConfig,
 };
 
 use super::{BaseProcessingOptions, VariantProcessor};
@@ -33,11 +34,19 @@ const IMAGE_FORMAT: &str = "webp";
 /// anything larger is not a legitimate image upload.
 pub const MAX_IMAGE_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Wall-clock budget for one conversion, including the wait for a free conversion slot.
-pub const IMAGE_CONVERSION_TIMEOUT: Duration = Duration::from_secs(30);
+static MEDIA_CONFIG: OnceLock<MediaConfig> = OnceLock::new();
 
-/// ImageMagick processes that may run at once across the whole process.
-const MAX_CONCURRENT_CONVERSIONS: usize = 2;
+pub fn init_media_config(config: &MediaConfig) {
+    let _ = MEDIA_CONFIG.set(config.clone());
+}
+
+fn media_config() -> &'static MediaConfig {
+    MEDIA_CONFIG.get_or_init(MediaConfig::default)
+}
+
+fn conversion_timeout() -> Duration {
+    Duration::from_secs(media_config().process_timeout_secs)
+}
 
 /// Resource limits passed to every ImageMagick run. They apply even where the host has no
 /// restrictive `policy.xml`; the image's policy can only tighten them further.
@@ -54,7 +63,7 @@ const IMAGEMAGICK_LIMITS: &[(&str, &str)] = &[
 ];
 
 static CONVERSION_SLOTS: LazyLock<Arc<Semaphore>> =
-    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CONVERSIONS)));
+    LazyLock::new(|| Arc::new(Semaphore::new(media_config().max_concurrency)));
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -121,6 +130,7 @@ struct OpenFailure {
 #[derive(Debug, Clone)]
 enum KnownFailure {
     UnsupportedInputFormat,
+    ContentTypeMismatch(String),
     InputTooLarge { size: u64, max: u64 },
     TimedOut,
     CommandFailed(String),
@@ -130,6 +140,9 @@ impl KnownFailure {
     fn error(&self) -> MediaProcessorError {
         match self {
             Self::UnsupportedInputFormat => MediaProcessorError::UnsupportedInputFormat,
+            Self::ContentTypeMismatch(content_type) => {
+                MediaProcessorError::UnsupportedContentType(content_type.clone())
+            }
             Self::InputTooLarge { size, max } => MediaProcessorError::InputTooLarge {
                 size: *size,
                 max: *max,
@@ -239,18 +252,29 @@ impl ImageInputFormat {
         }
     }
 
-    /// Whether a declared content type is one this processor can make variants for.
-    pub fn supports_content_type(content_type: &str) -> bool {
+    fn for_content_type(content_type: &str) -> Option<Self> {
         let essence = content_type
             .split(';')
             .next()
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        matches!(
-            essence.as_str(),
-            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-        )
+        match essence.as_str() {
+            "image/jpeg" => Some(Self::Jpeg),
+            "image/png" => Some(Self::Png),
+            "image/gif" => Some(Self::Gif),
+            "image/webp" => Some(Self::Webp),
+            _ => None,
+        }
+    }
+
+    /// Whether a declared content type is one this processor can make variants for.
+    pub fn supports_content_type(content_type: &str) -> bool {
+        Self::for_content_type(content_type).is_some()
+    }
+
+    pub fn matches_content_type(self, content_type: &str) -> bool {
+        Self::for_content_type(content_type) == Some(self)
     }
 }
 
@@ -258,6 +282,7 @@ pub struct ImageOptions {
     width: String,
     format: String,
     content_type: String,
+    declared_content_type: String,
 }
 
 impl BaseProcessingOptions for ImageOptions {
@@ -301,6 +326,7 @@ impl VariantProcessor for ImageProcessor {
             format: IMAGE_FORMAT.to_string(),
             width,
             content_type,
+            declared_content_type: file.content_type.clone(),
         })
     }
 
@@ -313,7 +339,7 @@ impl VariantProcessor for ImageProcessor {
             origin_file_path,
             output_file_path,
             options,
-            IMAGE_CONVERSION_TIMEOUT,
+            conversion_timeout(),
         )
         .await
     }
@@ -365,6 +391,17 @@ impl ImageProcessor {
                 return Err(error);
             }
         };
+
+        if !input_format.matches_content_type(&options.declared_content_type) {
+            remember_failure(
+                output_file_path,
+                Some(origin_stamp),
+                KnownFailure::ContentTypeMismatch(options.declared_content_type.clone()),
+            );
+            return Err(MediaProcessorError::UnsupportedContentType(
+                options.declared_content_type.clone(),
+            ));
+        }
 
         let conversion = Conversion {
             input,
@@ -443,6 +480,91 @@ impl ImageProcessor {
             .map_err(MediaProcessorError::command_failed)?;
         Ok((file.into_std().await, format, stamp))
     }
+
+    async fn validate_original(
+        file_path: &str,
+        content_type: &str,
+    ) -> Result<(), MediaProcessorError> {
+        let (_, format, _) = Self::open_input(file_path)
+            .await
+            .map_err(|failure| failure.error)?;
+        if format.matches_content_type(content_type) {
+            Ok(())
+        } else {
+            Err(MediaProcessorError::UnsupportedContentType(
+                content_type.to_string(),
+            ))
+        }
+    }
+
+    pub async fn avatar_variant(
+        file: &FileDetails,
+        file_path: std::path::PathBuf,
+    ) -> Result<(FileVariant, String), MediaProcessorError> {
+        Self::avatar_variant_within(file, file_path, conversion_timeout()).await
+    }
+
+    async fn avatar_variant_within(
+        file: &FileDetails,
+        file_path: std::path::PathBuf,
+        budget: Duration,
+    ) -> Result<(FileVariant, String), MediaProcessorError> {
+        let origin_path = file_path.join(&file.owner_id).join(&file.id);
+        let main = origin_path.join(FileVariant::Main.to_string());
+        let small = origin_path.join(FileVariant::Small.to_string());
+        let main = main
+            .to_str()
+            .ok_or_else(|| MediaProcessorError::InvalidFilePath("Original file".to_string()))?;
+        let small = small
+            .to_str()
+            .ok_or_else(|| MediaProcessorError::InvalidFilePath("Output file".to_string()))?;
+        if fs::metadata(small).await.is_ok() {
+            return Ok((FileVariant::Small, "image/webp".to_string()));
+        }
+
+        let options = Self::get_options_for_variant(file, &FileVariant::Small)?;
+        match Self::process_within(main, small, &options, budget).await {
+            Ok(_) => Ok((FileVariant::Small, "image/webp".to_string())),
+            Err(MediaProcessorError::Busy) => {
+                if Self::validate_original(main, &file.content_type)
+                    .await
+                    .is_err()
+                {
+                    return Err(MediaProcessorError::Busy);
+                }
+                Ok((FileVariant::Main, file.content_type.clone()))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn convert_args(
+    input_format: ImageInputFormat,
+    width: &str,
+    format: &str,
+    temp_output: &str,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for (resource, value) in IMAGEMAGICK_LIMITS {
+        args.extend([
+            "-limit".to_string(),
+            resource.to_string(),
+            value.to_string(),
+        ]);
+    }
+    args.push(format!("{}:-", input_format.coder()));
+    if input_format == ImageInputFormat::Gif {
+        args.push("-coalesce".to_string());
+    }
+    args.extend([
+        "-strip".to_string(),
+        "-resize".to_string(),
+        format!("{width}x"),
+        "-auto-orient".to_string(),
+        format!("{format}:{temp_output}"),
+    ]);
+    args
 }
 
 /// One ImageMagick run: decodes `input` with its sniffed decoder and writes the variant next to
@@ -524,15 +646,13 @@ impl Conversion {
             .push(self.output_file_path.clone());
 
         let mut command = Command::new("convert");
-        for (resource, value) in IMAGEMAGICK_LIMITS {
-            command.arg("-limit").arg(resource).arg(value);
-        }
         command
-            .arg(format!("{}:-", self.input_format.coder()))
-            .arg("-resize")
-            .arg(format!("{}x", self.width))
-            .arg("-auto-orient") // https://github.com/ImageMagick/ImageMagick/issues/6396
-            .arg(format!("{}:{temp_output}", self.format))
+            .args(convert_args(
+                self.input_format,
+                &self.width,
+                &self.format,
+                temp_output,
+            ))
             .env("MAGICK_TEMPORARY_PATH", scratch)
             .stdin(Stdio::from(input))
             .stdout(Stdio::null())
@@ -576,7 +696,7 @@ impl Conversion {
             }
             Ok(Err(e)) => Err(MediaProcessorError::command_failed(e)),
             Err(_) => {
-                if self.budget >= IMAGE_CONVERSION_TIMEOUT / 2 {
+                if self.budget >= conversion_timeout() / 2 {
                     remember_failure(
                         &self.output_file_path,
                         self.origin_stamp,
@@ -708,6 +828,7 @@ mod tests {
             width: SMALL_IMAGE_WIDTH.to_string(),
             format: IMAGE_FORMAT.to_string(),
             content_type: "image/webp".to_string(),
+            declared_content_type: "image/png".to_string(),
         }
     }
 
@@ -865,7 +986,7 @@ mod tests {
 
         let held = CONVERSION_SLOTS
             .clone()
-            .acquire_many_owned(MAX_CONCURRENT_CONVERSIONS as u32)
+            .acquire_many_owned(media_config().max_concurrency as u32)
             .await
             .unwrap();
         let result = ImageProcessor::process_within(
@@ -908,8 +1029,8 @@ mod tests {
             output_file_path: path_str(&output).to_string(),
             width: SMALL_IMAGE_WIDTH.to_string(),
             format: IMAGE_FORMAT.to_string(),
-            deadline: tokio::time::Instant::now() + IMAGE_CONVERSION_TIMEOUT,
-            budget: IMAGE_CONVERSION_TIMEOUT,
+            deadline: tokio::time::Instant::now() + conversion_timeout(),
+            budget: conversion_timeout(),
             origin_stamp: Some(stamp),
         };
 
@@ -938,7 +1059,7 @@ mod tests {
 
         for (name, budget, remembered) in [
             ("short", Duration::from_millis(50), false),
-            ("full", IMAGE_CONVERSION_TIMEOUT, true),
+            ("full", conversion_timeout(), true),
         ] {
             let output = dir.path().join(name);
             let (input, input_format, stamp) =
@@ -1174,7 +1295,14 @@ mod tests {
 
         for source in sources {
             let output = source.with_extension("small");
-            ImageProcessor::process(path_str(&source), path_str(&output), &small_options())
+            let options = ImageOptions {
+                declared_content_type: format!(
+                    "image/{}",
+                    source.file_name().unwrap().to_string_lossy()
+                ),
+                ..small_options()
+            };
+            ImageProcessor::process(path_str(&source), path_str(&output), &options)
                 .await
                 .unwrap_or_else(|e| panic!("{source:?}: {e}"));
 
@@ -1240,7 +1368,7 @@ mod tests {
 
         // The conversion keeps its slot until it has finished and cleaned up.
         let _all_slots = CONVERSION_SLOTS
-            .acquire_many(MAX_CONCURRENT_CONVERSIONS as u32)
+            .acquire_many(media_config().max_concurrency as u32)
             .await
             .unwrap();
         let variant = std::fs::read(&output).expect("the dropped request's variant is missing");
@@ -1271,7 +1399,7 @@ mod tests {
             width: FEED_IMAGE_WIDTH.to_string(),
             format: IMAGE_FORMAT.to_string(),
             deadline: tokio::time::Instant::now() + Duration::from_millis(50),
-            budget: IMAGE_CONVERSION_TIMEOUT,
+            budget: conversion_timeout(),
             origin_stamp: None,
         };
         let started = Instant::now();
@@ -1283,6 +1411,140 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(entries(dir.path()), vec!["png".to_string()]);
+    }
+
+    #[test]
+    fn conversion_arguments_strip_metadata_and_coalesce_only_gif() {
+        for format in [
+            ImageInputFormat::Jpeg,
+            ImageInputFormat::Png,
+            ImageInputFormat::Gif,
+            ImageInputFormat::Webp,
+        ] {
+            let args = convert_args(format, SMALL_IMAGE_WIDTH, IMAGE_FORMAT, "out");
+            assert!(args.iter().any(|arg| arg == "-strip"), "{format:?}");
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.as_str() == "-coalesce")
+                    .count(),
+                usize::from(format == ImageInputFormat::Gif),
+                "{format:?}"
+            );
+            let decoder = args
+                .iter()
+                .position(|arg| arg == &format!("{}:-", format.coder()))
+                .unwrap();
+            let strip = args.iter().position(|arg| arg == "-strip").unwrap();
+            let resize = args.iter().position(|arg| arg == "-resize").unwrap();
+            assert!(decoder < strip && strip < resize, "{format:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_type_that_differs_from_the_bytes_gets_no_variant() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let jpeg = make_source(dir.path(), "jpeg", &["-size", "64x48", "gradient:red-blue"]).await;
+        let origin = dir.path().join("main");
+        std::fs::rename(jpeg, &origin).unwrap();
+        let output = dir.path().join("small");
+
+        let result =
+            ImageProcessor::process(path_str(&origin), path_str(&output), &small_options()).await;
+        assert!(matches!(
+            result,
+            Err(MediaProcessorError::UnsupportedContentType(content_type)) if content_type == "image/png"
+        ));
+        assert_eq!(entries(dir.path()), vec!["main".to_string()]);
+        let stamp = OriginStamp::of(path_str(&origin)).await.unwrap();
+        assert!(matches!(
+            known_failure_for(path_str(&output), stamp),
+            Some(KnownFailure::ContentTypeMismatch(_))
+        ));
+
+        let repeat =
+            ImageProcessor::process(path_str(&origin), path_str(&output), &small_options()).await;
+        assert!(matches!(
+            repeat,
+            Err(MediaProcessorError::UnsupportedContentType(_))
+        ));
+        assert!(!CONVERSIONS_STARTED
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|path| path == path_str(&output)));
+    }
+
+    #[tokio::test]
+    async fn a_busy_avatar_uses_main_only_for_a_matching_allowlisted_original() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = FileDetails {
+            owner_id: "owner".to_string(),
+            id: "avatar".to_string(),
+            content_type: "image/png".to_string(),
+            ..Default::default()
+        };
+        let origin_dir = dir.path().join(&file.owner_id).join(&file.id);
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        make_source(
+            &origin_dir,
+            "png",
+            &["-size", "64x48", "gradient:white-black"],
+        )
+        .await;
+        std::fs::rename(origin_dir.join("png"), origin_dir.join("main")).unwrap();
+
+        let held = CONVERSION_SLOTS
+            .clone()
+            .acquire_many_owned(media_config().max_concurrency as u32)
+            .await
+            .unwrap();
+        let result = ImageProcessor::avatar_variant_within(
+            &file,
+            dir.path().to_path_buf(),
+            Duration::from_millis(100),
+        )
+        .await;
+        drop(held);
+        assert!(matches!(
+            result,
+            Ok((FileVariant::Main, content_type)) if content_type == "image/png"
+        ));
+        assert!(!origin_dir.join("small").exists());
+    }
+
+    #[tokio::test]
+    async fn a_busy_avatar_does_not_use_a_mismatched_original() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = FileDetails {
+            owner_id: "owner".to_string(),
+            id: "avatar".to_string(),
+            content_type: "image/png".to_string(),
+            ..Default::default()
+        };
+        let origin_dir = dir.path().join(&file.owner_id).join(&file.id);
+        std::fs::create_dir_all(&origin_dir).unwrap();
+        make_source(&origin_dir, "png", &["-size", "64x48", "gradient:red-blue"]).await;
+        std::fs::rename(origin_dir.join("png"), origin_dir.join("main")).unwrap();
+        let jpeg = make_source(dir.path(), "jpeg", &["-size", "64x48", "gradient:red-blue"]).await;
+        std::fs::copy(jpeg, origin_dir.join("main")).unwrap();
+
+        let held = CONVERSION_SLOTS
+            .clone()
+            .acquire_many_owned(media_config().max_concurrency as u32)
+            .await
+            .unwrap();
+        let result = ImageProcessor::avatar_variant_within(
+            &file,
+            dir.path().to_path_buf(),
+            Duration::from_millis(100),
+        )
+        .await;
+        drop(held);
+        assert!(matches!(result, Err(MediaProcessorError::Busy)));
+        assert!(!origin_dir.join("small").exists());
     }
 
     #[test]

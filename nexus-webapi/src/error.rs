@@ -60,6 +60,11 @@ impl From<ModelError> for Error {
     fn from(source: ModelError) -> Self {
         match source {
             ModelError::MediaProcessorError(MediaProcessorError::Busy) => Error::Busy,
+            ModelError::MediaProcessorError(MediaProcessorError::UnsupportedContentType(
+                content_type,
+            )) => Error::invalid_input(&format!(
+                "variant is not valid for content type {content_type}"
+            )),
             other => Error::InternalServerError {
                 source: other.into(),
             },

@@ -5,8 +5,11 @@ use crate::routes::AppState;
 use crate::{Error, Result};
 use axum::extract::{Request, State};
 use axum::{extract::Path, response::Response};
-use nexus_common::media::{FileVariant, VariantController};
-use nexus_common::models::file::Blob;
+use nexus_common::media::{
+    processors::{ImageProcessor, MediaProcessorError},
+    FileVariant, VariantController,
+};
+use nexus_common::models::error::ModelError;
 use nexus_common::models::{file::FileDetails, traits::Collection, user::UserDetails};
 use tower_http::services::fs::ServeFileSystemResponseBody;
 use tracing::{debug, error};
@@ -69,30 +72,35 @@ pub async fn user_avatar_handler(
     ) {
         return Err(Error::FileNotFound {});
     }
-    let small_variant_content_type =
-        Blob::get_by_id(&file_details, &FileVariant::Small, file_path.clone())
-            .await
-            .inspect_err(|_| {
-                error!(
-            "Error while processing small variant for user: {user_id} avatar with file: {file_id}"
-        )
-            })?;
+    let (variant, variant_content_type) = match ImageProcessor::avatar_variant(
+        &file_details,
+        file_path.clone(),
+    )
+    .await
+    {
+        Ok(variant) => variant,
+        Err(MediaProcessorError::UnsupportedContentType(_)) => return Err(Error::FileNotFound {}),
+        Err(error) => {
+            error!(
+                "Error while processing small variant for user: {user_id} avatar with file: {file_id}"
+            );
+            return Err(Error::from(ModelError::from(error)));
+        }
+    };
 
     // serve the file using ServeDir
     // Create a new request with a modified path to serve the file using ServeDir
     // 6. Build the url using small variant
     let file_uri_path = format!(
         "/{}/{}/{}", // /{owner_id}/{file_id}/{variant}
-        user_id,
-        file_details.id,
-        FileVariant::Small,
+        user_id, file_details.id, variant,
     );
 
     // 7. Serve the file. Then remove/replace any default Cache-Control header.
     let mut response = PubkyServeDir::try_call(
         request,
         file_uri_path,
-        small_variant_content_type,
+        variant_content_type,
         file_path.clone(),
     )
     .await?;

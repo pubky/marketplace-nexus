@@ -23,6 +23,10 @@ files_path = "./examples/static/files"
 # OTLP_ENDPOINT is set to empty by default. If you want to enable tracing, set it to the OpenTelemetry Collector endpoint
 #otlp_endpoint="http://localhost:4317"
 
+[stack.media]
+max_concurrency = 2
+process_timeout_secs = 30
+
 [stack.db]
 redis = "redis://localhost:6379"
 

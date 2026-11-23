@@ -36,6 +36,7 @@ async fn main() -> Result<(), DynError> {
                 otlp_endpoint: None,
                 db: DatabaseConfig::default(),
                 allowed_homeservers: Vec::new(),
+                media: Default::default(),
             };
             let config = WatcherConfig {
                 name: String::from("nexusd.watcher"),
