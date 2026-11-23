@@ -34,12 +34,24 @@ and every query string the API receives.
   the poll fails. A record is limited to 2 MiB and 30 seconds, a
   file blob to 100 MiB and 120 seconds, and the shared Pubky client has a
   180-second per-request deadline.
-- The tag, follower, following, friends, search and username-stream endpoints cap
-  a requested page at 1,000 items (`limit`, `limit_tags`, `limit_taggers`) on the
-  indexed path. A cache miss is served from the graph and returns the full set;
-  other list endpoints keep their own limits. Offsets above 10,000 (`skip` or
+- Requested pages are capped as follows:
+
+  | Endpoints | Maximum items |
+  |---|---:|
+  | user, post, listing and shop tags (`limit_tags`, `limit_taggers`); taggers (`limit`); notifications | 100 |
+  | shop and listing review streams | 30 |
+  | listing and drop streams; shop view | 30 |
+  | post streams | 30 |
+  | user streams | 20 |
+  | user, tag and post search; username-stream search; followers, following and friends | 1,000 |
+  | hot tags | 40 |
+  | global tag taggers | 20 |
+
+  A tag page served from the graph on a cache miss is the same page the index
+  serves, sorted by tagger count and then label. Offsets above 10,000 (`skip` or
   `skip_tags`) return an empty page; exactly 10,000 still selects the page at
-  that offset.
+  that offset. `POST /v0/files/by_ids` accepts at most 100 URIs and answers 400
+  above that.
 - Static files (`/static/files/...`, avatars) are always served with
   `X-Content-Type-Options: nosniff`. Images (SVG excluded), video, audio, PDF,
   plain text, JSON and `application/octet-stream` (which browsers download) are
@@ -56,6 +68,21 @@ and every query string the API receives.
   30-minute deadline.
 - 500 responses carry a generic message; the cause is in the server log.
 - Debug-level startup logs print the Neo4j password as `<redacted>`.
+
+### API and media configuration
+
+- `[api] request_timeout_secs` defaults to `30`; a slower request gets 408. It
+  must be at least 1 and greater than `stack.media.process_timeout_secs`.
+- `[api] max_body_size_bytes` defaults to `1048576`; a larger body gets 413.
+- `[stack.media] max_concurrency` defaults to `2` and must be at least 1.
+- `[stack.media] process_timeout_secs` defaults to `20` and must be at least 1.
+  When every conversion slot stays busy for that long, a file variant request
+  gets 503 with `Retry-After`; an avatar request gets the original image if its
+  declared JPEG, PNG, GIF or WebP type matches its bytes.
+
+These values are checked at startup. An `api-config.toml` that exists but does
+not parse or fails these checks stops startup instead of falling back to the
+daemon config.
 
 ### Moderation: launched setting
 
@@ -146,28 +173,33 @@ attestor publishes it again.
 
 ## Image variants and the runtime image
 
-`small` and `feed` image variants are made only from JPEG, PNG, GIF and WebP
-originals of at most 32 MiB, identified by their leading bytes and decoded with
-that format's decoder. Other image types (SVG among them) have only `main`, and
-the avatar route answers 404 for them. A conversion has
-30 seconds, at most two run at once, and each runs with ImageMagick limits of
-256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per side and 256 frames.
-File blobs larger than the specs' blob limit (100 MiB) are refused while they
-download.
+`small` and `feed` image variants are made only from originals of at most 32
+MiB whose declared type (`image/jpeg`, `image/png`, `image/gif` or `image/webp`)
+matches the format of their bytes. A mismatch gets 400 from a variant route and
+404 from the avatar route. `image/jpg` and `image/pjpeg` never had variants and
+still do not. Other image types (SVG among them) also have only `main`, and the avatar route answers
+404 for them. At most two conversions run at once by default; each runs with
+ImageMagick limits of 256 MiB memory, 512 MiB map, 1 GiB disk, 16000 pixels per
+side and 256 frames. ImageMagick's policy `time` limit of 30 seconds caps one
+conversion whatever `process_timeout_secs` is. File blobs larger than the specs'
+blob limit (100 MiB) are refused while they download.
 
-A request that waits 30 seconds for a conversion slot is answered `503` with
-`Retry-After: 5` and `Cache-Control: no-store`. A variant that fails to build
-(the file is not a decodable image, is over the size limit, or makes ImageMagick
-fail or time out) is remembered for an hour per stored original, up to 4,096
-entries, so the same request does not start the work again; a re-published
-original (a different file, so a different inode, length or modification time)
-is tried afresh. A process killed by a signal, a timeout after a shortened
-budget (the request spent most of it waiting for a slot) and a slot wait are not
-remembered. A variant built from an original that was replaced while it
-converted is discarded. Writing a new
-`main` file removes the `small` and `feed` variants built from the previous one.
-ImageMagick's diagnostics are capped at 4 KiB per run. The remembered failures live in memory and are lost on restart. Error responses
-carry no ImageMagick output or file paths.
+Variants are written with `-strip`, which drops embedded ICC colour profiles
+without converting to sRGB. A variant request that cannot get a conversion slot
+within `process_timeout_secs` is answered `503` with `Retry-After: 5` and
+`Cache-Control: no-store`; a matching avatar request instead serves the original
+JPEG, PNG, GIF or WebP. A variant that fails to build (the file is not a
+decodable image, is over the size limit, or makes ImageMagick fail or time out)
+is remembered for an hour per stored original, up to 4,096 entries, so the same
+request does not start the work again; a re-published original (a different
+file, so a different inode, length or modification time) is tried afresh. A
+process killed by a signal, a timeout after a shortened budget (the request
+spent most of it waiting for a slot) and a slot wait are not remembered. A
+variant built from an original that was replaced while it converted is
+discarded. Writing a new `main` file removes the `small` and `feed` variants
+built from the previous one. ImageMagick's diagnostics are capped at 4 KiB per
+run. The remembered failures live in memory and are lost on restart. Error
+responses carry no ImageMagick output or file paths.
 
 The runtime image (`Dockerfile`) installs only the JPEG and WebP coder packages
 on top of the base ImageMagick, replaces the system ImageMagick policy with
@@ -281,6 +313,18 @@ Jobs (`--job`):
   `ReviewTrustBucketsBackfill1792587206`.
 - `review-discovery` lists each indexed user's reviews directory and ingests
   the records the graph lacks, the same work as `ReviewBackfill1787905961`.
+
+After deploying this release, run the aggregate recompute to its completion so
+stored aggregates drop self-reviews indexed before it:
+
+```bash
+nexusd db backfill reviews --job review-trust-buckets --force-rerun
+```
+
+Until that run finishes, stored reputation summaries can still include those
+self-reviews. A verified self-review the job re-reads is refused by the ingest
+and counted as a failed item; the aggregates are still recomputed, and the run
+ends with the failed-items exit status.
 
 Flags:
 
