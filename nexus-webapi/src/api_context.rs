@@ -53,6 +53,7 @@ impl ApiContextBuilder {
             }
             Some(ac) => ac.clone(),
         };
+        api_config.validate()?;
 
         let pkarr_builder = self.pkarr_builder.clone().unwrap_or_default();
         let pkarr_client = pkarr_builder.build()?;
@@ -78,5 +79,39 @@ impl ApiContextBuilder {
             Keypair::from_secret_key_file(&secret_file_path).map_err(|e| e.to_string())?;
 
         Ok(keypair)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn builder_rejects_invalid_timeout_relationship() {
+        for process_timeout_secs in [20, 21] {
+            let temp_dir = tempfile::TempDir::new_in(".").unwrap();
+            let api_config = ApiConfig {
+                request_timeout_secs: 20,
+                stack: nexus_common::StackConfig {
+                    media: nexus_common::MediaConfig {
+                        process_timeout_secs,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let error = match ApiContextBuilder::from_config_dir(temp_dir.path().to_path_buf())
+                .api_config(api_config)
+                .try_build()
+                .await
+            {
+                Ok(_) => panic!("invalid timeouts are rejected"),
+                Err(error) => error,
+            };
+            assert!(error
+                .to_string()
+                .contains("must be less than api.request_timeout_secs"));
+        }
     }
 }

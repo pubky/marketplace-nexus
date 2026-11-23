@@ -22,7 +22,7 @@ files_path = "./static/files"
 
 [stack.media]
 max_concurrency = 2
-process_timeout_secs = 30
+process_timeout_secs = 20
 
 [stack.db]
 redis = "redis://localhost:6379"

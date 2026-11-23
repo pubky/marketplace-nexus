@@ -6,7 +6,7 @@ use std::{fmt::Debug, path::PathBuf};
 use super::{file::validate_and_expand_path, Level, LOG_LEVEL};
 
 const DEFAULT_MAX_CONCURRENCY: usize = 2;
-const DEFAULT_PROCESS_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_PROCESS_TIMEOUT_SECS: u64 = 20;
 
 const fn default_max_concurrency() -> usize {
     DEFAULT_MAX_CONCURRENCY
@@ -29,6 +29,19 @@ where
     Ok(value)
 }
 
+fn deserialize_process_timeout_secs<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom(
+            "stack.media.process_timeout_secs must be greater than 0",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MediaConfig {
     #[serde(
@@ -36,7 +49,10 @@ pub struct MediaConfig {
         deserialize_with = "deserialize_max_concurrency"
     )]
     pub max_concurrency: usize,
-    #[serde(default = "default_process_timeout_secs")]
+    #[serde(
+        default = "default_process_timeout_secs",
+        deserialize_with = "deserialize_process_timeout_secs"
+    )]
     pub process_timeout_secs: u64,
 }
 
@@ -110,7 +126,7 @@ mod tests {
         let config: StackConfig = toml::from_str(STACK_WITHOUT_MEDIA).expect("config parses");
         assert_eq!(config.media, MediaConfig::default());
         assert_eq!(config.media.max_concurrency, 2);
-        assert_eq!(config.media.process_timeout_secs, 30);
+        assert_eq!(config.media.process_timeout_secs, 20);
     }
 
     #[test]
@@ -121,6 +137,20 @@ mod tests {
 
         let input =
             STACK_WITHOUT_MEDIA.replace("[db.neo4j]", "[media]\nmax_concurrency = 0\n[db.neo4j]");
+        let error = toml::from_str::<StackConfig>(&input).expect_err("config is rejected");
+        assert!(error.to_string().contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn media_rejects_zero_process_timeout() {
+        let error = toml::from_str::<MediaConfig>("process_timeout_secs = 0")
+            .expect_err("zero process timeout is rejected");
+        assert!(error.to_string().contains("must be greater than 0"));
+
+        let input = STACK_WITHOUT_MEDIA.replace(
+            "[db.neo4j]",
+            "[media]\nprocess_timeout_secs = 0\n[db.neo4j]",
+        );
         let error = toml::from_str::<StackConfig>(&input).expect_err("config is rejected");
         assert!(error.to_string().contains("must be greater than 0"));
     }

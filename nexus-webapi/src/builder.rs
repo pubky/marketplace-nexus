@@ -150,17 +150,18 @@ impl NexusApi {
         config_dir: PathBuf,
         shutdown_rx: Option<Receiver<bool>>,
     ) -> Result<Self, DynError> {
-        match ApiConfig::load(config_dir.join(API_CONFIG_FILE_NAME)).await {
-            Ok(api_config) => {
-                let api_context = ApiContextBuilder::from_config_dir(config_dir)
-                    .api_config(api_config)
-                    .try_build()
-                    .await?;
-
-                NexusApiBuilder::new(api_context).start(shutdown_rx).await
-            }
-            Err(_) => NexusApi::start_from_daemon(config_dir, shutdown_rx).await,
+        let config_path = config_dir.join(API_CONFIG_FILE_NAME);
+        if !config_path.exists() {
+            return NexusApi::start_from_daemon(config_dir, shutdown_rx).await;
         }
+
+        let api_config = ApiConfig::load(config_path).await?;
+        let api_context = ApiContextBuilder::from_config_dir(config_dir)
+            .api_config(api_config)
+            .try_build()
+            .await?;
+
+        NexusApiBuilder::new(api_context).start(shutdown_rx).await
     }
 
     /// Loads the [ApiConfig] from the [DaemonConfig] in the given path and starts the Nexus API.

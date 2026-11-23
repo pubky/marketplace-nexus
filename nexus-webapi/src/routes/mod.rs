@@ -51,7 +51,7 @@ pub fn build_app(
         .layer(DefaultBodyLimit::max(max_body_size_bytes))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(request_timeout_secs.max(1)),
+            Duration::from_secs(request_timeout_secs),
         ))
         .layer(cors)
         .layer(axum::middleware::from_fn(

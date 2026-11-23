@@ -65,6 +65,15 @@ const IMAGEMAGICK_LIMITS: &[(&str, &str)] = &[
 static CONVERSION_SLOTS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(media_config().max_concurrency)));
 
+#[cfg(feature = "test-utils")]
+pub async fn acquire_all_conversion_slots() -> tokio::sync::OwnedSemaphorePermit {
+    CONVERSION_SLOTS
+        .clone()
+        .acquire_many_owned(media_config().max_concurrency as u32)
+        .await
+        .expect("conversion slots are available")
+}
+
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Output paths of the conversions started, for tests.
