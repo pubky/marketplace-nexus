@@ -1,8 +1,9 @@
 use anyhow::Result;
+use axum::http::StatusCode;
 use pubky_app_specs::file_uri_builder;
 use serde_json::json;
 
-use crate::utils::post_request;
+use crate::utils::{invalid_post_request, post_request};
 
 #[tokio_shared_rt::test(shared)]
 async fn test_files_by_ids() -> Result<()> {
@@ -26,6 +27,28 @@ async fn test_files_by_ids() -> Result<()> {
     assert_eq!(json_body[0]["owner_id"], test_file_user);
     assert_eq!(json_body[1]["id"], test_file_id2);
     assert_eq!(json_body[1]["owner_id"], test_file_user2);
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_files_by_ids_limits_uri_list() -> Result<()> {
+    let uri = file_uri_builder(
+        "y4euc58gnmxun9wo87gwmanu6kztt9pgw1zz1yp1azp7trrsjamy".into(),
+        "2ZK2H8P2T5NG0".into(),
+    );
+
+    post_request("/v0/files/by_ids", json!({"uris": vec![uri.clone(); 100]})).await?;
+    let body = invalid_post_request(
+        "/v0/files/by_ids",
+        json!({"uris": vec![uri; 101]}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await?;
+    assert_eq!(
+        body["error"],
+        "Invalid input: The maximum number of file URIs allowed is 100"
+    );
 
     Ok(())
 }

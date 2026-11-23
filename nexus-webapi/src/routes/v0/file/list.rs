@@ -1,5 +1,5 @@
 use crate::routes::v0::endpoints::FILE_LIST_ROUTE;
-use crate::Result;
+use crate::{Error, Result};
 use axum::Json;
 use nexus_common::models::file::FileDetails;
 use nexus_common::models::traits::Collection;
@@ -20,12 +20,19 @@ pub struct FilesByIdsBody {
     request_body = FilesByIdsBody,
     responses(
         (status = 200, description = "List of File Details", body = Vec<FileDetails>),
+        (status = 400, description = "More than 100 file URIs requested"),
         (status = 500, description = "Internal server error")
     )
 )]
 pub async fn file_details_by_uris_handler(
     Json(body): Json<FilesByIdsBody>,
 ) -> Result<Json<Vec<FileDetails>>> {
+    const MAX_FILE_URIS: usize = 100;
+    if body.uris.len() > MAX_FILE_URIS {
+        let err_msg = format!("The maximum number of file URIs allowed is {MAX_FILE_URIS}");
+        return Err(Error::invalid_input(&err_msg));
+    }
+
     debug!("GET {FILE_LIST_ROUTE} uris:{:?}", body.uris);
 
     let keys: Vec<(String, String)> = body
