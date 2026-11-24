@@ -213,6 +213,18 @@ with mode 600, or a volume created by an earlier root-run image, need their
 ownership changed once. Check the policy in a running container with
 `convert -list policy`.
 
+### Checking the deployed revision
+
+The image tag or digest identifies the build. `GET /v0/info` reports
+`commit_hash`: the `GIT_COMMIT` build arg when the image was built with
+`--build-arg GIT_COMMIT=<sha>`, otherwise `git rev-parse HEAD` for local builds,
+or `unknown` when neither is available. Build an image with its revision as
+follows:
+
+```bash
+docker build --build-arg GIT_COMMIT=<sha> -t pubky-nexus:<tag> .
+```
+
 ## Running the backfill migrations
 
 One-shot migrations (see the runbook in `README.md`):

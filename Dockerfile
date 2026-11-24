@@ -34,8 +34,10 @@ COPY Cargo.toml Cargo.lock ./
 # Copy over all the source code
 COPY . .
 
+# CI passes the commit as a build arg because the build context has no usable .git.
+ARG GIT_COMMIT
 # Build the project in release mode for the MUSL target
-RUN cargo build --locked --release --bin nexusd
+RUN GIT_COMMIT="${GIT_COMMIT}" cargo build --locked --release --bin nexusd
 
 # Strip the binaries to reduce size
 RUN strip target/release/nexusd
