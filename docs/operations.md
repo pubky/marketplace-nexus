@@ -256,6 +256,12 @@ One-shot migrations (see the runbook in `README.md`):
   over-counted) until their next edit. Run it once, after
   `ReviewPerItemRecompute1792584000`, after the release that adds trust-scoped
   aggregates.
+- `ReviewInstantsBackfill1795535288` sets the review instants the aggregates
+  order by on reviews indexed before them, settles seller-rating copies and
+  recomputes every review aggregate. It needs only the databases; run it once
+  after the release that adds it. Until it runs, reviews indexed earlier order
+  among themselves by their timestamp string and after newer reviews, and
+  recomputes never fail on a timestamp.
 
 Run them where the databases are reachable, for example inside the `nexusd`
 container:

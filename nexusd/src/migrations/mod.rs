@@ -13,6 +13,7 @@ use crate::migrations::migrations_list::listing_auction_terms_reindex_1787256279
 use crate::migrations::migrations_list::listing_reserve_scrub_1789805700::ListingReserveScrub1789805700;
 use crate::migrations::migrations_list::remove_muted_1771718400::RemoveMuted1771718400;
 use crate::migrations::migrations_list::review_backfill_1787905961::ReviewBackfill1787905961;
+use crate::migrations::migrations_list::review_instants_backfill_1795535288::ReviewInstantsBackfill1795535288;
 use crate::migrations::migrations_list::review_moderation_recompute_1792579958::ReviewModerationRecompute1792579958;
 use crate::migrations::migrations_list::review_per_item_recompute_1792584000::ReviewPerItemRecompute1792584000;
 use crate::migrations::migrations_list::review_trust_buckets_backfill_1792587206::ReviewTrustBucketsBackfill1792587206;
@@ -59,6 +60,7 @@ fn all_migrations() -> Vec<Box<dyn Migration>> {
         Box::new(ReviewModerationRecompute1792579958),
         Box::new(ReviewPerItemRecompute1792584000),
         Box::new(ReviewTrustBucketsBackfill1792587206),
+        Box::new(ReviewInstantsBackfill1795535288),
     ]
 }
 

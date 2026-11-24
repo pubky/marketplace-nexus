@@ -2,6 +2,7 @@ use super::{listing_details, seed_user, shop_details};
 use crate::utils::{get_request, invalid_get_request};
 use anyhow::Result;
 use axum::http::StatusCode;
+use nexus_common::db::graph::Query;
 use nexus_common::db::{exec_single_row, queries};
 use nexus_common::models::marketplace::{
     ListingDetails, ReputationSummary, ReviewDetails, ReviewModeration, ReviewModerationState,
@@ -133,9 +134,9 @@ async fn cleanup_reviews(
     Ok(())
 }
 
-async fn unverified_aggregates_for(
+async fn seed_unverified_reviews(
     inputs: [(&str, &str, i64); 2],
-) -> Result<(ReputationSummary, ReputationSummary)> {
+) -> Result<(String, String, String, [ReviewDetails; 2])> {
     crate::utils::host_url().await;
     let seller = random_id();
     let author = random_id();
@@ -166,7 +167,13 @@ async fn unverified_aggregates_for(
         details
     });
     put_graph_reviews(&reviews).await?;
+    Ok((seller, author, listing_id, reviews))
+}
 
+async fn unverified_aggregates_for(
+    inputs: [(&str, &str, i64); 2],
+) -> Result<(ReputationSummary, ReputationSummary)> {
+    let (seller, author, listing_id, reviews) = seed_unverified_reviews(inputs).await?;
     let computed = recompute_pair(&seller, &listing_id).await;
     cleanup_reviews(
         &seller,
@@ -609,6 +616,157 @@ async fn test_unverified_records_use_the_latest_created_instant() -> Result<()> 
             Some("2026-08-20T12:00:00Z")
         );
     }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_order_offsets_beyond_eighteen_hours_by_instant() -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("Z0AAAAAAAAAAA", "2026-08-21T06:00:00+19:00", 1),
+        ("A0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_order_negative_offsets_beyond_eighteen_hours_by_instant(
+) -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("Z0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 1),
+        ("A0AAAAAAAAAAA", "2026-08-19T13:00:00-23:59", 5),
+    ])
+    .await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-19T13:00:00-23:59")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_reviews_indexed_without_instants_still_recompute() -> Result<()> {
+    let (seller, author, listing_id, reviews) = seed_unverified_reviews([
+        ("Z0AAAAAAAAAAA", "2026-08-21T06:00:00+19:00", 1),
+        ("A0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+
+    let legacy = async {
+        exec_single_row(
+            Query::new(
+                "test_remove_review_instants",
+                "MATCH (:User {id: $author})-[r:REVIEWED]->(:User {id: $seller})
+                 REMOVE r.created_at_ms, r.updated_at_ms RETURN true AS flag",
+            )
+            .param("author", author.as_str())
+            .param("seller", seller.as_str()),
+        )
+        .await?;
+        recompute_pair(&seller, &listing_id).await
+    }
+    .await;
+    let restored = async {
+        for details in &reviews {
+            details.store_instants().await?;
+        }
+        recompute_pair(&seller, &listing_id).await
+    }
+    .await;
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &author],
+        true,
+        true,
+    )
+    .await?;
+
+    let (subject, listing) = legacy?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.avg, 1.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-21T06:00:00+19:00")
+        );
+    }
+    let (subject, listing) = restored?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_seller_fields_use_the_latest_updated_instant() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let author = random_id();
+    let attestor = random_id();
+    let order_ref = random_id();
+    let first_listing = random_id();
+    let second_listing = random_id();
+    for user in [&seller, &author] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let attested = Some((attestor.as_str(), order_ref.as_str(), 1_790_002_000, 2));
+    let mut first = listing_review(&author, &seller, &first_listing, 4, attested, now);
+    first.updated_at = "2026-08-21T06:00:00+19:00".to_string();
+    first.rating_shipping = Some(1);
+    first.rating_communication = Some(2);
+    let mut second = listing_review(&author, &seller, &second_listing, 4, attested, now + 1);
+    second.updated_at = "2026-08-20T12:00:00Z".to_string();
+    second.rating_shipping = Some(5);
+    second.rating_communication = Some(4);
+    let reviews = [first, second];
+
+    let computed = async {
+        for details in &reviews {
+            details.put_to_graph().await?;
+        }
+        ReviewDetails::resolve_seller_fields(
+            &author,
+            &attestor,
+            &order_ref,
+            PubkyAppReviewRole::BuyerReviewingSeller,
+        )
+        .await?;
+        ReputationSummary::recompute_subject(&seller, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await
+    }
+    .await;
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&first_listing, &second_listing],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
+
+    let subject = computed?.expect("the subject aggregate exists");
+    assert_eq!(subject.count, 2);
+    assert_eq!(subject.avg_shipping, Some(5.0));
+    assert_eq!(subject.avg_communication, Some(4.0));
     Ok(())
 }
 

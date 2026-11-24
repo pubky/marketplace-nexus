@@ -1,7 +1,9 @@
 use crate::db::graph::error::{GraphError, GraphResult};
 use crate::db::graph::queries::get::REVIEW_MODERATION_MARKERS;
 use crate::db::graph::Query;
-use crate::models::marketplace::{DropDetails, ListingDetails, ReviewDetails, ShopDetails};
+use crate::models::marketplace::{
+    rfc3339_millis, DropDetails, ListingDetails, ReviewDetails, ShopDetails,
+};
 use crate::models::post::PostRelationships;
 use crate::models::{file::FileDetails, post::PostDetails, user::UserDetails};
 use pubky_app_specs::{ParsedUri, Resource};
@@ -772,7 +774,9 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
             r.seller_fields_counted = CASE WHEN $order_keyed
                 THEN coalesce(r.seller_fields_counted, false) ELSE true END,
             r.created_at = $created_at,
+            r.created_at_ms = $created_at_ms,
             r.updated_at = $updated_at,
+            r.updated_at_ms = $updated_at_ms,
             r.revision = $revision
         // Returns true if the review edge already existed
         RETURN existing IS NOT NULL AS flag;",
@@ -811,7 +815,9 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
     )
     .param("order_keyed", review.order_key().is_some())
     .param("created_at", review.created_at.to_string())
+    .param("created_at_ms", rfc3339_millis(&review.created_at))
     .param("updated_at", review.updated_at.to_string())
+    .param("updated_at_ms", rfc3339_millis(&review.updated_at))
     .param("revision", review.revision);
 
     Ok(query)
@@ -822,7 +828,7 @@ pub fn create_review(review: &ReviewDetails) -> GraphResult<Query> {
 /// reviewer's verified edges of one `(attestor_id, order_ref, role)` (the
 /// seller rating is one per order and buyer) the one that counts
 /// in the aggregates (not superseded, not excluded) with the latest
-/// `updated_at`, ties to the lowest review id, is flagged
+/// `updated_at` instant, ties to the lowest review id, is flagged
 /// `seller_fields_counted` and every other copy is cleared.
 pub fn resolve_seller_fields(
     reviewer_id: &str,
@@ -837,7 +843,8 @@ pub fn resolve_seller_fields(
              AND r.role = $role AND r.verified
          WITH r, (coalesce(r.superseded, false) = false
              AND coalesce(r.moderation, '') <> 'excluded') AS counted
-         ORDER BY counted DESC, datetime(r.updated_at) DESC, r.review_id ASC
+         ORDER BY counted DESC, coalesce(r.updated_at_ms, -9223372036854775808) DESC,
+             CASE WHEN r.updated_at_ms IS NULL THEN r.updated_at END DESC, r.review_id ASC
          WITH collect(r) AS copies, collect(counted) AS counted
          UNWIND range(0, size(copies) - 1) AS position
          WITH copies[position] AS copy, position = 0 AND counted[0] AS flag
@@ -873,6 +880,25 @@ pub fn set_review_superseded(reviewer_id: &str, review_id: &str, superseded: boo
     .param("reviewer_id", reviewer_id.to_string())
     .param("review_id", review_id.to_string())
     .param("superseded", superseded)
+}
+
+/// Stores the instants derived from one review's timestamp strings.
+pub fn set_review_instants(
+    reviewer_id: &str,
+    review_id: &str,
+    created_at_ms: Option<i64>,
+    updated_at_ms: Option<i64>,
+) -> Query {
+    Query::new(
+        "set_review_instants",
+        "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+        SET r.created_at_ms = $created_at_ms, r.updated_at_ms = $updated_at_ms
+        RETURN true AS flag;",
+    )
+    .param("reviewer_id", reviewer_id.to_string())
+    .param("review_id", review_id.to_string())
+    .param("created_at_ms", created_at_ms)
+    .param("updated_at_ms", updated_at_ms)
 }
 
 /// Derives one review's moderation from its markers and stores it on the

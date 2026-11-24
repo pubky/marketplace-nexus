@@ -304,6 +304,46 @@ pub async fn recompute_per_item_counting() -> Result<PerItemRecompute, EventProc
     Ok(summary)
 }
 
+/// Outcome tally of the one-shot review-instant backfill.
+#[derive(Debug, Default)]
+pub struct ReviewInstantsBackfill {
+    /// Indexed reviews whose instants were stored.
+    pub reviews: usize,
+    /// Attested orders whose counted seller-rating copy was settled.
+    pub orders: usize,
+    /// Subject and listing aggregates recomputed.
+    pub aggregates: usize,
+}
+
+/// One-shot backfill of the instants review aggregates order by. Stores every
+/// indexed review's instants, settles each attested order's counted
+/// seller-rating copy, then recomputes every subject and listing aggregate.
+/// Idempotent.
+pub async fn backfill_review_instants() -> Result<ReviewInstantsBackfill, EventProcessorError> {
+    let mut summary = ReviewInstantsBackfill::default();
+    for reviewer_id in ReviewDetails::reviewer_ids().await? {
+        for review_id in ReviewDetails::ids_of_reviewer(&reviewer_id).await? {
+            if let Some(details) = ReviewDetails::get_from_index(&reviewer_id, &review_id).await? {
+                details.store_instants().await?;
+                summary.reviews += 1;
+            }
+        }
+    }
+    for (reviewer_id, attestor_id, order_ref, role) in ReviewDetails::order_keys().await? {
+        ReviewDetails::resolve_seller_fields(&reviewer_id, &attestor_id, &order_ref, role).await?;
+        summary.orders += 1;
+    }
+    let (subjects, listings) = ReviewDetails::aggregate_scopes().await?;
+    for (subject_id, role) in &subjects {
+        ReputationSummary::recompute_subject(subject_id, *role).await?;
+    }
+    for (listing_owner_id, listing_id) in &listings {
+        ReputationSummary::recompute_listing(listing_owner_id, listing_id).await?;
+    }
+    summary.aggregates = subjects.len() + listings.len();
+    Ok(summary)
+}
+
 /// Re-derives one review's moderation and, when it changed, its aggregates.
 /// Returns whether it changed.
 async fn refresh_moderation(

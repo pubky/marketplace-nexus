@@ -170,6 +170,18 @@ impl ReviewDetails {
         execute_graph_operation(query).await
     }
 
+    /// Stores the instants derived from this review's timestamp strings.
+    pub async fn store_instants(&self) -> ModelResult<()> {
+        exec_single_row(queries::put::set_review_instants(
+            &self.reviewer_id,
+            &self.review_id,
+            rfc3339_millis(&self.created_at),
+            rfc3339_millis(&self.updated_at),
+        ))
+        .await?;
+        Ok(())
+    }
+
     /// Stores the details JSON and, unless this is an edit of an already
     /// indexed review, adds the review to the per-subject (and, for buyer
     /// reviews, per-listing) sorted sets. Edits keep the original position.
@@ -1032,6 +1044,12 @@ fn role_from_graph(role: &str) -> Option<PubkyAppReviewRole> {
     .find(|candidate| candidate.as_str() == role)
 }
 
+pub(crate) fn rfc3339_millis(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
 /// True when `updated_at` is more than the marketplace edit window after
 /// `created_at`. Unparseable timestamps (already spec-validated upstream)
 /// degrade to `false` rather than mislabeling the record.
@@ -1055,6 +1073,27 @@ mod filter_tests {
 
     fn params<'a>() -> ReviewStreamParams<'a> {
         ReviewStreamParams::default()
+    }
+
+    #[test]
+    fn rfc3339_millis_accepts_offsets_fractional_seconds_and_z() {
+        assert!(rfc3339_millis("2026-08-21T06:00:00+19:00").is_some());
+        assert!(rfc3339_millis("2026-08-19T13:00:00-23:59").is_some());
+        assert_eq!(rfc3339_millis("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_millis("1970-01-01T00:00:00.123Z"), Some(123));
+    }
+
+    #[test]
+    fn rfc3339_millis_rejects_an_unparseable_string() {
+        assert_eq!(rfc3339_millis("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn rfc3339_millis_compares_the_instants_not_the_offset_strings() {
+        assert!(
+            rfc3339_millis("2026-08-21T06:00:00+19:00").unwrap()
+                < rfc3339_millis("2026-08-20T12:00:00Z").unwrap()
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

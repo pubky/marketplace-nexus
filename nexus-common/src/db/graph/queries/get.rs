@@ -1723,14 +1723,19 @@ const SELLER_FIELDS_ONCE_PER_ORDER: &str = "coalesce(r.seller_fields_counted, tr
 /// [`crate::models::marketplace::ReviewModerationState::Excluded`]).
 const REPUTATION_NOT_EXCLUDED: &str = "coalesce(r.moderation, '') <> 'excluded'";
 
+/// Orders reviews by their created instant, then by the greater review id.
+/// Edges indexed before the instant was stored sort after the others and
+/// among themselves by their timestamp string.
 const GROUP_REPUTATION_REVIEWS: &str = "
-        WITH reviewer, r, datetime(r.created_at) AS created
-        ORDER BY created.epochSeconds DESC, created.nanosecond DESC, r.review_id DESC
+        WITH reviewer, r
+        ORDER BY coalesce(r.created_at_ms, -9223372036854775808) DESC,
+            CASE WHEN r.created_at_ms IS NULL THEN r.created_at END DESC, r.review_id DESC
         WITH CASE WHEN r.verified THEN 'v:' + reviewer.id + ':' + r.review_id
              ELSE 'u:' + reviewer.id + ':' + coalesce(r.listing_id, '')
-             END AS review_group, collect(r)[0] AS r, collect(created)[0] AS created
-        WITH r, created
-        ORDER BY created.epochSeconds DESC, created.nanosecond DESC, r.review_id DESC";
+             END AS review_group, collect(r)[0] AS r
+        WITH r
+        ORDER BY coalesce(r.created_at_ms, -9223372036854775808) DESC,
+            CASE WHEN r.created_at_ms IS NULL THEN r.created_at END DESC, r.review_id DESC";
 
 /// The reviewer's other verified review edges in one role that carry the
 /// same attested order `(attestor_id, order_ref)` for the same listing: a
@@ -1764,8 +1769,8 @@ pub fn review_order_twins(
 }
 
 /// Builds the reputation summary for one subject and role. Verified records
-/// count individually; unverified records use the latest record per author and
-/// listing. Superseded and excluded records are removed before selection.
+/// count individually; unverified records use the latest created instant per
+/// author and listing. Superseded and excluded records are removed before selection.
 /// Seller fields count once per attested order.
 pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
     let cypher = format!(

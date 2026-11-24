@@ -27,6 +27,7 @@ pub use reputation::{
     AttestorWindow, CountedReview, ReputationBucket, ReputationSnippet, ReputationSummary,
     ScopedReputationSummary, MAX_ATTESTOR_WINDOWS, REPUTATION_LISTING_KEY, REPUTATION_SUBJECT_KEY,
 };
+pub(crate) use review::rfc3339_millis;
 pub use review::{
     FilteredReviewStream, ReviewDetails, ReviewMatch, ReviewReach, ReviewSort, ReviewStream,
     ReviewStreamFilter, ReviewStreamParams, ReviewStreamScope, ReviewView, ReviewerFilter,
