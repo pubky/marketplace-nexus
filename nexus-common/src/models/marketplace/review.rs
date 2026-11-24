@@ -172,11 +172,14 @@ impl ReviewDetails {
         execute_graph_operation(query).await
     }
 
-    /// Stores the instants derived from this review's timestamp strings.
+    /// Stores the instants derived from this review's timestamp strings, only
+    /// while the edge still carries those strings.
     pub async fn store_instants(&self) -> ModelResult<()> {
         exec_single_row(queries::put::set_review_instants(
             &self.reviewer_id,
             &self.review_id,
+            &self.created_at,
+            &self.updated_at,
             rfc3339_millis(&self.created_at),
             rfc3339_millis(&self.updated_at),
         ))

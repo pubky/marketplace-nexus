@@ -188,9 +188,10 @@ Variants are written with `-strip`, which drops embedded ICC colour profiles
 without converting to sRGB. A variant request that cannot get a conversion slot
 within `process_timeout_secs` is answered `503` with `Retry-After: 5` and
 `Cache-Control: no-store`; a matching avatar request instead serves the original
-JPEG, PNG, GIF or WebP. A variant that fails to build (the file is not a
-decodable image, is over the size limit, or makes ImageMagick fail or time out)
-is remembered for an hour per stored original, up to 4,096 entries, so the same
+JPEG, PNG, GIF or WebP with `Cache-Control: no-store`. A variant that fails to
+build (the file is not a decodable image, is over the size limit, or makes
+ImageMagick fail or time out) is remembered for an hour per stored original, up
+to 4,096 entries, so the same
 request does not start the work again; a re-published original (a different
 file, so a different inode, length or modification time) is tried afresh. A
 process killed by a signal, a timeout after a shortened budget (the request
@@ -260,8 +261,9 @@ One-shot migrations (see the runbook in `README.md`):
   order by on reviews indexed before them, settles seller-rating copies and
   recomputes every review aggregate. It needs only the databases; run it once
   after the release that adds it. Until it runs, reviews indexed earlier order
-  among themselves by their timestamp string and after newer reviews, and
-  recomputes never fail on a timestamp.
+  among themselves by their timestamp string and after every review indexed or
+  edited since the release, and recomputes never fail on a timestamp. The pass
+  leaves an edge alone when a later edit already changed its timestamps.
 
 Run them where the databases are reachable, for example inside the `nexusd`
 container:

@@ -659,8 +659,8 @@ async fn test_unverified_records_order_negative_offsets_beyond_eighteen_hours_by
 #[tokio_shared_rt::test(shared)]
 async fn test_reviews_indexed_without_instants_still_recompute() -> Result<()> {
     let (seller, author, listing_id, reviews) = seed_unverified_reviews([
-        ("Z0AAAAAAAAAAA", "2026-08-21T06:00:00+19:00", 1),
-        ("A0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+        ("A0AAAAAAAAAAA", "2026-08-21T06:00:00+19:00", 1),
+        ("Z0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
     ])
     .await?;
 

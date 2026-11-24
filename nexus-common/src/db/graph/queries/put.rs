@@ -882,21 +882,27 @@ pub fn set_review_superseded(reviewer_id: &str, review_id: &str, superseded: boo
     .param("superseded", superseded)
 }
 
-/// Stores the instants derived from one review's timestamp strings.
+/// Stores the instants derived from one review's timestamp strings, only while
+/// the edge still carries those strings.
 pub fn set_review_instants(
     reviewer_id: &str,
     review_id: &str,
+    created_at: &str,
+    updated_at: &str,
     created_at_ms: Option<i64>,
     updated_at_ms: Option<i64>,
 ) -> Query {
     Query::new(
         "set_review_instants",
         "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+        WHERE r.created_at = $created_at AND r.updated_at = $updated_at
         SET r.created_at_ms = $created_at_ms, r.updated_at_ms = $updated_at_ms
         RETURN true AS flag;",
     )
     .param("reviewer_id", reviewer_id.to_string())
     .param("review_id", review_id.to_string())
+    .param("created_at", created_at)
+    .param("updated_at", updated_at)
     .param("created_at_ms", created_at_ms)
     .param("updated_at_ms", updated_at_ms)
 }

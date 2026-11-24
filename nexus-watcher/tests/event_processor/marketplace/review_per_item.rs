@@ -7,10 +7,12 @@ use crate::event_processor::utils::watcher::{HomeserverHashIdPath, WatcherTest};
 use anyhow::Result;
 use chrono::Utc;
 use nexus_common::db::graph::Query;
-use nexus_common::db::{exec_single_row, queries, RedisOps};
+use nexus_common::db::{exec_single_row, fetch_row_from_graph, queries, RedisOps};
 use nexus_common::models::marketplace::{ReputationSummary, ReviewDetails, ReviewStream};
 use nexus_common::types::Pagination;
-use nexus_watcher::events::handlers::review::recompute_per_item_counting;
+use nexus_watcher::events::handlers::review::{
+    backfill_review_instants, recompute_per_item_counting,
+};
 use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::{
     marketplace_review_uri_builder, traits::HasPath, PubkyAppListingCondition,
@@ -23,6 +25,18 @@ struct Market {
     seller_id: String,
     listing_a: String,
     listing_b: String,
+    shop_path: ResourcePath,
+    listing_paths: Vec<ResourcePath>,
+}
+
+impl Market {
+    async fn remove(&self, test: &mut WatcherTest) -> Result<()> {
+        for path in &self.listing_paths {
+            test.del(&self.seller_kp, path).await?;
+        }
+        test.del(&self.seller_kp, &self.shop_path).await?;
+        test.cleanup_user(&self.seller_kp).await
+    }
 }
 
 async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
@@ -34,6 +48,7 @@ async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
     test.put(&seller_kp, &shop_path, &test_shop(&seller_id))
         .await?;
     let mut listings = Vec::new();
+    let mut listing_paths = Vec::new();
     for title in ["Item A", "Item B"] {
         let listing = test_listing(
             &seller_id,
@@ -42,7 +57,9 @@ async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
             PubkyAppListingCondition::Excellent,
             15_000,
         );
-        listings.push(test.create_listing(&seller_kp, &listing).await?.0);
+        let (listing_id, listing_path) = test.create_listing(&seller_kp, &listing).await?;
+        listings.push(listing_id);
+        listing_paths.push(listing_path);
     }
     let listing_b = listings.pop().unwrap();
     let listing_a = listings.pop().unwrap();
@@ -51,6 +68,8 @@ async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
         seller_id,
         listing_a,
         listing_b,
+        shop_path,
+        listing_paths,
     })
 }
 
@@ -94,6 +113,21 @@ async fn summary_of_seller(seller_id: &str) -> ReputationSummary {
         .await
         .unwrap()
         .expect("the seller aggregate exists")
+}
+
+async fn edge_instants(reviewer_id: &str, review_id: &str) -> Result<(Option<i64>, Option<i64>)> {
+    let row = fetch_row_from_graph(
+        Query::new(
+            "test_review_edge_instants",
+            "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+             RETURN r.created_at_ms AS created_at_ms, r.updated_at_ms AS updated_at_ms",
+        )
+        .param("reviewer_id", reviewer_id)
+        .param("review_id", review_id),
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("the review edge exists"))?;
+    Ok((row.get("created_at_ms")?, row.get("updated_at_ms")?))
 }
 
 /// Asserts the supersession flags and the aggregates for the indexed subset
@@ -526,6 +560,83 @@ async fn the_one_shot_recompute_recounts_reviews_indexed_before_per_item_countin
     test.del(&buyer_kp, &scoped_b_path).await?;
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn backfill_only_stores_instants_while_timestamp_strings_match() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewInstantsBackfill").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(
+            &buyer_kp,
+            &seller_profile("Watcher:ReviewInstantsBackfill:Buyer"),
+        )
+        .await?;
+
+    let legacy = item_review(&market, &buyer_id, &market.listing_a, 'a', 4, true);
+    let (legacy_id, legacy_path) = test.create_review(&buyer_kp, &legacy).await?;
+    let edited = item_review(&market, &buyer_id, &market.listing_b, 'b', 5, true);
+    let (edited_id, edited_path) = test.create_review(&buyer_kp, &edited).await?;
+    let millis =
+        |value: &str| chrono::DateTime::parse_from_rfc3339(value).map(|t| t.timestamp_millis());
+    let edited_updated_at = "2026-09-01T00:00:00Z";
+    let edited_updated_at_ms = millis(edited_updated_at)?;
+
+    let outcome = async {
+        exec_single_row(
+            Query::new(
+                "test_remove_review_instants",
+                "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+                 REMOVE r.created_at_ms, r.updated_at_ms",
+            )
+            .param("reviewer_id", buyer_id.as_str())
+            .param("review_id", legacy_id.as_str()),
+        )
+        .await?;
+        // An edit indexed after the pass read the review's JSON: the edge
+        // carries newer strings and instants than the JSON the pass holds.
+        exec_single_row(
+            Query::new(
+                "test_edit_review_timestamp_after_read",
+                "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
+                 SET r.updated_at = $updated_at, r.updated_at_ms = $updated_at_ms",
+            )
+            .param("reviewer_id", buyer_id.as_str())
+            .param("review_id", edited_id.as_str())
+            .param("updated_at", edited_updated_at)
+            .param("updated_at_ms", edited_updated_at_ms),
+        )
+        .await?;
+        let summary = backfill_review_instants().await?;
+        let legacy_instants = edge_instants(&buyer_id, &legacy_id).await?;
+        let edited_instants = edge_instants(&buyer_id, &edited_id).await?;
+        anyhow::Ok((summary, legacy_instants, edited_instants))
+    }
+    .await;
+
+    test.del(&buyer_kp, &legacy_path).await?;
+    test.del(&buyer_kp, &edited_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    market.remove(&mut test).await?;
+
+    let (summary, legacy_instants, edited_instants) = outcome?;
+    assert!(summary.reviews >= 2);
+    assert_eq!(
+        legacy_instants,
+        (
+            Some(millis(&legacy.created_at)?),
+            Some(millis(&legacy.updated_at)?)
+        )
+    );
+    assert_eq!(
+        edited_instants,
+        (
+            Some(millis(&edited.created_at)?),
+            Some(edited_updated_at_ms)
+        )
+    );
     Ok(())
 }
 
