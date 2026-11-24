@@ -462,9 +462,10 @@ impl ReviewDetails {
 
     /// Re-derives a review's moderation from the markers and stores it on the
     /// edge ([`ReviewModeration::derive_and_store`]) and the details JSON
-    /// ([`Self::store_moderation`]). Returns the indexed details when the
-    /// stored moderation changed, so the caller recomputes what depends on it;
-    /// `None` when it did not or the review is not indexed.
+    /// ([`Self::store_moderation`]). Returns the indexed details when the edge
+    /// derivation changed or a details write changed its indexed moderation,
+    /// so the caller recomputes what depends on it; `None` otherwise or when
+    /// the review is not indexed.
     pub async fn refresh_moderation(
         reviewer_id: &str,
         review_id: &str,
@@ -478,13 +479,15 @@ impl ReviewDetails {
     /// review deleted meanwhile stays deleted), and only if no later
     /// derivation has written it already: a derivation that read the markers
     /// before a release never stores them after the release's own derivation.
-    /// Returns the indexed details when the derivation changed the edge,
-    /// holding whichever derivation's moderation is current.
+    /// Returns the indexed details when the derivation changed the edge or its
+    /// write changed the moderation previously in the details JSON, holding
+    /// whichever derivation's moderation is current.
     pub async fn store_moderation(
         reviewer_id: &str,
         review_id: &str,
         derived: &DerivedReviewModeration,
     ) -> ModelResult<Option<Self>> {
+        let indexed = Self::get_from_index(reviewer_id, review_id).await?;
         let key = [reviewer_id, review_id].join(":");
         let written = put_field_if_newer(
             &Self::prefix().await,
@@ -495,7 +498,13 @@ impl ReviewDetails {
             derived.version,
         )
         .await?;
-        if written == VersionedWrite::Missing || !derived.changed {
+        if written == VersionedWrite::Missing {
+            return Ok(None);
+        }
+        let details_changed = written == VersionedWrite::Written
+            && indexed
+                .is_some_and(|details| details.moderation.as_ref() != derived.moderation.as_ref());
+        if !derived.changed && !details_changed {
             return Ok(None);
         }
         Ok(Self::get_from_index(reviewer_id, review_id).await?)
