@@ -9,10 +9,15 @@ updates:
     commit-message:
       prefix: "deps"
     rebase-strategy: "auto"
+    # Only patch releases are grouped. Any other release (for a 0.x crate a
+    # minor is breaking, e.g. pubky 0.7 -> 0.9) gets its own PR, so one
+    # migration can't hold back every other update.
     groups:
-      cargo-dependencies:
+      cargo-patch:
         patterns:
           - "*"
+        update-types:
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
