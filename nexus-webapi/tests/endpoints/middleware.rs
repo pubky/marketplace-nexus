@@ -5,7 +5,7 @@ use anyhow::Result;
 use axum::body::{to_bytes, Body};
 use axum::extract::Path;
 use axum::http::header::{
-    ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN, RETRY_AFTER,
+    ACCESS_CONTROL_ALLOW_ORIGIN, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN, RETRY_AFTER,
 };
 use axum::http::{HeaderValue, Method, Request, StatusCode};
 use axum::routing::{get, post};
@@ -94,19 +94,23 @@ async fn index_media_file(
     Ok(file)
 }
 
-async fn index_avatar(file: &FileDetails) -> Result<()> {
+async fn index_avatar_for(user_id: &str, file: &FileDetails) -> Result<()> {
     let user = UserDetails {
         name: "Router Avatar".to_string(),
         bio: None,
-        id: PubkyId::try_from(file.owner_id.as_str()).map_err(anyhow::Error::msg)?,
+        id: PubkyId::try_from(user_id).map_err(anyhow::Error::msg)?,
         links: None,
         status: None,
         image: Some(file.uri.clone()),
         indexed_at: 0,
     };
     user.put_to_graph().await?;
-    UserDetails::put_to_index(&[file.owner_id.as_str()], vec![Some(user)]).await?;
+    UserDetails::put_to_index(&[user_id], vec![Some(user)]).await?;
     Ok(())
+}
+
+async fn index_avatar(file: &FileDetails) -> Result<()> {
+    index_avatar_for(&file.owner_id, file).await
 }
 
 async fn png_body() -> Result<Vec<u8>> {
@@ -261,12 +265,19 @@ async fn test_avatar_slots_held_serves_original() -> Result<()> {
         .unwrap()
         .to_str()?
         .to_string();
+    let cache_control = response
+        .headers()
+        .get(CACHE_CONTROL)
+        .unwrap()
+        .to_str()?
+        .to_string();
     let body = to_bytes(response.into_body(), png.len() + 1024).await?;
     remove_media_file(&state, &file).await?;
     UserDetails::delete(&file.owner_id).await?;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(content_type, "image/png");
+    assert_eq!(cache_control, "no-store");
     assert_eq!(body.as_ref(), png.as_slice());
     Ok(())
 }
@@ -292,5 +303,164 @@ async fn test_file_variant_declared_type_mismatch_returns_400() -> Result<()> {
     remove_media_file(&state, &file).await?;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_file_variant_corrected_declared_type_builds_variant() -> Result<()> {
+    let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
+    let state = media_router_state().await;
+    let file = index_media_file(&state, "2ZKTYPE000002", "image/jpeg", &png_body().await?).await?;
+    let mismatch = media_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/static/files/{}/{}/small", file.owner_id, file.id))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    let mut corrected = file.clone();
+    corrected.content_type = "image/png".to_string();
+    corrected.put_to_graph().await?;
+    FileDetails::put_to_index(
+        &[&[corrected.owner_id.as_str(), corrected.id.as_str()]],
+        vec![Some(corrected.clone())],
+    )
+    .await?;
+    let converted = media_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/static/files/{}/{}/small", file.owner_id, file.id))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    let mismatch_status = mismatch.status();
+    let converted_status = converted.status();
+    let converted_content_type = converted
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    drop(converted);
+    remove_media_file(&state, &corrected).await?;
+
+    assert_eq!(mismatch_status, StatusCode::BAD_REQUEST);
+    assert_eq!(converted_status, StatusCode::OK);
+    assert_eq!(converted_content_type.as_deref(), Some("image/webp"));
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_cross_owner_avatar_serves_original_and_small_variant() -> Result<()> {
+    let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
+    let state = media_router_state().await;
+    let png = png_body().await?;
+    let file = index_media_file(&state, "2ZKAVATAR0002", "image/png", &png).await?;
+    let profile_id = Keypair::random().public_key().to_z32();
+    index_avatar_for(&profile_id, &file).await?;
+
+    let held = acquire_all_conversion_slots().await;
+    let original = media_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/static/avatar/{profile_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    drop(held);
+    let original_status = original.status();
+    let original_content_type = original
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let original_cache_control = original
+        .headers()
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let original_body = to_bytes(original.into_body(), png.len() + 1024).await?;
+
+    let small = media_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/static/avatar/{profile_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let small_status = small.status();
+    let small_content_type = small
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let small_cache_control = small
+        .headers()
+        .get(CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    drop(small);
+    remove_media_file(&state, &file).await?;
+    UserDetails::delete(&profile_id).await?;
+
+    assert_eq!(original_status, StatusCode::OK);
+    assert_eq!(original_content_type.as_deref(), Some("image/png"));
+    assert_eq!(original_cache_control.as_deref(), Some("no-store"));
+    assert_eq!(original_body.as_ref(), png.as_slice());
+    assert_eq!(small_status, StatusCode::OK);
+    assert_eq!(small_content_type.as_deref(), Some("image/webp"));
+    assert_eq!(small_cache_control.as_deref(), Some("public, max-age=3600"));
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_avatar_declared_type_mismatch_returns_404_with_or_without_slots() -> Result<()> {
+    let _serial = MEDIA_ROUTER_TEST_LOCK.lock().await;
+    let state = media_router_state().await;
+    let free_file = index_media_file(
+        &state,
+        "2ZKAVATARTYPE1",
+        "image/png",
+        &[0xFF, 0xD8, 0xFF, 0x00],
+    )
+    .await?;
+    index_avatar(&free_file).await?;
+    let free = media_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/static/avatar/{}", free_file.owner_id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let free_status = free.status();
+    drop(free);
+    remove_media_file(&state, &free_file).await?;
+    UserDetails::delete(&free_file.owner_id).await?;
+
+    let held_file = index_media_file(
+        &state,
+        "2ZKAVATARTYPE2",
+        "image/png",
+        &[0xFF, 0xD8, 0xFF, 0x00],
+    )
+    .await?;
+    index_avatar(&held_file).await?;
+    let held = acquire_all_conversion_slots().await;
+    let busy = media_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/static/avatar/{}", held_file.owner_id))
+                .body(Body::empty())?,
+        )
+        .await?;
+    drop(held);
+    let held_status = busy.status();
+    drop(busy);
+    remove_media_file(&state, &held_file).await?;
+    UserDetails::delete(&held_file.owner_id).await?;
+
+    assert_eq!(free_status, StatusCode::NOT_FOUND);
+    assert_eq!(held_status, StatusCode::NOT_FOUND);
     Ok(())
 }

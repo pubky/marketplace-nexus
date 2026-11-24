@@ -93,7 +93,7 @@ pub async fn user_avatar_handler(
     // 6. Build the url using small variant
     let file_uri_path = format!(
         "/{}/{}/{}", // /{owner_id}/{file_id}/{variant}
-        user_id, file_details.id, variant,
+        file_details.owner_id, file_details.id, variant,
     );
 
     // 7. Serve the file. Then remove/replace any default Cache-Control header.
@@ -108,8 +108,14 @@ pub async fn user_avatar_handler(
     // Remove any default "cache-control" header
     response.headers_mut().remove("cache-control");
 
-    // Insert a new Cache-Control header (e.g., 1 hour)
-    let cache_control_header = "public, max-age=3600"
+    // The thumbnail is cached for an hour. The original is served only while every
+    // conversion slot is busy, so no cache may keep it in place of the thumbnail.
+    let cache_control = if variant == FileVariant::Main {
+        "no-store"
+    } else {
+        "public, max-age=3600"
+    };
+    let cache_control_header = cache_control
         .parse()
         .inspect_err(|err| error!("Failed to parse Cache-Control header value: {}", err))?;
 

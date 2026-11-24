@@ -217,6 +217,17 @@ fn known_failure_for(output: &str, stamp: OriginStamp) -> Option<KnownFailure> {
         .lookup(output, stamp, std::time::Instant::now())
 }
 
+fn known_failure_for_options(
+    output: &str,
+    stamp: OriginStamp,
+    options: &ImageOptions,
+) -> Option<KnownFailure> {
+    known_failure_for(output, stamp).filter(|failure| match failure {
+        KnownFailure::ContentTypeMismatch(declared) => declared == &options.declared_content_type,
+        _ => true,
+    })
+}
+
 fn remember_failure(output: &str, stamp: Option<OriginStamp>, failure: KnownFailure) {
     let Some(stamp) = stamp else { return };
     if let Ok(mut cache) = FAILED_VARIANTS.lock() {
@@ -363,7 +374,7 @@ impl ImageProcessor {
         budget: Duration,
     ) -> Result<String, MediaProcessorError> {
         if let Some(stamp) = OriginStamp::of(origin_file_path).await {
-            if let Some(failure) = known_failure_for(output_file_path, stamp) {
+            if let Some(failure) = known_failure_for_options(output_file_path, stamp, options) {
                 return Err(failure.error());
             }
         }
@@ -535,12 +546,7 @@ impl ImageProcessor {
         match Self::process_within(main, small, &options, budget).await {
             Ok(_) => Ok((FileVariant::Small, "image/webp".to_string())),
             Err(MediaProcessorError::Busy) => {
-                if Self::validate_original(main, &file.content_type)
-                    .await
-                    .is_err()
-                {
-                    return Err(MediaProcessorError::Busy);
-                }
+                Self::validate_original(main, &file.content_type).await?;
                 Ok((FileVariant::Main, file.content_type.clone()))
             }
             Err(error) => Err(error),
@@ -1485,6 +1491,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_corrected_declared_type_replaces_a_remembered_mismatch() {
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = make_source(
+            dir.path(),
+            "png",
+            &["-size", "64x48", "gradient:white-black"],
+        )
+        .await;
+        let origin = dir.path().join("main");
+        std::fs::rename(source, &origin).unwrap();
+        let output = dir.path().join("small");
+        let mismatched = ImageOptions {
+            declared_content_type: "image/jpeg".to_string(),
+            ..small_options()
+        };
+
+        let first =
+            ImageProcessor::process(path_str(&origin), path_str(&output), &mismatched).await;
+        assert!(matches!(
+            first,
+            Err(MediaProcessorError::UnsupportedContentType(content_type)) if content_type == "image/jpeg"
+        ));
+
+        ImageProcessor::process(path_str(&origin), path_str(&output), &small_options())
+            .await
+            .expect("the corrected declared type converts the unchanged original");
+        assert!(output.exists());
+    }
+
+    #[tokio::test]
     async fn a_busy_avatar_uses_main_only_for_a_matching_allowlisted_original() {
         let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
@@ -1552,7 +1589,10 @@ mod tests {
         )
         .await;
         drop(held);
-        assert!(matches!(result, Err(MediaProcessorError::Busy)));
+        assert!(matches!(
+            result,
+            Err(MediaProcessorError::UnsupportedContentType(content_type)) if content_type == "image/png"
+        ));
         assert!(!origin_dir.join("small").exists());
     }
 
