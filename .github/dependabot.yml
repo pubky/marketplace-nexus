@@ -9,10 +9,25 @@ updates:
     commit-message:
       prefix: "deps"
     rebase-strategy: "auto"
-    # Only patch releases are grouped. Any other release (for a 0.x crate a
-    # minor is breaking, e.g. pubky 0.7 -> 0.9) gets its own PR, so one
-    # migration can't hold back every other update.
+    # Crates released together are bumped together, at any version level, so
+    # one PR compiles. A dependency that matches several groups joins the
+    # first one listed, so these come before cargo-patch. Any other crate gets
+    # a PR per non-patch release (for a 0.x crate a minor is breaking, e.g.
+    # pubky 0.7 -> 0.9), so one migration can't hold back every other update.
     groups:
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+      pubky:
+        patterns:
+          - "pubky*"
+      utoipa:
+        patterns:
+          - "utoipa*"
+      redis:
+        patterns:
+          - "redis"
+          - "deadpool-redis"
       cargo-patch:
         patterns:
           - "*"
