@@ -329,9 +329,13 @@ impl UserStream {
     pub async fn get_user_list_from_source(
         input: UserStreamInput,
     ) -> ModelResult<Option<Vec<String>>> {
-        let influencer_preview =
-            matches!(&input.source, UserStreamSource::Influencers) && input.preview == Some(true);
-        if !influencer_preview && input.skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+        // These sources never pass skip to their lookup.
+        let ignores_skip = matches!(
+            &input.source,
+            UserStreamSource::Recommended | UserStreamSource::PostReplies
+        ) || (matches!(&input.source, UserStreamSource::Influencers)
+            && input.preview == Some(true));
+        if !ignores_skip && input.skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
             return Ok(None);
         }
 

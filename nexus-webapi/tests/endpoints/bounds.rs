@@ -139,7 +139,7 @@ async fn test_graph_stream_skip_above_bound_is_empty() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
-async fn test_user_streams_skip_above_bound_is_empty() -> Result<()> {
+async fn test_post_replies_user_streams_ignore_skip_above_bound() -> Result<()> {
     let author_id = "emq37ky6fbnaun7q1ris6rx3mqmw3a33so1txfesg9jj3ak9ryoy";
     let post_id = "1A1P4D8C9K0F";
     for route in ["/v0/stream/users", "/v0/stream/users/ids"] {
@@ -148,7 +148,7 @@ async fn test_user_streams_skip_above_bound_is_empty() -> Result<()> {
             SKIP_BOUND + 1
         );
         let body = get_request(&path).await?;
-        assert!(body.as_array().expect("user stream").is_empty(), "{path}");
+        assert!(!body.as_array().expect("user stream").is_empty(), "{path}");
     }
     Ok(())
 }
