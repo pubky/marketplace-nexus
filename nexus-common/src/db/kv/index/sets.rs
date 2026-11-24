@@ -9,6 +9,10 @@ fn sscan_count(limit: usize) -> usize {
     limit.min(MAX_SSCAN_COUNT)
 }
 
+fn sscan_batch(skip: usize, limit: usize) -> usize {
+    sscan_count(skip.saturating_add(limit))
+}
+
 /// Adds elements to a Redis set.
 ///
 /// This function adds elements to the specified Redis set. If the set doesn't exist,
@@ -95,7 +99,7 @@ pub async fn get_range(
             .arg(&index_key)
             .arg(&cursor)
             .arg("COUNT")
-            .arg(sscan_count(limit))
+            .arg(sscan_batch(skip, limit))
             .query_async(&mut redis_conn)
             .await?;
 
@@ -398,6 +402,14 @@ mod tests {
     fn sscan_count_caps_large_limits() {
         assert_eq!(sscan_count(MAX_SSCAN_COUNT + 1), MAX_SSCAN_COUNT);
         assert_eq!(sscan_count(usize::MAX), MAX_SSCAN_COUNT);
+    }
+
+    #[test]
+    fn sscan_batch_covers_skip_and_limit() {
+        assert_eq!(sscan_batch(900, 5), 905);
+        assert_eq!(sscan_batch(10_000, 5), MAX_SSCAN_COUNT);
+        assert_eq!(sscan_batch(0, 40), 40);
+        assert_eq!(sscan_batch(usize::MAX, 5), MAX_SSCAN_COUNT);
     }
 
     #[tokio::test]
