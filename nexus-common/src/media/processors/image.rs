@@ -644,7 +644,8 @@ impl Conversion {
         ))
     }
 
-    /// A failure to write says nothing about the original, so probe the output directory first.
+    /// A failure to write says nothing about the original, so probe that a
+    /// synced byte reaches the output directory first.
     async fn output_is_writable(&self) -> bool {
         let probe_path = format!(
             "{}.probe-{}-{}",
@@ -661,7 +662,7 @@ impl Conversion {
             Ok(probe) => probe,
             Err(_) => return false,
         };
-        let written = probe.write_all(&[0]).await.is_ok();
+        let written = probe.write_all(&[0]).await.is_ok() && probe.sync_all().await.is_ok();
         drop(probe);
         let _ = fs::remove_file(probe_path).await;
         written
