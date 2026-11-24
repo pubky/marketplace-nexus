@@ -1706,7 +1706,7 @@ fn reputation_return(seller_fields: &str) -> String {
             sum(CASE WHEN r.has_response THEN 1 ELSE 0 END) AS response_count,
             sum(CASE WHEN r.edited_late THEN 1 ELSE 0 END) AS edited_late_count,
             [x IN collect(CASE WHEN r.verified THEN r.attestor_id ELSE null END) WHERE x IS NOT NULL] AS attestors,
-            max(r.created_at) AS last_reviewed_at
+            collect(r.created_at)[0] AS last_reviewed_at
         "
     )
 }
@@ -1724,11 +1724,13 @@ const SELLER_FIELDS_ONCE_PER_ORDER: &str = "coalesce(r.seller_fields_counted, tr
 const REPUTATION_NOT_EXCLUDED: &str = "coalesce(r.moderation, '') <> 'excluded'";
 
 const GROUP_REPUTATION_REVIEWS: &str = "
-        WITH reviewer, r
-        ORDER BY r.created_at DESC, r.review_id DESC
+        WITH reviewer, r, datetime(r.created_at) AS created
+        ORDER BY created.epochSeconds DESC, created.nanosecond DESC, r.review_id DESC
         WITH CASE WHEN r.verified THEN 'v:' + reviewer.id + ':' + r.review_id
              ELSE 'u:' + reviewer.id + ':' + coalesce(r.listing_id, '')
-             END AS review_group, collect(r)[0] AS r";
+             END AS review_group, collect(r)[0] AS r, collect(created)[0] AS created
+        WITH r, created
+        ORDER BY created.epochSeconds DESC, created.nanosecond DESC, r.review_id DESC";
 
 /// The reviewer's other verified review edges in one role that carry the
 /// same attested order `(attestor_id, order_ref)` for the same listing: a

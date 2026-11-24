@@ -4,8 +4,10 @@ use anyhow::Result;
 use axum::http::StatusCode;
 use nexus_common::db::{exec_single_row, queries};
 use nexus_common::models::marketplace::{
-    ReputationSummary, ReviewDetails, ReviewModeration, ReviewModerationState,
+    ListingDetails, ReputationSummary, ReviewDetails, ReviewModeration, ReviewModerationState,
+    ShopDetails,
 };
+use nexus_common::models::user::UserDetails;
 use pubky::Keypair;
 use pubky_app_specs::{PubkyAppListingCondition, PubkyAppReviewRole};
 use serde_json::Value;
@@ -99,6 +101,55 @@ async fn recompute_pair(
         .await?
         .expect("the listing aggregate exists");
     Ok((subject, listing))
+}
+
+async fn unverified_aggregates_for(
+    inputs: [(&str, &str, i64); 2],
+) -> Result<(ReputationSummary, ReputationSummary)> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let author = random_id();
+    let listing_id = random_id();
+    for user in [&seller, &author] {
+        seed_user(user).await?;
+    }
+    let shop = shop_details(&seller);
+    shop.put_to_graph().await?;
+    shop.put_to_index().await?;
+    let category = format!("cat-{}", chrono::Utc::now().timestamp_micros());
+    let listing = listing_details(
+        &seller,
+        &listing_id,
+        "Lamp",
+        &category,
+        PubkyAppListingCondition::Good,
+        4_000,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    listing.put_to_graph().await?;
+    listing.put_to_index(false).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = inputs.map(|(review_id, created_at, rating)| {
+        let mut details = review(&author, &seller, review_id, rating, None, now);
+        details.listing_id = listing_id.clone();
+        details.created_at = created_at.to_string();
+        details
+    });
+    put_graph_reviews(&reviews).await?;
+
+    let computed = recompute_pair(&seller, &listing_id).await;
+    for details in &reviews {
+        details.delete().await?;
+    }
+    ReputationSummary::recompute_subject(&seller, PubkyAppReviewRole::BuyerReviewingSeller).await?;
+    ReputationSummary::recompute_listing(&seller, &listing_id).await?;
+    ListingDetails::delete(&seller, &listing_id).await?;
+    ShopDetails::delete_indexes(&seller).await?;
+    exec_single_row(queries::del::delete_untagged_shop(&seller)).await?;
+    UserDetails::delete(&author).await?;
+    UserDetails::delete(&seller).await?;
+
+    computed
 }
 
 /// Seeds a shop, one listing, one verified review (iat 1790002000, price
@@ -452,6 +503,48 @@ async fn test_unverified_records_collapse_to_latest_per_user_and_listing() -> Re
         );
     }
 
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_use_the_latest_created_instant() -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("Z0AAAAAAAAAAA", "2026-08-20T13:00:00+02:00", 1),
+        ("A0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.verified_count, 0);
+        assert_eq!(summary.unverified_count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_equal_created_instants_use_the_greater_review_id() -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("A0AAAAAAAAAAA", "2026-08-20T14:00:00+02:00", 1),
+        ("Z0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.verified_count, 0);
+        assert_eq!(summary.unverified_count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
     Ok(())
 }
 
