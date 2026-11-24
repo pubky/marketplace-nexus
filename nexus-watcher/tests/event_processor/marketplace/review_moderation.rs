@@ -372,7 +372,6 @@ async fn a_replayed_tag_recomputes_after_the_details_write_was_missed() -> Resul
     test.del(&market.seller_kp, &market.shop_path).await?;
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
-    test.cleanup_user(&moderator_kp).await?;
     Ok(())
 }
 
