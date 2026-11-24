@@ -132,7 +132,9 @@ impl ReviewDetails {
             uri: marketplace_review_uri_builder(reviewer_id.to_string(), review.review_id.clone()),
             reviewer_id: reviewer_id.to_string(),
             subject_id: subject_id.to_string(),
-            listing_owner_id: review.listing_owner_pubky.clone(),
+            listing_owner_id: PubkyId::try_from(review.listing_owner_pubky.as_str())
+                .map(|id| id.to_string())
+                .unwrap_or_else(|_| review.listing_owner_pubky.clone()),
             listing_id: review.listing_id.clone(),
             role: review.role,
             rating_overall: review.ratings.overall,

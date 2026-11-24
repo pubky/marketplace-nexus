@@ -1108,6 +1108,22 @@ mod review_validation_tests {
         let details = ReviewDetails::from_homeserver(&review, &user_id, &subject_id);
         assert_eq!(details.subject_id, subject);
     }
+
+    #[test]
+    fn details_store_the_canonical_listing_owner() {
+        let mut review = self_review(PubkyAppReviewRole::BuyerReviewingSeller);
+        let user_id = PubkyId::try_from(review.owner_pubky.as_str()).unwrap();
+        review.subject_pubky = pubky::Keypair::random().public_key().to_z32();
+        let subject_id = PubkyId::try_from(review.subject_pubky.as_str()).unwrap();
+        let listing_owner = pubky::Keypair::random().public_key().to_z32();
+        let aliases = canonical_aliases(&listing_owner);
+        assert!(!aliases.is_empty());
+        for alias in aliases {
+            review.listing_owner_pubky = alias;
+            let details = ReviewDetails::from_homeserver(&review, &user_id, &subject_id);
+            assert_eq!(details.listing_owner_id, listing_owner);
+        }
+    }
 }
 
 #[cfg(test)]
