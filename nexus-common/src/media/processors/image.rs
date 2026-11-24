@@ -644,28 +644,10 @@ impl Conversion {
         ))
     }
 
-    /// A failure to write says nothing about the original, so probe that a
-    /// synced byte reaches the output directory first.
+    /// A failure to write says nothing about the original, so first check that
+    /// the output directory accepts a written byte.
     async fn output_is_writable(&self) -> bool {
-        let probe_path = format!(
-            "{}.probe-{}-{}",
-            self.output_file_path,
-            std::process::id(),
-            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let mut probe = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe_path)
-            .await
-        {
-            Ok(probe) => probe,
-            Err(_) => return false,
-        };
-        let written = probe.write_all(&[0]).await.is_ok() && probe.sync_all().await.is_ok();
-        drop(probe);
-        let _ = fs::remove_file(probe_path).await;
-        written
+        directory_accepts_a_byte(&self.output_file_path).await
     }
 
     async fn convert(
@@ -751,6 +733,28 @@ impl Conversion {
         let _ = child.wait().await;
         result
     }
+}
+
+async fn directory_accepts_a_byte(output_file_path: &str) -> bool {
+    let probe_path = format!(
+        "{}.probe-{}-{}",
+        output_file_path,
+        std::process::id(),
+        TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut probe = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe_path)
+        .await
+    {
+        Ok(probe) => probe,
+        Err(_) => return false,
+    };
+    let written = probe.write_all(&[0]).await.is_ok() && probe.flush().await.is_ok();
+    drop(probe);
+    let _ = fs::remove_file(probe_path).await;
+    written
 }
 
 /// Removes `path` unless a different file (a newer conversion's variant) has taken its place
@@ -1012,9 +1016,72 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[ignore]
+    #[test]
+    fn probe_under_a_zero_file_size_limit() {
+        let Some(dir) = std::env::var_os("PROBE_UNDER_ZERO_FSIZE_DIR") else {
+            return;
+        };
+        // SAFETY: this child process owns its signal disposition and file-size limit.
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            libc::setrlimit(
+                libc::RLIMIT_FSIZE,
+                &libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                },
+            );
+        }
+        let output = std::path::PathBuf::from(dir).join("small");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let accepted = runtime.block_on(directory_accepts_a_byte(path_str(&output)));
+        println!("probe-result={accepted}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_that_refuses_writes_is_not_reported_writable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = dir.path().join("small");
+        assert!(directory_accepts_a_byte(path_str(&output)).await);
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "media::processors::image::tests::probe_under_a_zero_file_size_limit",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PROBE_UNDER_ZERO_FSIZE_DIR", dir.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(
+            child.status.success(),
+            "child failed\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("probe-result=false"),
+            "stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(entries(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_unwritable_variant_directory_is_retried_after_it_becomes_writable() {
         use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("running as root, directory permissions do not apply; skipping");
+            return;
+        }
 
         let _serial = SLOT_TESTS.lock().await;
         let dir = tempfile::TempDir::new().unwrap();
