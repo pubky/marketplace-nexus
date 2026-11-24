@@ -195,7 +195,9 @@ request does not start the work again; a re-published original (a different
 file, so a different inode, length or modification time) is tried afresh. A
 process killed by a signal, a timeout after a shortened budget (the request
 spent most of it waiting for a slot) and a slot wait are not remembered. A
-variant built from an original that was replaced while it converted is
+failure while the variant directory cannot be written is not remembered either,
+so fixing ownership of `files_path` takes effect without a restart. A variant
+built from an original that was replaced while it converted is
 discarded. Writing a new `main` file removes the `small` and `feed` variants
 built from the previous one. ImageMagick's diagnostics are capped at 4 KiB per
 run. The remembered failures live in memory and are lost on restart. Error

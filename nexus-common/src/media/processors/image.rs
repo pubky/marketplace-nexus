@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
     sync::Semaphore,
     time::{timeout_at, Instant},
@@ -644,6 +644,29 @@ impl Conversion {
         ))
     }
 
+    /// A failure to write says nothing about the original, so probe the output directory first.
+    async fn output_is_writable(&self) -> bool {
+        let probe_path = format!(
+            "{}.probe-{}-{}",
+            self.output_file_path,
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut probe = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe_path)
+            .await
+        {
+            Ok(probe) => probe,
+            Err(_) => return false,
+        };
+        let written = probe.write_all(&[0]).await.is_ok();
+        drop(probe);
+        let _ = fs::remove_file(probe_path).await;
+        written
+    }
+
     async fn convert(
         &self,
         scratch: &std::path::Path,
@@ -700,7 +723,7 @@ impl Conversion {
                 );
                 // An exit code is ImageMagick's verdict on these bytes under fixed limits. A
                 // process ended by a signal (an OOM kill, an operator) says nothing about them.
-                if status.code().is_some() {
+                if status.code().is_some() && self.output_is_writable().await {
                     remember_failure(
                         &self.output_file_path,
                         self.origin_stamp,
@@ -985,6 +1008,49 @@ mod tests {
             .await
             .expect("a republished valid image must convert");
         assert!(output.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_variant_directory_is_retried_after_it_becomes_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = SLOT_TESTS.lock().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let origins = dir.path().join("origins");
+        let variants = dir.path().join("variants");
+        std::fs::create_dir(&origins).unwrap();
+        std::fs::create_dir(&variants).unwrap();
+        let origin =
+            make_source(&origins, "png", &["-size", "64x48", "gradient:white-black"]).await;
+        let output = variants.join("small");
+        std::fs::set_permissions(&variants, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let root_check = variants.join("write-check");
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&root_check)
+            .is_ok()
+        {
+            std::fs::remove_file(root_check).unwrap();
+            std::fs::set_permissions(&variants, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("directory permissions do not restrict this process; skipping the check");
+            return;
+        }
+
+        let first =
+            ImageProcessor::process(path_str(&origin), path_str(&output), &small_options()).await;
+        std::fs::set_permissions(&variants, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let stamp = OriginStamp::of(path_str(&origin)).await.unwrap();
+        assert!(first.is_err(), "{first:?}");
+        assert!(known_failure_for(path_str(&output), stamp).is_none());
+
+        let second =
+            ImageProcessor::process(path_str(&origin), path_str(&output), &small_options()).await;
+        assert!(second.is_ok(), "{second:?}");
+        assert!(output.exists());
+        assert_eq!(entries(&variants), vec!["small".to_string()]);
     }
 
     #[tokio::test]
