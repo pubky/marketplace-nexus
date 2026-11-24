@@ -19,6 +19,7 @@ struct Seeded {
     attestor_id: String,
     verified_reviewer: String,
     unverified_reviewer: String,
+    reviews: [ReviewDetails; 2],
 }
 
 fn random_id() -> String {
@@ -103,6 +104,35 @@ async fn recompute_pair(
     Ok((subject, listing))
 }
 
+async fn cleanup_reviews(
+    seller_id: &str,
+    reviews: &[ReviewDetails],
+    listing_ids: &[&str],
+    user_ids: &[&str],
+    listings_created: bool,
+    shop_created: bool,
+) -> Result<()> {
+    for details in reviews {
+        details.delete().await?;
+    }
+    ReputationSummary::recompute_subject(seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+        .await?;
+    for listing_id in listing_ids {
+        ReputationSummary::recompute_listing(seller_id, listing_id).await?;
+        if listings_created {
+            ListingDetails::delete(seller_id, listing_id).await?;
+        }
+    }
+    if shop_created {
+        ShopDetails::delete_indexes(seller_id).await?;
+        exec_single_row(queries::del::delete_untagged_shop(seller_id)).await?;
+    }
+    for user_id in user_ids {
+        UserDetails::delete(user_id).await?;
+    }
+    Ok(())
+}
+
 async fn unverified_aggregates_for(
     inputs: [(&str, &str, i64); 2],
 ) -> Result<(ReputationSummary, ReputationSummary)> {
@@ -138,16 +168,15 @@ async fn unverified_aggregates_for(
     put_graph_reviews(&reviews).await?;
 
     let computed = recompute_pair(&seller, &listing_id).await;
-    for details in &reviews {
-        details.delete().await?;
-    }
-    ReputationSummary::recompute_subject(&seller, PubkyAppReviewRole::BuyerReviewingSeller).await?;
-    ReputationSummary::recompute_listing(&seller, &listing_id).await?;
-    ListingDetails::delete(&seller, &listing_id).await?;
-    ShopDetails::delete_indexes(&seller).await?;
-    exec_single_row(queries::del::delete_untagged_shop(&seller)).await?;
-    UserDetails::delete(&author).await?;
-    UserDetails::delete(&seller).await?;
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &author],
+        true,
+        true,
+    )
+    .await?;
 
     computed
 }
@@ -220,7 +249,24 @@ async fn seed_reviews() -> Result<Seeded> {
         attestor_id,
         verified_reviewer,
         unverified_reviewer,
+        reviews,
     })
+}
+
+async fn cleanup_seeded(seeded: &Seeded) -> Result<()> {
+    cleanup_reviews(
+        &seeded.seller_id,
+        &seeded.reviews,
+        &[LISTING_ID],
+        &[
+            &seeded.seller_id,
+            &seeded.verified_reviewer,
+            &seeded.unverified_reviewer,
+        ],
+        true,
+        true,
+    )
+    .await
 }
 
 fn review_by<'a>(stream: &'a Value, reviewer_id: &str) -> &'a Value {
@@ -259,6 +305,7 @@ async fn test_review_streams_serve_the_attestation_iat_next_to_the_attestor() ->
         }
     }
 
+    cleanup_seeded(&seeded).await?;
     Ok(())
 }
 
@@ -340,6 +387,7 @@ async fn test_reputation_serves_buckets_and_scopes_them_by_attestor_windows() ->
         .await?;
     }
 
+    cleanup_seeded(&seeded).await?;
     Ok(())
 }
 
@@ -379,6 +427,15 @@ async fn test_same_user_edges_do_not_shape_reputation() -> Result<()> {
         assert!(summary.buckets.is_empty());
     }
 
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &other_user],
+        false,
+        false,
+    )
+    .await?;
     Ok(())
 }
 
@@ -429,6 +486,15 @@ async fn test_verified_records_from_different_reviewers_count_separately() -> Re
         assert_eq!(bucket.histogram, [0, 0, 1, 0, 1]);
     }
 
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[LISTING_ID],
+        &[&seller, &first_reviewer, &second_reviewer],
+        false,
+        false,
+    )
+    .await?;
     Ok(())
 }
 
@@ -461,6 +527,15 @@ async fn test_filtered_streams_leave_out_same_user_edges() -> Result<()> {
         assert_eq!(stream[0]["review"]["reviewer_id"], reviewer);
     }
 
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &reviewer],
+        false,
+        false,
+    )
+    .await?;
     Ok(())
 }
 
@@ -488,7 +563,8 @@ async fn test_unverified_records_collapse_to_latest_per_user_and_listing() -> Re
     } else {
         tie_b.rating_overall = 5;
     }
-    put_graph_reviews(&[older, tie_a, tie_b]).await?;
+    let reviews = [older, tie_a, tie_b];
+    put_graph_reviews(&reviews).await?;
 
     let (subject, listing) = recompute_pair(&seller, &listing_id).await?;
     for summary in [&subject, &listing] {
@@ -503,6 +579,15 @@ async fn test_unverified_records_collapse_to_latest_per_user_and_listing() -> Re
         );
     }
 
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
     Ok(())
 }
 
@@ -577,6 +662,15 @@ async fn test_unverified_records_on_two_listings_count_separately() -> Result<()
     assert_eq!(second.count, 1);
     assert_eq!(second.avg, 2.0);
 
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&first_listing, &second_listing],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
     Ok(())
 }
 
@@ -605,7 +699,8 @@ async fn test_filtered_records_do_not_replace_counted_unverified_records() -> Re
         state: ReviewModerationState::Excluded,
         reason: "not_counted".to_string(),
     });
-    put_graph_reviews(&[kept_first, superseded, kept_second, excluded]).await?;
+    let reviews = [kept_first, superseded, kept_second, excluded];
+    put_graph_reviews(&reviews).await?;
     exec_single_row(queries::put::set_review_superseded(
         &author,
         &superseded_id,
@@ -632,5 +727,14 @@ async fn test_filtered_records_do_not_replace_counted_unverified_records() -> Re
     assert_eq!(second.count, 1);
     assert_eq!(second.avg, 2.0);
 
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&first_listing, &second_listing],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
     Ok(())
 }
