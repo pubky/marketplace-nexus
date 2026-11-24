@@ -883,7 +883,12 @@ pub fn set_review_superseded(reviewer_id: &str, review_id: &str, superseded: boo
 }
 
 /// Stores the instants derived from one review's timestamp strings, only while
-/// the edge still carries those strings.
+/// the edge still carries those strings, and returns whether it stored them.
+///
+/// The statement write-locks the edge before it compares the strings, so an
+/// edit whose transaction is still open is waited for and its strings are
+/// compared afterwards; without the lock the comparison reads the old strings
+/// and the stale instants overwrite the edit's.
 pub fn set_review_instants(
     reviewer_id: &str,
     review_id: &str,
@@ -895,9 +900,12 @@ pub fn set_review_instants(
     Query::new(
         "set_review_instants",
         "MATCH (:User {id: $reviewer_id})-[r:REVIEWED {review_id: $review_id}]->(:User)
-        WHERE r.created_at = $created_at AND r.updated_at = $updated_at
-        SET r.created_at_ms = $created_at_ms, r.updated_at_ms = $updated_at_ms
-        RETURN true AS flag;",
+        SET r._instants_lock = true
+        WITH r, r.created_at = $created_at AND r.updated_at = $updated_at AS fresh
+        REMOVE r._instants_lock
+        SET r.created_at_ms = CASE WHEN fresh THEN $created_at_ms ELSE r.created_at_ms END,
+            r.updated_at_ms = CASE WHEN fresh THEN $updated_at_ms ELSE r.updated_at_ms END
+        RETURN fresh AS flag;",
     )
     .param("reviewer_id", reviewer_id.to_string())
     .param("review_id", review_id.to_string())

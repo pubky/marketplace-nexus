@@ -612,7 +612,21 @@ async fn backfill_only_stores_instants_while_timestamp_strings_match() -> Result
         let summary = backfill_review_instants().await?;
         let legacy_instants = edge_instants(&buyer_id, &legacy_id).await?;
         let edited_instants = edge_instants(&buyer_id, &edited_id).await?;
-        anyhow::Ok((summary, legacy_instants, edited_instants))
+        let stale = ReviewDetails::get_from_index(&buyer_id, &edited_id)
+            .await?
+            .expect("the edited review stays indexed");
+        let stale_stored = stale.store_instants().await?;
+        let current = ReviewDetails::get_from_index(&buyer_id, &legacy_id)
+            .await?
+            .expect("the legacy review stays indexed");
+        let current_stored = current.store_instants().await?;
+        anyhow::Ok((
+            summary,
+            legacy_instants,
+            edited_instants,
+            stale_stored,
+            current_stored,
+        ))
     }
     .await;
 
@@ -621,8 +635,10 @@ async fn backfill_only_stores_instants_while_timestamp_strings_match() -> Result
     test.cleanup_user(&buyer_kp).await?;
     market.remove(&mut test).await?;
 
-    let (summary, legacy_instants, edited_instants) = outcome?;
-    assert!(summary.reviews >= 2);
+    let (summary, legacy_instants, edited_instants, stale_stored, current_stored) = outcome?;
+    assert!(summary.reviews >= 1);
+    assert!(!stale_stored, "a guarded no-op is not reported as stored");
+    assert!(current_stored, "an edge on the same strings is stored");
     assert_eq!(
         legacy_instants,
         (

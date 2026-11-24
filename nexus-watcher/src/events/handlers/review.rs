@@ -307,7 +307,8 @@ pub async fn recompute_per_item_counting() -> Result<PerItemRecompute, EventProc
 /// Outcome tally of the one-shot review-instant backfill.
 #[derive(Debug, Default)]
 pub struct ReviewInstantsBackfill {
-    /// Indexed reviews whose instants were stored.
+    /// Indexed reviews whose instants were stored; reviews edited since their
+    /// JSON was read keep their own instants and are not counted.
     pub reviews: usize,
     /// Attested orders whose counted seller-rating copy was settled.
     pub orders: usize,
@@ -324,8 +325,9 @@ pub async fn backfill_review_instants() -> Result<ReviewInstantsBackfill, EventP
     for reviewer_id in ReviewDetails::reviewer_ids().await? {
         for review_id in ReviewDetails::ids_of_reviewer(&reviewer_id).await? {
             if let Some(details) = ReviewDetails::get_from_index(&reviewer_id, &review_id).await? {
-                details.store_instants().await?;
-                summary.reviews += 1;
+                if details.store_instants().await? {
+                    summary.reviews += 1;
+                }
             }
         }
     }

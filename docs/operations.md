@@ -263,7 +263,9 @@ One-shot migrations (see the runbook in `README.md`):
   after the release that adds it. Until it runs, reviews indexed earlier order
   among themselves by their timestamp string and after every review indexed or
   edited since the release, and recomputes never fail on a timestamp. The pass
-  leaves an edge alone when a later edit already changed its timestamps.
+  write-locks each edge before it compares timestamps, and leaves an edge alone
+  when an edit already changed them, including an edit still in flight; such
+  edges are not counted as stored in the migration log.
 
 Run them where the databases are reachable, for example inside the `nexusd`
 container:

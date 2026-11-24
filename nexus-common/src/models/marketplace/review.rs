@@ -6,8 +6,8 @@ use crate::db::kv::{
     put_field_if_exists, put_field_if_newer, RedisResult, SortOrder, VersionedWrite,
 };
 use crate::db::{
-    exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, queries, GraphResult,
-    OperationOutcome, RedisOps,
+    exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, fetch_key_from_graph,
+    queries, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
 use crate::types::Pagination;
@@ -173,18 +173,23 @@ impl ReviewDetails {
     }
 
     /// Stores the instants derived from this review's timestamp strings, only
-    /// while the edge still carries those strings.
-    pub async fn store_instants(&self) -> ModelResult<()> {
-        exec_single_row(queries::put::set_review_instants(
-            &self.reviewer_id,
-            &self.review_id,
-            &self.created_at,
-            &self.updated_at,
-            rfc3339_millis(&self.created_at),
-            rfc3339_millis(&self.updated_at),
-        ))
+    /// while the edge still carries those strings. Returns whether they were
+    /// stored: `false` when the edge was edited since these strings were read
+    /// (it keeps its own instants) or no longer exists.
+    pub async fn store_instants(&self) -> ModelResult<bool> {
+        let fresh = fetch_key_from_graph::<Option<bool>>(
+            queries::put::set_review_instants(
+                &self.reviewer_id,
+                &self.review_id,
+                &self.created_at,
+                &self.updated_at,
+                rfc3339_millis(&self.created_at),
+                rfc3339_millis(&self.updated_at),
+            ),
+            "flag",
+        )
         .await?;
-        Ok(())
+        Ok(fresh.flatten().unwrap_or(false))
     }
 
     /// Stores the details JSON and, unless this is an edit of an already
