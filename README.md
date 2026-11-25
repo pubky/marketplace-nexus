@@ -431,8 +431,11 @@ same tag. A copy that arrives after the flip, or again on a migrator rerun,
 finds its edge or marker and changes no count. The epoch is the
 `epoch` property of the `User` node (absent means `v0`). The user's edges are
 read in pages, then every rewrite and the epoch are written in one Neo4j
-transaction. A failure before that commit writes nothing and reruns the whole
-flip on the user's next `social/v1` profile PUT. For a user already in the
+transaction. For a user already in the graph, a failure before that commit
+writes nothing and reruns the whole flip on the user's next `social/v1` profile
+PUT. A user new to the graph is created from the profile and then given the
+epoch, in two writes; a failure between them leaves the new user at `v0` until
+their next `social/v1` profile PUT runs the flip again. For a user already in the
 graph the profile is read after the commit, as in `pubky-nexus`, so a profile
 that is gone or rejected leaves them at `v1` with the profile they had, and
 their next profile PUT is an ordinary edit. The user's other events in between
