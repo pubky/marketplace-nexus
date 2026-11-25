@@ -140,6 +140,9 @@ async fn a_pubky_app_seller_migrates_to_social_v1() -> Result<()> {
         listing_taggers(&seller_id, &listing_id, &listing_label).await?,
         1
     );
+    // A social/v1 write with no pubky.app counterpart is not read before the flip either
+    follow(&mut test, &seller_kp, &other_id).await?;
+    assert!(!follows_edge(&seller_id, &other_id).await?);
 
     // The profile, written last, flips the seller
     test.put(
