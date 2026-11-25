@@ -21,7 +21,9 @@
 use crate::events::handlers;
 use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use crate::events::social_v1;
-use nexus_common::db::{fetch_all_rows_from_graph, fetch_key_from_graph, queries, GraphError};
+use nexus_common::db::{
+    exec_single_row, fetch_all_rows_from_graph, fetch_key_from_graph, queries, GraphError,
+};
 use nexus_common::models::event::{Event, EventProcessorError};
 use nexus_common::models::user::{Epoch, UserDetails};
 use pubky_app_specs::traits::HashId as _;
@@ -205,14 +207,14 @@ async fn rekey_moderation_markers(moderator_id: &PubkyId) -> Result<(), EventPro
         }
     }
     if !moderated_users.is_empty() {
-        nexus_common::db::exec_single_row(queries::social_v1::rekey_moderated_user_markers(
+        exec_single_row(queries::social_v1::rekey_moderated_user_markers(
             moderator_id,
             moderated_users,
         ))
         .await?;
     }
     if !excluded_reviewers.is_empty() {
-        nexus_common::db::exec_single_row(queries::social_v1::rekey_excluded_reviewer_markers(
+        exec_single_row(queries::social_v1::rekey_excluded_reviewer_markers(
             moderator_id,
             excluded_reviewers,
         ))

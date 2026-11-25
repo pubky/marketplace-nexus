@@ -63,7 +63,10 @@ impl Moderation {
                 warn!("Moderation tag '{label}' on {tagged_uri} not applied: social/v1 files are not indexed here");
                 return Ok(());
             }
-            TaggedResource::Prohibited(_) | TaggedResource::Unindexed => return Ok(()),
+            TaggedResource::Prohibited(_) | TaggedResource::Unindexed => {
+                warn!("Moderation tag '{label}' on {tagged_uri} not applied: it names nothing this indexer removes");
+                return Ok(());
+            }
         };
         let user_id = parsed_uri.user_id;
 
