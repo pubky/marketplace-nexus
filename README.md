@@ -396,7 +396,10 @@ The watcher reads three public objects of
 `/pub/social/v1/profile.json`, `/pub/social/v1/follows/{key}.json` and
 `/pub/social/v1/tags/{hash}.json`, each checked by the spec reader. Social v1
 posts, files and feeds are served by the social Nexus and skipped here, and
-`/priv/` paths never reach the event stream's handlers.
+`/priv/` paths never reach the event stream's handlers. A migrated profile's
+`image` is a `social/v1/files` address this index holds no file for, so
+`/static/avatar/{user_id}` answers 404 for it, as for any image that is not an
+indexed `pubky.app` file; clients load that avatar from the social Nexus.
 
 Every user is read through one epoch, as in `pubky/pubky-nexus`:
 
@@ -418,7 +421,10 @@ to the id of the user's `social/v1` copy, so a later `social/v1` untag finds
 them: the user's tags on users (written on `pubky.app/profile.json`) and on
 posts, and, when the user is the moderator, its `ModeratedUser` and
 `ExcludedReviewer` markers. Tags and markers on listings, shops and reviews
-keep their id, because the migrator keeps those addresses. The epoch is the
+keep their id, because the migrator keeps those addresses. A test checks each
+of these ids against the file `pubky-social-specs`' migrator writes for the
+same tag. A copy that arrives after the flip, or again on a migrator rerun,
+finds its edge or marker and changes no count. The epoch is the
 `epoch` property of the `User` node (absent means `v0`). The flip reruns from
 the start on the next `social/v1` profile PUT if it fails part way.
 
