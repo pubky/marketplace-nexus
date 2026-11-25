@@ -51,11 +51,13 @@ pub async fn user_avatar_handler(
         return Err(Error::FileNotFound {});
     };
 
-    // 3. Parse user_id + file_id from the "pubky://owner_id/file_id" style URI
-    let (owner_id, file_id) =
-        FileDetails::file_key_from_uri(&image_uri).ok_or(Error::InternalServerError {
-            source: format!("Invalid file URI: {image_uri}").into(),
-        })?;
+    // 3. Parse user_id + file_id from the "pubky://owner_id/file_id" style URI. Only
+    // `pubky.app` files are indexed here: a `social/v1/files` image, a web URL or any other
+    // address the profile holds has no avatar on this server.
+    let Some((owner_id, file_id)) = FileDetails::file_key_from_uri(&image_uri) else {
+        debug!("Avatar of {user_id} is not a pubky.app file: {image_uri}");
+        return Err(Error::FileNotFound {});
+    };
 
     // 4. Look up FileDetails in Redis/Neo4j using get_by_ids
     let file_list = FileDetails::get_by_ids(&[&[&owner_id, &file_id]]).await?;

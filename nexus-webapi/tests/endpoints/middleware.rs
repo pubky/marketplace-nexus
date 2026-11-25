@@ -95,13 +95,17 @@ async fn index_media_file(
 }
 
 async fn index_avatar_for(user_id: &str, file: &FileDetails) -> Result<()> {
+    index_profile_image(user_id, &file.uri).await
+}
+
+async fn index_profile_image(user_id: &str, image: &str) -> Result<()> {
     let user = UserDetails {
         name: "Router Avatar".to_string(),
         bio: None,
         id: PubkyId::try_from(user_id).map_err(anyhow::Error::msg)?,
         links: None,
         status: None,
-        image: Some(file.uri.clone()),
+        image: Some(image.to_string()),
         indexed_at: 0,
     };
     user.put_to_graph().await?;
@@ -462,5 +466,36 @@ async fn test_avatar_declared_type_mismatch_returns_404_with_or_without_slots() 
 
     assert_eq!(free_status, StatusCode::NOT_FOUND);
     assert_eq!(held_status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A profile image this server holds no file for, such as a migrated user's
+/// `social/v1/files` image, is a missing avatar, not a server error.
+#[tokio_shared_rt::test(shared)]
+async fn test_avatar_of_an_image_that_is_not_an_indexed_file_returns_404() -> Result<()> {
+    let state = media_router_state().await;
+    let profile_id = Keypair::random().public_key().to_z32();
+    let images = [
+        format!("pubky://{profile_id}/pub/social/v1/files/8Z8CWH8NVYQY39ZEBFGKQWWEKG.png"),
+        "https://example.com/avatar.png".to_string(),
+        format!("pubky://{profile_id}/pub/pubky.app/posts/0032SSN7Q4EVG"),
+    ];
+    let mut statuses = Vec::new();
+    for image in &images {
+        index_profile_image(&profile_id, image).await?;
+        let response = media_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/static/avatar/{profile_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        statuses.push((image.clone(), response.status()));
+    }
+    UserDetails::delete(&profile_id).await?;
+
+    for (image, status) in statuses {
+        assert_eq!(status, StatusCode::NOT_FOUND, "{image}");
+    }
     Ok(())
 }
