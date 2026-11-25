@@ -14,25 +14,26 @@
 //! | `ModeratedUser`, `ExcludedReviewer` marker | `pubky.app/profile.json` | hash of `social/v1/profile.json` |
 //! | Listing and review markers | the marketplace address | kept |
 //!
-//! Follows are keyed by the two users and need no rewrite. Every step pages or batches through
-//! the user's records and reruns to the same result, so a flip that fails part way leaves the
-//! user at `v0` and their next `social/v1` profile PUT runs it again.
+//! Follows are keyed by the two users and need no rewrite. The user's edges are read in keyset
+//! pages and their markers in one read; every rewrite and the epoch are then written by one
+//! statement, one transaction, so a flip that fails leaves nothing half rewritten: the user
+//! stays at `v0` with their `pubky.app` ids, and their next `social/v1` profile PUT runs it again.
 
 use crate::events::handlers;
 use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
 use crate::events::social_v1;
-use nexus_common::db::{
-    exec_single_row, fetch_all_rows_from_graph, fetch_key_from_graph, queries, GraphError,
-};
+use nexus_common::db::queries::social_v1::FlipRewrite;
+use nexus_common::db::{fetch_all_rows_from_graph, fetch_key_from_graph, queries, GraphError};
 use nexus_common::models::event::{Event, EventProcessorError};
 use nexus_common::models::user::{Epoch, UserDetails};
 use pubky_app_specs::traits::HashId as _;
 use pubky_app_specs::{ParsedUri, PubkyAppTag, PubkyId, Resource};
 use pubky_social_specs::traits::HashId as _;
 use pubky_social_specs::PubkySocialTag;
+use std::collections::HashSet;
 use tracing::{debug, info, warn};
 
-/// `TAGGED` edges read and rewritten per batch.
+/// `TAGGED` edges read per keyset page.
 const EDGE_BATCH: usize = 500;
 
 /// Flips the user of `event`, a `social/v1` profile PUT of a user at `v0`.
@@ -73,12 +74,23 @@ pub async fn put_profile(event: &Event) -> Result<(), EventProcessorError> {
     .await
 }
 
-/// Migrates what the graph holds for `user_id` at `pubky.app` to its `social/v1` form, then
-/// writes the epoch. The user's node must exist.
+/// Migrates what the graph holds for `user_id` at `pubky.app` to its `social/v1` form and
+/// writes the epoch, in one transaction. The user's node must exist.
 pub async fn move_to_v1(user_id: &PubkyId) -> Result<(), EventProcessorError> {
-    rekey_tag_edges(user_id).await?;
-    rekey_moderation_markers(user_id).await?;
-    Epoch::set_v1_in_graph(user_id).await?;
+    let (moderated_users, excluded_reviewers) = marker_changes(user_id).await?;
+    let rewrite = FlipRewrite {
+        edges: tag_edge_changes(user_id).await?,
+        moderated_users,
+        excluded_reviewers,
+    };
+    let changed =
+        fetch_key_from_graph::<i64>(queries::social_v1::flip_to_v1(user_id, rewrite), "changed")
+            .await?;
+    if changed.unwrap_or(0) == 0 {
+        return Err(EventProcessorError::generic(format!(
+            "User {user_id} is not in the graph; its epoch cannot move to v1"
+        )));
+    }
     info!(%user_id, "User flipped to v1");
     Ok(())
 }
@@ -101,7 +113,10 @@ enum EdgeTarget {
     },
 }
 
-async fn rekey_tag_edges(user_id: &PubkyId) -> Result<(), EventProcessorError> {
+/// `[edge element id, id it holds, new id]` for every edge of `user_id` on a user or a post
+/// whose id the flip changes, read in keyset pages of [`EDGE_BATCH`].
+async fn tag_edge_changes(user_id: &PubkyId) -> Result<Vec<Vec<String>>, EventProcessorError> {
+    let mut changes = Vec::new();
     let mut after = String::new();
     loop {
         let rows = fetch_all_rows_from_graph(queries::social_v1::tagger_social_edges_after(
@@ -109,10 +124,9 @@ async fn rekey_tag_edges(user_id: &PubkyId) -> Result<(), EventProcessorError> {
         ))
         .await?;
         let Some(last) = rows.last() else {
-            return Ok(());
+            return Ok(changes);
         };
         after = last.get::<String>("edge").map_err(GraphError::from)?;
-        let mut changes = Vec::new();
         for row in &rows {
             let required = |key: &str| row.get::<String>(key).map_err(GraphError::from);
             let target = match required("kind")?.as_str() {
@@ -130,15 +144,8 @@ async fn rekey_tag_edges(user_id: &PubkyId) -> Result<(), EventProcessorError> {
                 target,
             };
             if let Some(new_id) = flipped_edge_id(user_id, &tag) {
-                changes.push(vec![required("edge")?, new_id]);
+                changes.push(vec![required("edge")?, tag.id, new_id]);
             }
-        }
-        if !changes.is_empty() {
-            fetch_key_from_graph::<i64>(
-                queries::social_v1::set_tagger_edge_ids(user_id, changes),
-                "changed",
-            )
-            .await?;
         }
     }
 }
@@ -189,7 +196,11 @@ fn flipped_edge_id(owner: &PubkyId, tag: &StoredTag) -> Option<String> {
     }
 }
 
-async fn rekey_moderation_markers(moderator_id: &PubkyId) -> Result<(), EventProcessorError> {
+/// The `ModeratedUser` and the `ExcludedReviewer` rows of [`FlipRewrite`] for the markers
+/// `moderator_id`'s tags wrote.
+async fn marker_changes(
+    moderator_id: &PubkyId,
+) -> Result<(Vec<Vec<String>>, Vec<Vec<String>>), EventProcessorError> {
     let rows =
         fetch_all_rows_from_graph(queries::social_v1::moderator_user_markers(moderator_id)).await?;
     let mut moderated_users = Vec::new();
@@ -200,27 +211,34 @@ async fn rekey_moderation_markers(moderator_id: &PubkyId) -> Result<(), EventPro
         let Some((new_id, new_uri)) = flipped_marker(&tag_id, &uri, &label) else {
             continue;
         };
-        let change = vec![tag_id, new_id, new_uri];
+        let change = (tag_id, new_id, new_uri);
         match required("kind")?.as_str() {
             "ModeratedUser" => moderated_users.push(change),
             _ => excluded_reviewers.push(change),
         }
     }
-    if !moderated_users.is_empty() {
-        exec_single_row(queries::social_v1::rekey_moderated_user_markers(
-            moderator_id,
-            moderated_users,
-        ))
-        .await?;
-    }
-    if !excluded_reviewers.is_empty() {
-        exec_single_row(queries::social_v1::rekey_excluded_reviewer_markers(
-            moderator_id,
-            excluded_reviewers,
-        ))
-        .await?;
-    }
-    Ok(())
+    Ok((
+        marker_rows(moderated_users),
+        marker_rows(excluded_reviewers),
+    ))
+}
+
+/// `[old tag id, new tag id, new uri, "move" or "drop"]` for each `(old, new, uri)` marker
+/// change: the first change to a new tag id moves its marker there, every later one drops its
+/// marker, as one statement cannot move two markers to one `(moderator_id, tag_id)`.
+fn marker_rows(changes: Vec<(String, String, String)>) -> Vec<Vec<String>> {
+    let mut taken = HashSet::new();
+    changes
+        .into_iter()
+        .map(|(old, new, uri)| {
+            let action = if taken.insert(new.clone()) {
+                "move"
+            } else {
+                "drop"
+            };
+            vec![old, new, uri, action.to_string()]
+        })
+        .collect()
 }
 
 /// The tag id and uri a user marker takes after its moderator's flip: the moderator's tag on a
@@ -381,6 +399,26 @@ mod tests {
             flipped_marker(&pubky_app_tag_id(&listing, LABEL), &listing, LABEL),
             None
         );
+    }
+
+    #[test]
+    fn only_the_first_marker_moving_to_a_tag_id_moves_and_the_rest_drop() {
+        let change = |old: &str, new: &str| (old.to_string(), new.to_string(), "uri".to_string());
+        let row = |old: &str, new: &str, action: &str| {
+            vec![old, new, "uri", action]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            marker_rows(vec![change("a", "x"), change("b", "y"), change("c", "x")]),
+            vec![
+                row("a", "x", "move"),
+                row("b", "y", "move"),
+                row("c", "x", "drop")
+            ]
+        );
+        assert!(marker_rows(Vec::new()).is_empty());
     }
 
     /// The tag file the migrator writes for the `pubky.app` tag on `target`, read back as the
