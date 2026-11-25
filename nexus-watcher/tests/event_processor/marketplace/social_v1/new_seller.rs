@@ -4,7 +4,7 @@ use super::{graph_epoch, graph_user_exists, profile_path, social_profile};
 use crate::event_processor::utils::watcher::{HomeserverPath, WatcherTest};
 use anyhow::Result;
 use nexus_common::models::marketplace::ShopDetails;
-use nexus_common::models::user::UserDetails;
+use nexus_common::models::user::{UserDetails, USER_DELETED_SENTINEL};
 use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::{traits::HasPath, PubkyAppListingCondition, PubkyAppShop, PubkyAppUser};
 use pubky_social_specs::{PubkySocialUser, PubkySocialUserLink};
@@ -93,10 +93,14 @@ async fn a_social_v1_only_seller_is_indexed_and_sells() -> Result<()> {
     assert!(ShopDetails::get_from_graph(&seller_id).await?.is_none());
     test.del(&seller_kp, &PubkyAppUser::hs_path()).await?;
     assert!(UserDetails::get_by_id(&seller_id).await?.is_some());
-    // The social/v1 profile DEL is the one that removes the user
+    // The social/v1 profile DEL is the one that deletes the user, who stays a v1 tombstone
     test.del(&seller_kp, &profile_path()).await?;
-    assert!(UserDetails::get_by_id(&seller_id).await?.is_none());
-    assert!(!graph_user_exists(&seller_id).await?);
+    assert_eq!(
+        UserDetails::get_by_id(&seller_id).await?.unwrap().name,
+        USER_DELETED_SENTINEL
+    );
+    assert!(graph_user_exists(&seller_id).await?);
+    assert_eq!(graph_epoch(&seller_id).await?.as_deref(), Some("v1"));
     Ok(())
 }
 

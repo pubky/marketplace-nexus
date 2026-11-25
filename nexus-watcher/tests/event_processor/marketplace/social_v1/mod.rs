@@ -2,6 +2,7 @@
 //! `pubky.app` until their `social/v1/profile.json` flips them, then through `social/v1` only,
 //! while their marketplace records index in every epoch.
 
+mod flip_transaction;
 mod follows;
 mod invalid;
 mod migration;
@@ -9,16 +10,20 @@ mod migrator_copies;
 mod moderation;
 mod new_seller;
 mod tags;
+mod tombstones;
 
 use crate::event_processor::utils::default_moderation_tests;
-use crate::event_processor::utils::watcher::WatcherTest;
+use crate::event_processor::utils::watcher::{HomeserverHashIdPath, HomeserverPath, WatcherTest};
 use anyhow::Result;
+use chrono::Utc;
 use nexus_common::db::fetch_key_from_graph;
 use nexus_common::db::graph::Query;
 use nexus_common::models::event::EventProcessorError;
+use nexus_common::models::user::{UserDetails, USER_DELETED_SENTINEL};
 use nexus_watcher::events::Moderation;
 use pubky::{Keypair, ResourcePath};
-use pubky_app_specs::PubkyId;
+use pubky_app_specs::traits::HasIdPath as _;
+use pubky_app_specs::{user_uri_builder, PubkyAppFollow, PubkyAppTag, PubkyAppUser, PubkyId};
 use pubky_social_specs::traits::{HasIdPath, HasPath, HashId};
 use pubky_social_specs::{PubkySocialFollow, PubkySocialTag, PubkySocialUser};
 use std::sync::Arc;
@@ -149,6 +154,68 @@ pub(super) fn own_moderator(test: &mut WatcherTest) -> (Keypair, Arc<Moderation>
     });
     test.event_processor_runner.moderation = moderation.clone();
     (keypair, moderation)
+}
+
+/// Asserts the user is a deleted user at `v1`: their node stays, with its epoch, and their
+/// profile is the `[DELETED]` tombstone.
+pub(super) async fn assert_v1_tombstone(user_id: &str) -> Result<()> {
+    assert!(
+        graph_user_exists(user_id).await?,
+        "the node of {user_id} stays"
+    );
+    assert_eq!(graph_epoch(user_id).await?.as_deref(), Some("v1"));
+    let details = UserDetails::get_by_id(user_id)
+        .await?
+        .expect("the tombstone profile is indexed");
+    assert_eq!(details.name, USER_DELETED_SENTINEL);
+    Ok(())
+}
+
+/// Writes, then deletes, what a client that predates the migration writes for `user_kp` under
+/// `pubky.app`: a profile, a follow of `other_id` and a tag on `other_id`'s profile. Asserts
+/// none is read: the user stays the `v1` tombstone.
+pub(super) async fn assert_stale_pubky_app_writes_ignored(
+    test: &mut WatcherTest,
+    user_kp: &Keypair,
+    other_id: &str,
+) -> Result<()> {
+    let user_id = user_kp.public_key().to_z32();
+    let label = format!("stale{}", Utc::now().timestamp_micros() % 1_000_000);
+    test.put(
+        user_kp,
+        &PubkyAppUser::hs_path(),
+        PubkyAppUser {
+            name: "Watcher:SocialV1:StaleClient".to_string(),
+            bio: None,
+            image: None,
+            links: None,
+            status: None,
+        },
+    )
+    .await?;
+    let follow_path: ResourcePath = PubkyAppFollow::create_path(other_id).parse()?;
+    test.put(
+        user_kp,
+        &follow_path,
+        PubkyAppFollow {
+            created_at: Utc::now().timestamp_millis(),
+        },
+    )
+    .await?;
+    let stale_tag = PubkyAppTag {
+        uri: user_uri_builder(other_id.to_string()),
+        label: label.clone(),
+        created_at: Utc::now().timestamp_millis(),
+    };
+    test.put(user_kp, &stale_tag.hs_path(), &stale_tag).await?;
+    assert_v1_tombstone(&user_id).await?;
+    assert!(!follows_edge(&user_id, other_id).await?);
+    assert!(tag_edge_ids(&user_id, &label).await?.is_empty());
+
+    test.del(user_kp, &stale_tag.hs_path()).await?;
+    test.del(user_kp, &follow_path).await?;
+    test.del(user_kp, &PubkyAppUser::hs_path()).await?;
+    assert_v1_tombstone(&user_id).await
 }
 
 /// Asserts `result` is the error whose message starts with `kind` (`SpecValidation`,

@@ -1,7 +1,10 @@
 use super::super::moderation::{assert_hidden, assert_listed, seller_profile, MODERATED_LABEL};
 use super::super::utils::{test_listing, test_shop};
-use super::{create_social_user, graph_epoch, own_moderator, profile_path, tag};
-use crate::event_processor::utils::watcher::{HomeserverHashIdPath, WatcherTest};
+use super::{
+    assert_v1_tombstone, create_social_user, graph_epoch, graph_user_exists, own_moderator,
+    profile_path, social_profile, tag,
+};
+use crate::event_processor::utils::watcher::{HomeserverHashIdPath, HomeserverPath, WatcherTest};
 use anyhow::Result;
 use chrono::Utc;
 use nexus_common::db::fetch_key_from_graph;
@@ -16,6 +19,7 @@ use pubky::{Keypair, ResourcePath};
 use pubky_app_specs::traits::{HasPath, HashId};
 use pubky_app_specs::{
     listing_uri_builder, user_uri_builder, PubkyAppListingCondition, PubkyAppShop, PubkyAppTag,
+    PubkyAppUser,
 };
 use pubky_social_specs::traits::HashId as _;
 
@@ -187,7 +191,7 @@ async fn a_hidden_social_v1_seller_is_restored_from_their_social_v1_profile() ->
     .await?;
     assert!(ModeratedUser::is_moderated(&seller_id).await?);
     assert_hidden(&seller_id, &listing_id).await;
-    assert!(UserDetails::get_by_id(&seller_id).await?.is_none());
+    assert_v1_tombstone(&seller_id).await?;
 
     test.del(&moderator_kp, &takedown_path).await?;
     assert!(!ModeratedUser::is_moderated(&seller_id).await?);
@@ -201,6 +205,148 @@ async fn a_hidden_social_v1_seller_is_restored_from_their_social_v1_profile() ->
 
     test.del(&seller_kp, &listing_path).await?;
     test.del(&seller_kp, &shop_path).await?;
+    test.del(&seller_kp, &profile_path()).await?;
+    test.del(&moderator_kp, &profile_path()).await?;
+    Ok(())
+}
+
+/// Writes a `social/v1` profile the reader refuses for `keypair`, as a broken migrator would,
+/// and lets the watcher read its event.
+async fn put_invalid_social_profile(test: &mut WatcherTest, keypair: &Keypair) -> Result<()> {
+    test.create_file_from_body(keypair, &profile_path().to_string(), b"not json".to_vec())
+        .await?;
+    test.ensure_event_processing_complete().await
+}
+
+/// A `pubky.app` seller whose node went with their takedown, and whose `social/v1` profile
+/// then fails the reader, is restored from their `pubky.app` profile when the takedown is
+/// lifted, at `v0`, shop and listing included: an invalid `social/v1` profile is not there to
+/// restore from, and never strands the release.
+#[tokio_shared_rt::test(shared)]
+async fn a_hidden_pubky_app_seller_with_an_invalid_social_v1_profile_is_restored_from_pubky_app(
+) -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let (moderator_kp, _) = own_moderator(&mut test);
+    let moderator_id = create_social_user(
+        &mut test,
+        &moderator_kp,
+        "Watcher:SocialV1:InvalidV0Moderator",
+    )
+    .await?;
+    let (seller_kp, seller_id, listing_id, listing_path, shop_path) =
+        seller_with_listing(&mut test, "Watcher:SocialV1:InvalidV0Seller").await?;
+
+    let (_, takedown_path) = tag(
+        &mut test,
+        &moderator_kp,
+        &user_uri_builder(seller_id.clone()),
+        MODERATED_LABEL,
+    )
+    .await?;
+    assert!(ModeratedUser::is_moderated(&seller_id).await?);
+    assert_hidden(&seller_id, &listing_id).await;
+    assert!(
+        !graph_user_exists(&seller_id).await?,
+        "the node of a v0 seller nothing points at goes with the takedown"
+    );
+    put_invalid_social_profile(&mut test, &seller_kp).await?;
+    assert!(!graph_user_exists(&seller_id).await?);
+
+    test.del(&moderator_kp, &takedown_path).await?;
+    assert!(!ModeratedUser::is_moderated(&seller_id).await?);
+    assert_eq!(
+        moderator_markers("ModeratedUser", &moderator_id, "user_id", &seller_id).await?,
+        0
+    );
+    let details = UserDetails::get_by_id(&seller_id)
+        .await?
+        .expect("the seller is restored from pubky.app");
+    assert_eq!(details.name, "Watcher:SocialV1:InvalidV0Seller");
+    assert_eq!(graph_epoch(&seller_id).await?, None, "the seller stays v0");
+    assert!(ShopDetails::get_from_graph(&seller_id).await?.is_some());
+    assert_listed(&seller_id, &listing_id).await;
+
+    test.del(&seller_kp, &listing_path).await?;
+    test.del(&seller_kp, &shop_path).await?;
+    test.del(&seller_kp, &profile_path()).await?;
+    test.cleanup_user(&seller_kp).await?;
+    test.del(&moderator_kp, &profile_path()).await?;
+    Ok(())
+}
+
+/// A seller at `v1` whose `social/v1` profile fails the reader while they are hidden has no
+/// profile to restore: lifting the takedown completes, the marker is gone and they are no
+/// longer moderated, and they stay the `v1` tombstone, never restored from `pubky.app`, until
+/// their next valid `social/v1` profile.
+#[tokio_shared_rt::test(shared)]
+async fn a_hidden_social_v1_seller_with_an_invalid_profile_is_released_as_a_tombstone() -> Result<()>
+{
+    let mut test = WatcherTest::setup().await?;
+    let (moderator_kp, _) = own_moderator(&mut test);
+    let moderator_id = create_social_user(
+        &mut test,
+        &moderator_kp,
+        "Watcher:SocialV1:InvalidV1Moderator",
+    )
+    .await?;
+    let seller_kp = Keypair::random();
+    let seller_id =
+        create_social_user(&mut test, &seller_kp, "Watcher:SocialV1:InvalidV1Seller").await?;
+    let shop_path: ResourcePath = PubkyAppShop::create_path().parse()?;
+    test.put(&seller_kp, &shop_path, &test_shop(&seller_id))
+        .await?;
+    let listing = test_listing(
+        &seller_id,
+        "Hidden with an invalid profile",
+        "fashion",
+        PubkyAppListingCondition::New,
+        5_000,
+    );
+    let (listing_id, listing_path) = test.create_listing(&seller_kp, &listing).await?;
+    assert_listed(&seller_id, &listing_id).await;
+
+    let (_, takedown_path) = tag(
+        &mut test,
+        &moderator_kp,
+        &format!("pubky://{seller_id}"),
+        MODERATED_LABEL,
+    )
+    .await?;
+    assert!(ModeratedUser::is_moderated(&seller_id).await?);
+    assert_v1_tombstone(&seller_id).await?;
+    put_invalid_social_profile(&mut test, &seller_kp).await?;
+    test.put(
+        &seller_kp,
+        &PubkyAppUser::hs_path(),
+        seller_profile("Watcher:SocialV1:InvalidV1Stale"),
+    )
+    .await?;
+
+    test.del(&moderator_kp, &takedown_path).await?;
+    assert!(!ModeratedUser::is_moderated(&seller_id).await?);
+    assert_eq!(
+        moderator_markers("ModeratedUser", &moderator_id, "user_id", &seller_id).await?,
+        0
+    );
+    assert_v1_tombstone(&seller_id).await?;
+    assert_hidden(&seller_id, &listing_id).await;
+    assert!(ShopDetails::get_from_graph(&seller_id).await?.is_none());
+
+    test.put(
+        &seller_kp,
+        &profile_path(),
+        social_profile("Watcher:SocialV1:InvalidV1Fixed"),
+    )
+    .await?;
+    assert_eq!(
+        UserDetails::get_by_id(&seller_id).await?.unwrap().name,
+        "Watcher:SocialV1:InvalidV1Fixed"
+    );
+    assert_eq!(graph_epoch(&seller_id).await?.as_deref(), Some("v1"));
+
+    test.del(&seller_kp, &listing_path).await?;
+    test.del(&seller_kp, &shop_path).await?;
+    test.del(&seller_kp, &PubkyAppUser::hs_path()).await?;
     test.del(&seller_kp, &profile_path()).await?;
     test.del(&moderator_kp, &profile_path()).await?;
     Ok(())
