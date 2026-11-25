@@ -392,7 +392,8 @@ Redis-only flush keeps it, and a Neo4j wipe is repaired by the replay itself.
 
 The watcher reads three public objects of
 [`pubky-social-specs`](https://github.com/pubky/pubky-social-specs) 1.0
-(`1.0.0-rc.2`, the same bytes as `1.0.0`) besides the `pubky.app` ones:
+(`1.0.0-rc.2`, the latest release; the unreleased `1.0.0` changes no stored
+bytes) besides the `pubky.app` ones:
 `/pub/social/v1/profile.json`, `/pub/social/v1/follows/{key}.json` and
 `/pub/social/v1/tags/{hash}.json`, each checked by the spec reader. Social v1
 posts, files and feeds are served by the social Nexus and skipped here, and
@@ -412,7 +413,10 @@ Every user is read through one epoch, as in `pubky/pubky-nexus`:
 - A user at `v1` is read through `social/v1` only: their `pubky.app` profile,
   follows, tags, posts and files are ignored, PUT and DEL. A client that
   deletes a migrated object deletes both copies, so the `social/v1` DEL
-  applies it.
+  applies it. A user at `v1` who deletes their profile, or whom the moderator
+  hides, keeps their `User` node as the `[DELETED]` tombstone with its epoch,
+  even with nothing pointing at it (`pubky-nexus` removes such a node), so
+  their stale `pubky.app` writes stay ignored.
 - Marketplace records under `/pub/pubky.app/marketplace/` have no `social/v1`
   form and are read for users at either epoch.
 
@@ -425,17 +429,27 @@ keep their id, because the migrator keeps those addresses. A test checks each
 of these ids against the file `pubky-social-specs`' migrator writes for the
 same tag. A copy that arrives after the flip, or again on a migrator rerun,
 finds its edge or marker and changes no count. The epoch is the
-`epoch` property of the `User` node (absent means `v0`). The flip reruns from
-the start on the next `social/v1` profile PUT if it fails part way.
+`epoch` property of the `User` node (absent means `v0`). The user's edges are
+read in pages, then every rewrite and the epoch are written in one Neo4j
+transaction. A failure before that commit writes nothing and reruns the whole
+flip on the user's next `social/v1` profile PUT. For a user already in the
+graph the profile is read after the commit, as in `pubky-nexus`, so a profile
+that is gone or rejected leaves them at `v1` with the profile they had, and
+their next profile PUT is an ordinary edit. The user's other events in between
+are not deferred.
 
 Tags take their target from either epoch: a user is named by either profile
 address or the bare key, a post by either post address, and listings, shops
-and reviews by their marketplace address. A tag on a follow, mute, bookmark,
-feed, tag, last-read or private address is refused, as is any record the spec
-reader rejects; neither is retried. The moderator's `social/v1` tags take down
-and restore listings, users and reviews as its `pubky.app` tags do, and a
-takedown it placed through `pubky.app` holds across its own migration until
-it deletes the `social/v1` copy.
+and reviews by their marketplace address. An ordinary tag on a follow, mute,
+bookmark, feed, tag, last-read or private address is refused, as is any record
+the spec reader rejects; neither is retried (the moderator's tag on a tag
+address deletes that tag). The moderator's `social/v1` tags take down and
+restore listings, users and reviews as its `pubky.app` tags do, and a takedown
+it placed through `pubky.app` holds across its own migration until it deletes
+the `social/v1` copy. Lifting a takedown restores a user from their
+`social/v1` profile; a profile that is gone or that the reader rejects is not
+there, so a user at `v0` or out of the graph is restored from `pubky.app`, and
+a user at `v1` stays the tombstone until their next valid profile.
 
 `pubky-social-specs` 1.0 needs `pubky` 0.10, which cannot share a build with
 the workspace's `pubky` 0.9.3 (their `ed25519` pins conflict).

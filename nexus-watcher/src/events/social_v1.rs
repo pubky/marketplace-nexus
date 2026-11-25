@@ -80,8 +80,6 @@ pub fn resolve_tag_target(uri: &str) -> TaggedResource {
             SocialResource::Tag(tag_id) => Resource::Tag(tag_id),
             SocialResource::File(_) => return TaggedResource::SocialFile,
             SocialResource::Follow(_) => return TaggedResource::Prohibited("follow"),
-            SocialResource::Mute(_) => return TaggedResource::Prohibited("mute"),
-            SocialResource::Bookmark(_) => return TaggedResource::Prohibited("bookmark"),
             SocialResource::Feed(_) => return TaggedResource::Prohibited("feed"),
             SocialResource::Foreign { ref namespace, .. } if namespace == PUBKY_APP_NAMESPACE => {
                 return resolve_pubky_app(uri)

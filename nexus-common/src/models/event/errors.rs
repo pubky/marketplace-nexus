@@ -33,8 +33,9 @@ pub enum EventProcessorError {
     #[error("SpecValidation: {0}")]
     SpecValidation(String),
 
-    /// A tag whose target is never indexed as a tag: a follow, mute, bookmark, feed, tag,
-    /// last-read or private address, or a resource this indexer keeps no tags for. Never
+    /// An ordinary tag whose target is never indexed as a tag: a follow, mute, bookmark, feed,
+    /// tag, last-read or private address, or a resource this indexer keeps no tags for. The
+    /// configured moderator's tag on a tag address is not one: it deletes that tag. Never
     /// retried.
     #[error("UnsupportedTarget: {0}")]
     UnsupportedTarget(String),
