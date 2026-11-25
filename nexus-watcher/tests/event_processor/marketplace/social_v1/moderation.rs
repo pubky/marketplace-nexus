@@ -4,6 +4,8 @@ use super::{create_social_user, graph_epoch, own_moderator, profile_path, tag};
 use crate::event_processor::utils::watcher::{HomeserverHashIdPath, WatcherTest};
 use anyhow::Result;
 use chrono::Utc;
+use nexus_common::db::fetch_key_from_graph;
+use nexus_common::db::graph::Query;
 use nexus_common::models::marketplace::{
     ExcludedReviewer, ModeratedListing, ModeratedUser, ShopDetails,
 };
@@ -16,6 +18,20 @@ use pubky_app_specs::{
     listing_uri_builder, user_uri_builder, PubkyAppListingCondition, PubkyAppShop, PubkyAppTag,
 };
 use pubky_social_specs::traits::HashId as _;
+
+/// The `kind` markers `moderator_id` holds whose `key` property is `value`, counted in the
+/// graph whatever their tag id.
+async fn moderator_markers(kind: &str, moderator_id: &str, key: &str, value: &str) -> Result<i64> {
+    let query = Query::new(
+        "test_moderator_markers",
+        format!(
+            "MATCH (m:{kind} {{moderator_id: $moderator_id, {key}: $value}}) RETURN count(m) AS n"
+        ),
+    )
+    .param("moderator_id", moderator_id)
+    .param("value", value);
+    Ok(fetch_key_from_graph::<i64>(query, "n").await?.unwrap_or(0))
+}
 
 /// A seller with a shop and one listing, published through `pubky.app`.
 async fn seller_with_listing(
@@ -265,6 +281,26 @@ async fn a_takedown_holds_across_the_moderators_migration() -> Result<()> {
             .is_empty()
     );
 
+    // A rerun of the migrator puts both copies again: each finds its marker
+    let (v1_listing_takedown, _) =
+        tag(&mut test, &moderator_kp, &listing_uri, MODERATED_LABEL).await?;
+    test.put(&moderator_kp, &v1_user_takedown_path, &v1_user_takedown)
+        .await?;
+    assert_eq!(
+        v1_listing_takedown.create_id(),
+        v0_listing_takedown.create_id()
+    );
+    assert_eq!(
+        moderator_markers("ModeratedListing", &moderator_id, "listing_id", &listing_id).await?,
+        1
+    );
+    assert_eq!(
+        moderator_markers("ModeratedUser", &moderator_id, "user_id", &user_seller_id).await?,
+        1
+    );
+    assert_hidden(&listing_seller_id, &listing_id).await;
+    assert_hidden(&user_seller_id, &user_listing_id).await;
+
     // The pubky.app DELs no longer lift anything
     test.del(&moderator_kp, &v0_listing_takedown.hs_path())
         .await?;
@@ -280,6 +316,14 @@ async fn a_takedown_holds_across_the_moderators_migration() -> Result<()> {
     test.del(&moderator_kp, &v1_user_takedown_path).await?;
     assert!(!ModeratedUser::is_moderated(&user_seller_id).await?);
     assert_listed(&user_seller_id, &user_listing_id).await;
+    assert_eq!(
+        moderator_markers("ModeratedListing", &moderator_id, "listing_id", &listing_id).await?,
+        0
+    );
+    assert_eq!(
+        moderator_markers("ModeratedUser", &moderator_id, "user_id", &user_seller_id).await?,
+        0
+    );
 
     for (kp, listing, shop) in [
         (&listing_seller_kp, &listing_path, &listing_shop_path),

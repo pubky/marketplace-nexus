@@ -383,6 +383,98 @@ mod tests {
         );
     }
 
+    /// The tag file the migrator writes for the `pubky.app` tag on `target`, read back as the
+    /// id in its `social/v1` path. The `pubky.app` id is the one the watcher stored on the edge.
+    fn migrated_tag_id(target: &str) -> (String, String) {
+        let tag = PubkyAppTag {
+            uri: target.to_string(),
+            label: LABEL.to_string(),
+            created_at: 1_700_000_000_000,
+        };
+        let v0_id = tag.create_id();
+        let bytes = serde_json::to_vec(&tag).unwrap();
+        let ctx = pubky_social_specs::migrate::MigrationCtx::new(
+            pubky_social_specs::PubkyId::try_from(OWNER).unwrap(),
+        );
+        let migrated = pubky_social_specs::migrate::transform(
+            &format!("pub/pubky.app/tags/{v0_id}"),
+            &bytes,
+            &ctx,
+        )
+        .unwrap_or_else(|skipped| panic!("the migrator wrote no file for {target}: {skipped}"));
+        let [(path, _)] = migrated.writes.as_slice() else {
+            panic!(
+                "the migrator wrote {} files for {target}",
+                migrated.writes.len()
+            );
+        };
+        let v1_id = path
+            .strip_prefix("pub/social/v1/tags/")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .unwrap_or_else(|| panic!("not a social/v1 tag path: {path}"));
+        (v0_id, v1_id.to_string())
+    }
+
+    /// The agreement with the migrator: for every target a `pubky.app` tag of this index can
+    /// name, the id the flip leaves on the edge is the id of the file the migrator writes for
+    /// that tag, so the user's `social/v1` untag of the copy finds the edge.
+    #[test]
+    fn every_flipped_edge_takes_the_id_of_the_migrators_copy() {
+        let user = || EdgeTarget::User(OTHER.to_string());
+        let post_of = |author: &str| EdgeTarget::Post {
+            author_id: Some(author.to_string()),
+            post_id: POST_ID.to_string(),
+        };
+        let cases = [
+            (pubky_app_profile_uri(OTHER), Some(user())),
+            (bare_user_uri(OTHER), Some(user())),
+            (
+                pubky_app_specs::post_uri_builder(OTHER.into(), POST_ID.into()),
+                Some(post_of(OTHER)),
+            ),
+            (
+                pubky_app_specs::post_uri_builder(OWNER.into(), POST_ID.into()),
+                Some(post_of(OWNER)),
+            ),
+            (
+                pubky_app_specs::listing_uri_builder(OTHER.into(), POST_ID.into()),
+                None,
+            ),
+            (pubky_app_specs::shop_uri_builder(OTHER.into()), None),
+            (
+                pubky_app_specs::marketplace_review_uri_builder(OTHER.into(), "0".repeat(32)),
+                None,
+            ),
+        ];
+        for (target, edge_target) in cases {
+            let (v0_id, migrated_id) = migrated_tag_id(&target);
+            let flipped = match edge_target {
+                Some(target) => flipped_edge_id(
+                    &owner(),
+                    &StoredTag {
+                        id: v0_id.clone(),
+                        label: LABEL.to_string(),
+                        target,
+                    },
+                )
+                .unwrap_or(v0_id),
+                None => v0_id,
+            };
+            assert_eq!(flipped, migrated_id, "{target}");
+        }
+    }
+
+    /// The same agreement for a moderator's user markers: the takedown on a `pubky.app`
+    /// profile moves to the id of the migrator's copy, and one on a bare key keeps it.
+    #[test]
+    fn every_flipped_marker_takes_the_id_of_the_migrators_copy() {
+        for uri in [pubky_app_profile_uri(OTHER), bare_user_uri(OTHER)] {
+            let (v0_id, migrated_id) = migrated_tag_id(&uri);
+            let flipped = flipped_marker(&v0_id, &uri, LABEL).map_or(v0_id, |(id, _)| id);
+            assert_eq!(flipped, migrated_id, "{uri}");
+        }
+    }
+
     /// The migrator keeps a listing, shop or review address, so the tag file it writes there
     /// has the id the `pubky.app` one had: those records need no rewrite.
     #[test]

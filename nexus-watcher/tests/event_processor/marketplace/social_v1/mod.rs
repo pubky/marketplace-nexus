@@ -5,6 +5,7 @@
 mod follows;
 mod invalid;
 mod migration;
+mod migrator_copies;
 mod moderation;
 mod new_seller;
 mod tags;
