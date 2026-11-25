@@ -19,6 +19,7 @@ use nexus_watcher::events::handlers::tag::{
     del_tagged_target, del_tagged_target_with_hook, TagTarget, TargetTagCleanupHook,
     TargetTagCleanupStep,
 };
+use nexus_watcher::events::social_v1::resolve_tag_target;
 use pubky::Keypair;
 use pubky_app_specs::traits::HashId;
 use pubky_app_specs::{
@@ -26,6 +27,18 @@ use pubky_app_specs::{
     PubkyAppUser, PubkyId,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Indexes `tag` as the watcher indexes a `pubky.app` tag event.
+async fn sync_put_tag(tag: &PubkyAppTag, tagger_id: PubkyId) -> Result<(), EventProcessorError> {
+    nexus_watcher::events::handlers::tag::sync_put(
+        &tag.label,
+        &tag.uri,
+        resolve_tag_target(&tag.uri),
+        tagger_id,
+        tag.create_id(),
+    )
+    .await
+}
 
 /// Fails the cleanup once, as a Redis or graph error would, at one step.
 struct FailOnceAt {
@@ -58,12 +71,7 @@ struct TagLandsAt {
 impl TargetTagCleanupHook for TagLandsAt {
     async fn at(&self, step: TargetTagCleanupStep) -> Result<(), EventProcessorError> {
         if step == self.step && !self.fired.swap(true, Ordering::SeqCst) {
-            nexus_watcher::events::handlers::tag::sync_put(
-                self.tag.clone(),
-                self.tagger_id.clone(),
-                self.tag.create_id(),
-            )
-            .await?;
+            sync_put_tag(&self.tag, self.tagger_id.clone()).await?;
         }
         Ok(())
     }
@@ -630,9 +638,7 @@ async fn a_tag_committed_after_the_final_check_refuses_the_listing_deletion() ->
     assert!(!suggested(&late).await?);
 
     // After the deletion the same tag finds no target and indexes nothing.
-    let after =
-        nexus_watcher::events::handlers::tag::sync_put(tag.clone(), tagger_id, tag.create_id())
-            .await;
+    let after = sync_put_tag(&tag, tagger_id).await;
     assert!(
         matches!(after, Err(EventProcessorError::MissingDependency { .. })),
         "{after:?}"
@@ -694,9 +700,7 @@ async fn a_tag_committed_after_the_final_check_refuses_the_shop_deletion() -> Re
     assert!(taggers.is_empty());
     assert!(!suggested(&late).await?);
 
-    let after =
-        nexus_watcher::events::handlers::tag::sync_put(tag.clone(), tagger_id, tag.create_id())
-            .await;
+    let after = sync_put_tag(&tag, tagger_id).await;
     assert!(
         matches!(after, Err(EventProcessorError::MissingDependency { .. })),
         "{after:?}"
@@ -885,13 +889,9 @@ async fn a_label_tagged_during_the_autocomplete_prune_stays_suggested() -> Resul
     // The label is unused when checked; a profile tag is indexed with it
     // before the prune removes it.
     TagSearch::del_from_index_if_unused_with_hook(&label, async {
-        nexus_watcher::events::handlers::tag::sync_put(
-            tag.clone(),
-            tagger_id.clone(),
-            tag.create_id(),
-        )
-        .await
-        .expect("profile tag indexes");
+        sync_put_tag(&tag, tagger_id.clone())
+            .await
+            .expect("profile tag indexes");
     })
     .await?;
     assert!(suggested(&label).await?, "a used label must stay suggested");

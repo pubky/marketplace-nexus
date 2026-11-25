@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use nexus_common::db::kv::RedisResult;
+use nexus_common::models::event::Event;
+use nexus_common::models::user::Epoch;
 use pubky_app_specs::ParsedUri;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +57,21 @@ impl RetryEvent {
         };
 
         Some(key)
+    }
+
+    /// The index key of `event`. A `pubky.app` event is keyed by its URI as
+    /// [`Self::generate_index_key`] keys it; a `social/v1` event by its user
+    /// and resource behind a `v1:` prefix, so the copies of one resource in the
+    /// two epochs keep separate entries.
+    pub fn generate_index_key_for_event(event: &Event) -> Option<String> {
+        match event.epoch {
+            Epoch::V0 => Self::generate_index_key(&event.uri),
+            Epoch::V1 => Some(format!(
+                "{}:{}",
+                Epoch::V1,
+                Self::generate_index_key_from_uri(&event.parsed_uri)
+            )),
+        }
     }
 
     pub fn generate_index_key_from_uri(event_uri: &ParsedUri) -> String {

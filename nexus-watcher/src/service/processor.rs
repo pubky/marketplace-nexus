@@ -282,15 +282,17 @@ fn extract_retry_event_info(
     error: EventProcessorError,
 ) -> Option<(String, RetryEvent)> {
     let retry_event = match error {
-        EventProcessorError::InvalidEventLine(ref message) => {
-            error!("{}", message);
+        EventProcessorError::InvalidEventLine(ref message)
+        | EventProcessorError::SpecValidation(ref message)
+        | EventProcessorError::UnsupportedTarget(ref message) => {
+            error!("{} {}: {}", event.event_type, event.uri, message);
             return None;
         }
         _ => RetryEvent::new(error),
     };
 
     // Generate a compress index to save in the cache
-    let index = match RetryEvent::generate_index_key(&event.uri) {
+    let index = match RetryEvent::generate_index_key_for_event(event) {
         Some(retry_index) => retry_index,
         None => {
             return None;
