@@ -150,17 +150,18 @@ impl NexusApi {
         config_dir: PathBuf,
         shutdown_rx: Option<Receiver<bool>>,
     ) -> Result<Self, DynError> {
-        match ApiConfig::load(config_dir.join(API_CONFIG_FILE_NAME)).await {
-            Ok(api_config) => {
-                let api_context = ApiContextBuilder::from_config_dir(config_dir)
-                    .api_config(api_config)
-                    .try_build()
-                    .await?;
-
-                NexusApiBuilder::new(api_context).start(shutdown_rx).await
-            }
-            Err(_) => NexusApi::start_from_daemon(config_dir, shutdown_rx).await,
+        let config_path = config_dir.join(API_CONFIG_FILE_NAME);
+        if !config_path.exists() {
+            return NexusApi::start_from_daemon(config_dir, shutdown_rx).await;
         }
+
+        let api_config = ApiConfig::load(config_path).await?;
+        let api_context = ApiContextBuilder::from_config_dir(config_dir)
+            .api_config(api_config)
+            .try_build()
+            .await?;
+
+        NexusApiBuilder::new(api_context).start(shutdown_rx).await
     }
 
     /// Loads the [ApiConfig] from the [DaemonConfig] in the given path and starts the Nexus API.
@@ -192,7 +193,16 @@ impl NexusApi {
         enable_key_republisher: bool,
     ) -> Result<Self, DynError> {
         // Create all the routes of the API
-        let router = routes::routes(ctx.api_config.stack.files_path.clone());
+        let state = routes::AppState {
+            files_path: Arc::new(ctx.api_config.stack.files_path.clone()),
+        };
+        let app_routes = routes::app_routes(state.clone());
+        let router = routes::build_app(
+            app_routes,
+            state,
+            ctx.api_config.request_timeout_secs,
+            ctx.api_config.max_body_size_bytes,
+        );
         debug!(?ctx.api_config, "Running NexusAPI with config");
 
         let (icann_http_handle, icann_http_socket) =

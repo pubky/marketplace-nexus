@@ -8,6 +8,8 @@ use pubky_app_specs::{bookmark_uri_builder, post_uri_builder, tag_uri_builder, P
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+const MAX_NOTIFICATION_PAGE: usize = 100;
+
 #[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PostChangedSource {
@@ -127,8 +129,8 @@ impl Notification {
     /// Lists notifications from the sorted set for the user, based on skip and limit, or timestamp range.
     pub async fn get_by_id(user_id: &str, pagination: Pagination) -> RedisResult<Vec<Self>> {
         // Set the default params for pagination
-        let skip = pagination.skip.unwrap_or(0);
-        let limit = pagination.limit.unwrap_or(20);
+        let skip = pagination.bounded_skip();
+        let limit = pagination.bounded_limit(20).min(MAX_NOTIFICATION_PAGE);
 
         let notifications = Notification::try_from_index_sorted_set(
             &["Notification", user_id],

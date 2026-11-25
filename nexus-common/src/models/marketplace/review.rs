@@ -6,8 +6,8 @@ use crate::db::kv::{
     put_field_if_exists, put_field_if_newer, RedisResult, SortOrder, VersionedWrite,
 };
 use crate::db::{
-    exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, queries, GraphResult,
-    OperationOutcome, RedisOps,
+    exec_single_row, execute_graph_operation, fetch_all_rows_from_graph, fetch_key_from_graph,
+    queries, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
 use crate::types::Pagination;
@@ -110,7 +110,11 @@ impl ReviewDetails {
     /// running the offline attestation verification recipe (parse →
     /// signature → binding). A failed verification never rejects the record:
     /// unverified reviews are indexed and labeled (ratified D5).
-    pub fn from_homeserver(review: &PubkyAppMarketplaceReview, reviewer_id: &PubkyId) -> Self {
+    pub fn from_homeserver(
+        review: &PubkyAppMarketplaceReview,
+        reviewer_id: &PubkyId,
+        subject_id: &PubkyId,
+    ) -> Self {
         let (verified, attestor_id, order_ref, iat, price_weight) =
             match PubkyAppPurchaseAttestation::verify_for_review(review) {
                 Ok(attestation) => (
@@ -127,8 +131,10 @@ impl ReviewDetails {
             review_id: review.review_id.clone(),
             uri: marketplace_review_uri_builder(reviewer_id.to_string(), review.review_id.clone()),
             reviewer_id: reviewer_id.to_string(),
-            subject_id: review.subject_pubky.clone(),
-            listing_owner_id: review.listing_owner_pubky.clone(),
+            subject_id: subject_id.to_string(),
+            listing_owner_id: PubkyId::try_from(review.listing_owner_pubky.as_str())
+                .map(|id| id.to_string())
+                .unwrap_or_else(|_| review.listing_owner_pubky.clone()),
             listing_id: review.listing_id.clone(),
             role: review.role,
             rating_overall: review.ratings.overall,
@@ -164,6 +170,26 @@ impl ReviewDetails {
     pub async fn put_to_graph(&self) -> GraphResult<OperationOutcome> {
         let query = queries::put::create_review(self)?;
         execute_graph_operation(query).await
+    }
+
+    /// Stores the instants derived from this review's timestamp strings, only
+    /// while the edge still carries those strings. Returns whether they were
+    /// stored: `false` when the edge was edited since these strings were read
+    /// (it keeps its own instants) or no longer exists.
+    pub async fn store_instants(&self) -> ModelResult<bool> {
+        let fresh = fetch_key_from_graph::<Option<bool>>(
+            queries::put::set_review_instants(
+                &self.reviewer_id,
+                &self.review_id,
+                &self.created_at,
+                &self.updated_at,
+                rfc3339_millis(&self.created_at),
+                rfc3339_millis(&self.updated_at),
+            ),
+            "flag",
+        )
+        .await?;
+        Ok(fresh.flatten().unwrap_or(false))
     }
 
     /// Stores the details JSON and, unless this is an edit of an already
@@ -458,9 +484,10 @@ impl ReviewDetails {
 
     /// Re-derives a review's moderation from the markers and stores it on the
     /// edge ([`ReviewModeration::derive_and_store`]) and the details JSON
-    /// ([`Self::store_moderation`]). Returns the indexed details when the
-    /// stored moderation changed, so the caller recomputes what depends on it;
-    /// `None` when it did not or the review is not indexed.
+    /// ([`Self::store_moderation`]). Returns the indexed details when the edge
+    /// derivation changed or a details write changed its indexed moderation,
+    /// so the caller recomputes what depends on it; `None` otherwise or when
+    /// the review is not indexed.
     pub async fn refresh_moderation(
         reviewer_id: &str,
         review_id: &str,
@@ -474,13 +501,15 @@ impl ReviewDetails {
     /// review deleted meanwhile stays deleted), and only if no later
     /// derivation has written it already: a derivation that read the markers
     /// before a release never stores them after the release's own derivation.
-    /// Returns the indexed details when the derivation changed the edge,
-    /// holding whichever derivation's moderation is current.
+    /// Returns the indexed details when the derivation changed the edge or its
+    /// write changed the moderation previously in the details JSON, holding
+    /// whichever derivation's moderation is current.
     pub async fn store_moderation(
         reviewer_id: &str,
         review_id: &str,
         derived: &DerivedReviewModeration,
     ) -> ModelResult<Option<Self>> {
+        let indexed = Self::get_from_index(reviewer_id, review_id).await?;
         let key = [reviewer_id, review_id].join(":");
         let written = put_field_if_newer(
             &Self::prefix().await,
@@ -491,7 +520,13 @@ impl ReviewDetails {
             derived.version,
         )
         .await?;
-        if written == VersionedWrite::Missing || !derived.changed {
+        if written == VersionedWrite::Missing {
+            return Ok(None);
+        }
+        let details_changed = written == VersionedWrite::Written
+            && indexed
+                .is_some_and(|details| details.moderation.as_ref() != derived.moderation.as_ref());
+        if !derived.changed && !details_changed {
             return Ok(None);
         }
         Ok(Self::get_from_index(reviewer_id, review_id).await?)
@@ -1019,6 +1054,12 @@ fn role_from_graph(role: &str) -> Option<PubkyAppReviewRole> {
     .find(|candidate| candidate.as_str() == role)
 }
 
+pub(crate) fn rfc3339_millis(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.timestamp_millis())
+}
+
 /// True when `updated_at` is more than the marketplace edit window after
 /// `created_at`. Unparseable timestamps (already spec-validated upstream)
 /// degrade to `false` rather than mislabeling the record.
@@ -1042,6 +1083,27 @@ mod filter_tests {
 
     fn params<'a>() -> ReviewStreamParams<'a> {
         ReviewStreamParams::default()
+    }
+
+    #[test]
+    fn rfc3339_millis_accepts_offsets_fractional_seconds_and_z() {
+        assert!(rfc3339_millis("2026-08-21T06:00:00+19:00").is_some());
+        assert!(rfc3339_millis("2026-08-19T13:00:00-23:59").is_some());
+        assert_eq!(rfc3339_millis("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(rfc3339_millis("1970-01-01T00:00:00.123Z"), Some(123));
+    }
+
+    #[test]
+    fn rfc3339_millis_rejects_an_unparseable_string() {
+        assert_eq!(rfc3339_millis("not-a-timestamp"), None);
+    }
+
+    #[test]
+    fn rfc3339_millis_compares_the_instants_not_the_offset_strings() {
+        assert!(
+            rfc3339_millis("2026-08-21T06:00:00+19:00").unwrap()
+                < rfc3339_millis("2026-08-20T12:00:00Z").unwrap()
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -58,7 +58,9 @@ hosting is out of scope for it.
 
 **Fixes:** `setup_graph` now tolerates Neo4j's `AlreadyExists` race when
 concurrent processes create the same new index (surfaced by parallel test
-boots).
+boots). List endpoints accept `skip` and `skip_tags` offsets through 10,000;
+larger offsets return an empty page, while exactly 10,000 still selects the page
+at that offset.
 
 Operating the dedicated instance (moderation setting, homeserver discovery and replay, backfill migrations): `docs/operations.md`.
 

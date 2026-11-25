@@ -44,6 +44,9 @@
 //! This project is licensed under the terms of the MIT License.
 
 pub mod api_context;
+#[cfg(test)]
+#[path = "../build_support/commit.rs"]
+mod build_commit;
 mod builder;
 pub mod error;
 mod key_republisher;

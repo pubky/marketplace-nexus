@@ -8,7 +8,7 @@ use crate::models::error::ModelError;
 use crate::models::error::ModelResult;
 use crate::models::follow::{Followers, Following, Friends, UserFollows};
 use crate::models::post::{PostStream, POST_REPLIES_PER_POST_KEY_PARTS};
-use crate::types::{StreamReach, Timeframe};
+use crate::types::{StreamReach, Timeframe, MAX_PAGE_SKIP};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -329,6 +329,16 @@ impl UserStream {
     pub async fn get_user_list_from_source(
         input: UserStreamInput,
     ) -> ModelResult<Option<Vec<String>>> {
+        // These sources never pass skip to their lookup.
+        let ignores_skip = matches!(
+            &input.source,
+            UserStreamSource::Recommended | UserStreamSource::PostReplies
+        ) || (matches!(&input.source, UserStreamSource::Influencers)
+            && input.preview == Some(true));
+        if !ignores_skip && input.skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+            return Ok(None);
+        }
+
         let UserStreamInput {
             user_id,
             skip,

@@ -41,6 +41,25 @@ pub async fn sync_put(
     index_review(review, user_id, review_id).await
 }
 
+fn validate_review_subject(
+    review: &PubkyAppMarketplaceReview,
+    user_id: &PubkyId,
+) -> Result<PubkyId, EventProcessorError> {
+    let subject_id = PubkyId::try_from(review.subject_pubky.as_str()).map_err(|e| {
+        EventProcessorError::InvalidEventLine(format!(
+            "Review subject {} is not a valid pubky: {e}",
+            review.subject_pubky
+        ))
+    })?;
+    if subject_id.to_string() == user_id.to_string() {
+        return Err(EventProcessorError::InvalidEventLine(format!(
+            "Review owner {} and subject must differ",
+            review.owner_pubky
+        )));
+    }
+    Ok(subject_id)
+}
+
 /// The ingest [`sync_put`] runs, without marking the review as touched. For
 /// callers that fence their own read against the event feed
 /// ([`ingest_read_review`]); the feed itself goes through [`sync_put`].
@@ -59,8 +78,9 @@ pub async fn index_review(
             review.owner_pubky, user_id
         )));
     }
+    let subject_id = validate_review_subject(&review, &user_id)?;
 
-    let mut details = ReviewDetails::from_homeserver(&review, &user_id);
+    let mut details = ReviewDetails::from_homeserver(&review, &user_id, &subject_id);
     // An edit keeps its supersession state until resolve_order_twins
     // re-evaluates it against the record's previous attested order.
     let prior = ReviewDetails::get_from_index(&user_id, &review_id).await?;
@@ -269,6 +289,48 @@ pub async fn recompute_per_item_counting() -> Result<PerItemRecompute, EventProc
         }
     }
     ReviewDetails::flag_unkeyed_seller_fields().await?;
+    for (reviewer_id, attestor_id, order_ref, role) in ReviewDetails::order_keys().await? {
+        ReviewDetails::resolve_seller_fields(&reviewer_id, &attestor_id, &order_ref, role).await?;
+        summary.orders += 1;
+    }
+    let (subjects, listings) = ReviewDetails::aggregate_scopes().await?;
+    for (subject_id, role) in &subjects {
+        ReputationSummary::recompute_subject(subject_id, *role).await?;
+    }
+    for (listing_owner_id, listing_id) in &listings {
+        ReputationSummary::recompute_listing(listing_owner_id, listing_id).await?;
+    }
+    summary.aggregates = subjects.len() + listings.len();
+    Ok(summary)
+}
+
+/// Outcome tally of the one-shot review-instant backfill.
+#[derive(Debug, Default)]
+pub struct ReviewInstantsBackfill {
+    /// Indexed reviews whose instants were stored; reviews edited since their
+    /// JSON was read keep their own instants and are not counted.
+    pub reviews: usize,
+    /// Attested orders whose counted seller-rating copy was settled.
+    pub orders: usize,
+    /// Subject and listing aggregates recomputed.
+    pub aggregates: usize,
+}
+
+/// One-shot backfill of the instants review aggregates order by. Stores every
+/// indexed review's instants, settles each attested order's counted
+/// seller-rating copy, then recomputes every subject and listing aggregate.
+/// Idempotent.
+pub async fn backfill_review_instants() -> Result<ReviewInstantsBackfill, EventProcessorError> {
+    let mut summary = ReviewInstantsBackfill::default();
+    for reviewer_id in ReviewDetails::reviewer_ids().await? {
+        for review_id in ReviewDetails::ids_of_reviewer(&reviewer_id).await? {
+            if let Some(details) = ReviewDetails::get_from_index(&reviewer_id, &review_id).await? {
+                if details.store_instants().await? {
+                    summary.reviews += 1;
+                }
+            }
+        }
+    }
     for (reviewer_id, attestor_id, order_ref, role) in ReviewDetails::order_keys().await? {
         ReviewDetails::resolve_seller_fields(&reviewer_id, &attestor_id, &order_ref, role).await?;
         summary.orders += 1;
@@ -940,6 +1002,130 @@ pub async fn backfill_trust_buckets() -> Result<TrustBucketBackfill, EventProces
     }
     summary.aggregates = subjects.len() + listings.len();
     Ok(summary)
+}
+
+#[cfg(test)]
+mod review_validation_tests {
+    use super::*;
+    use pubky_app_specs::PubkyAppReviewRatings;
+
+    fn self_review(role: PubkyAppReviewRole) -> PubkyAppMarketplaceReview {
+        let owner = pubky::Keypair::random().public_key().to_z32();
+        PubkyAppMarketplaceReview::new(
+            owner.clone(),
+            1,
+            "2026-08-20T12:00:00Z".to_string(),
+            "2026-08-20T12:00:00Z".to_string(),
+            String::new(),
+            owner.clone(),
+            owner,
+            "listing".to_string(),
+            role,
+            PubkyAppReviewRatings {
+                overall: 5,
+                item_accuracy: None,
+                shipping: None,
+                communication: None,
+            },
+            "Arrived as described.".to_string(),
+            String::new(),
+        )
+    }
+
+    fn final_character_spellings(canonical: &str) -> Vec<String> {
+        const Z32_ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+        assert_eq!(canonical.len(), 52);
+        Z32_ALPHABET
+            .iter()
+            .filter(|character| **character != canonical.as_bytes()[51])
+            .map(|character| {
+                let mut spelling = canonical.as_bytes().to_vec();
+                spelling[51] = *character;
+                String::from_utf8(spelling).unwrap()
+            })
+            .collect()
+    }
+
+    fn canonical_aliases(canonical: &str) -> Vec<String> {
+        final_character_spellings(canonical)
+            .into_iter()
+            .filter(|spelling| {
+                PubkyId::try_from(spelling.as_str())
+                    .is_ok_and(|parsed| parsed.to_string() == canonical)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn owner_and_subject_differ_for_every_review_role() {
+        for role in [
+            PubkyAppReviewRole::BuyerReviewingSeller,
+            PubkyAppReviewRole::SellerReviewingBuyer,
+        ] {
+            let mut review = self_review(role);
+            let user_id = PubkyId::try_from(review.owner_pubky.as_str()).unwrap();
+            assert!(matches!(
+                validate_review_subject(&review, &user_id),
+                Err(EventProcessorError::InvalidEventLine(_))
+            ));
+
+            review.subject_pubky = pubky::Keypair::random().public_key().to_z32();
+            assert!(validate_review_subject(&review, &user_id).is_ok());
+        }
+    }
+
+    #[test]
+    fn changed_final_character_of_owner_is_refused() {
+        let mut review = self_review(PubkyAppReviewRole::BuyerReviewingSeller);
+        let user_id = PubkyId::try_from(review.owner_pubky.as_str()).unwrap();
+        let aliases = canonical_aliases(&review.owner_pubky);
+        assert!(!aliases.is_empty());
+        review.subject_pubky = aliases[0].clone();
+        assert!(matches!(
+            validate_review_subject(&review, &user_id),
+            Err(EventProcessorError::InvalidEventLine(_))
+        ));
+    }
+
+    #[test]
+    fn unparseable_subject_is_refused() {
+        let mut review = self_review(PubkyAppReviewRole::BuyerReviewingSeller);
+        let user_id = PubkyId::try_from(review.owner_pubky.as_str()).unwrap();
+        review.subject_pubky = "not-a-pubky".to_string();
+        assert!(matches!(
+            validate_review_subject(&review, &user_id),
+            Err(EventProcessorError::InvalidEventLine(_))
+        ));
+    }
+
+    #[test]
+    fn details_store_the_canonical_subject() {
+        let mut review = self_review(PubkyAppReviewRole::BuyerReviewingSeller);
+        let user_id = PubkyId::try_from(review.owner_pubky.as_str()).unwrap();
+        let subject = pubky::Keypair::random().public_key().to_z32();
+        let aliases = canonical_aliases(&subject);
+        assert!(!aliases.is_empty());
+        review.subject_pubky = aliases[0].clone();
+        let subject_id = validate_review_subject(&review, &user_id).unwrap();
+        let details = ReviewDetails::from_homeserver(&review, &user_id, &subject_id);
+        assert_eq!(details.subject_id, subject);
+    }
+
+    #[test]
+    fn details_store_the_canonical_listing_owner() {
+        let mut review = self_review(PubkyAppReviewRole::BuyerReviewingSeller);
+        let user_id = PubkyId::try_from(review.owner_pubky.as_str()).unwrap();
+        review.subject_pubky = pubky::Keypair::random().public_key().to_z32();
+        let subject_id = PubkyId::try_from(review.subject_pubky.as_str()).unwrap();
+        let listing_owner = pubky::Keypair::random().public_key().to_z32();
+        let aliases = canonical_aliases(&listing_owner);
+        assert!(!aliases.is_empty());
+        for alias in aliases {
+            review.listing_owner_pubky = alias;
+            let details = ReviewDetails::from_homeserver(&review, &user_id, &subject_id);
+            assert_eq!(details.listing_owner_id, listing_owner);
+        }
+    }
 }
 
 #[cfg(test)]

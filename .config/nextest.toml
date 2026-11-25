@@ -6,7 +6,9 @@ nextest-version = "0.9.70"
 # the shared Neo4j and Redis state: the legacy reserve scrub evicts and rewrites
 # the details cache entry of every listing, the auction terms backfill reindexes
 # every auction listing missing its terms, and the stale listing prune checks
-# and deletes every listing whose record is gone. nextest runs each test in its
+# and deletes every listing whose record is gone, and the review passes
+# recompute the counting and moderation of every review and the aggregates of
+# every subject and listing. nextest runs each test in its
 # own process against the same databases, so when one of them overlaps any other
 # listing test it evicts or rewrites that test's rows between its steps and the
 # other test fails once, then passes on a rerun. Occupying every test slot makes
@@ -22,6 +24,9 @@ package(nexus-watcher) & (
   | test(=event_processor::marketplace::stale_prune::prune_removes_only_stale_listings_and_cleans_every_index)
   | test(=event_processor::marketplace::stale_prune::a_prune_interrupted_at_any_phase_is_finished_by_the_next_run)
   | test(=event_processor::marketplace::stale_prune::a_pending_listing_whose_record_came_back_is_restored_by_the_next_run)
+  | test(=event_processor::marketplace::review_per_item::the_one_shot_recompute_recounts_reviews_indexed_before_per_item_counting)
+  | test(=event_processor::marketplace::review_per_item::backfill_only_stores_instants_while_timestamp_strings_match)
+  | test(=event_processor::marketplace::review_moderation::the_one_shot_recompute_hides_reviews_of_users_moderated_before_it)
 )
 '''
 threads-required = 'num-test-threads'

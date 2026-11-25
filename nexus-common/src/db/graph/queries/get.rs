@@ -12,6 +12,20 @@ use crate::types::StreamSorting;
 use crate::types::Timeframe;
 use pubky_app_specs::{PubkyAppListingState, PubkyAppPostKind};
 
+const MAX_QUERY_SKIP: usize = 10_000;
+const MAX_QUERY_LIMIT: usize = 1_000;
+
+fn bounded_query_skip(skip: usize) -> usize {
+    if skip > MAX_QUERY_SKIP {
+        return (i64::MAX as usize) - MAX_QUERY_LIMIT;
+    }
+    skip
+}
+
+fn bounded_query_limit(limit: usize) -> usize {
+    limit.min(MAX_QUERY_LIMIT)
+}
+
 // Retrieve post node by post id and author id
 pub fn get_post_by_id(author_id: &str, post_id: &str) -> Query {
     Query::new(
@@ -462,9 +476,11 @@ pub fn get_user_followers(user_id: &str, skip: Option<usize>, limit: Option<usiz
                 COLLECT(follower.id) AS follower_ids",
     );
     if let Some(skip_value) = skip {
+        let skip_value = bounded_query_skip(skip_value);
         query_string.push_str(&format!(" SKIP {skip_value}"));
     }
     if let Some(limit_value) = limit {
+        let limit_value = bounded_query_limit(limit_value);
         query_string.push_str(&format!(" LIMIT {limit_value}"));
     }
     Query::new("get_user_followers", &query_string).param("user_id", user_id)
@@ -478,9 +494,11 @@ pub fn get_user_following(user_id: &str, skip: Option<usize>, limit: Option<usiz
                 COLLECT(following.id) AS following_ids",
     );
     if let Some(skip_value) = skip {
+        let skip_value = bounded_query_skip(skip_value);
         query_string.push_str(&format!(" SKIP {skip_value}"));
     }
     if let Some(limit_value) = limit {
+        let limit_value = bounded_query_limit(limit_value);
         query_string.push_str(&format!(" LIMIT {limit_value}"));
     }
     Query::new("get_user_following", &query_string).param("user_id", user_id)
@@ -551,8 +569,8 @@ pub fn get_tag_taggers_by_reach(
     Query::new("get_tag_taggers_by_reach", &cypher)
         .param("label", label)
         .param("user_id", user_id)
-        .param("skip", skip as i64)
-        .param("limit", limit as i64)
+        .param("skip", bounded_query_skip(skip) as i64)
+        .param("limit", bounded_query_limit(limit) as i64)
 }
 
 pub fn get_hot_tags_by_reach(
@@ -588,12 +606,12 @@ pub fn get_hot_tags_by_reach(
     ",
         stream_reach_to_graph_subquery(&reach),
         input_tagged_type,
-        tags_query.taggers_limit
+        bounded_query_limit(tags_query.taggers_limit)
     );
     Query::new("get_hot_tags_by_reach", &cypher)
         .param("user_id", user_id)
-        .param("skip", tags_query.skip as i64)
-        .param("limit", tags_query.limit as i64)
+        .param("skip", bounded_query_skip(tags_query.skip) as i64)
+        .param("limit", bounded_query_limit(tags_query.limit) as i64)
         .param("from", from)
         .param("to", to)
 }
@@ -625,11 +643,12 @@ pub fn get_global_hot_tags(tags_query: &HotTagsInputDTO) -> Query {
         SKIP $skip LIMIT $limit
         RETURN COLLECT(hot_tag) as hot_tags
     ",
-        input_tagged_type, tags_query.taggers_limit
+        input_tagged_type,
+        bounded_query_limit(tags_query.taggers_limit)
     );
     Query::new("get_global_hot_tags", &cypher)
-        .param("skip", tags_query.skip as i64)
-        .param("limit", tags_query.limit as i64)
+        .param("skip", bounded_query_skip(tags_query.skip) as i64)
+        .param("limit", bounded_query_limit(tags_query.limit) as i64)
         .param("from", from)
         .param("to", to)
 }
@@ -678,8 +697,8 @@ pub fn get_influencers_by_reach(
     );
     Query::new("get_influencers_by_reach", &cypher)
         .param("user_id", user_id)
-        .param("skip", skip as i64)
-        .param("limit", limit as i64)
+        .param("skip", bounded_query_skip(skip) as i64)
+        .param("limit", bounded_query_limit(limit) as i64)
         .param("from", from)
         .param("to", to)
 }
@@ -716,8 +735,8 @@ pub fn get_global_influencers(skip: usize, limit: usize, timeframe: &Timeframe) 
         RETURN COLLECT([influencer.id, influencer.score]) as influencers
     ",
     )
-    .param("skip", skip as i64)
-    .param("limit", limit as i64)
+    .param("skip", bounded_query_skip(skip) as i64)
+    .param("limit", bounded_query_limit(limit) as i64)
     .param("from", from)
     .param("to", to)
 }
@@ -880,9 +899,11 @@ pub fn post_stream(
 
     // Apply skip and limit
     if let Some(skip) = pagination.skip {
+        let skip = bounded_query_skip(skip);
         cypher.push_str(&format!("SKIP {skip}\n"));
     }
     if let Some(limit) = pagination.limit {
+        let limit = bounded_query_limit(limit);
         cypher.push_str(&format!("LIMIT {limit}\n"));
     }
 
@@ -1266,9 +1287,11 @@ pub fn drop_stream(
     ));
 
     if let Some(skip) = pagination.skip {
+        let skip = bounded_query_skip(skip);
         cypher.push_str(&format!("SKIP {skip}\n"));
     }
     if let Some(limit) = pagination.limit {
+        let limit = bounded_query_limit(limit);
         cypher.push_str(&format!("LIMIT {limit}\n"));
     }
 
@@ -1435,9 +1458,11 @@ pub fn listing_stream(
     ));
 
     if let Some(skip) = pagination.skip {
+        let skip = bounded_query_skip(skip);
         cypher.push_str(&format!("SKIP {skip}\n"));
     }
     if let Some(limit) = pagination.limit {
+        let limit = bounded_query_limit(limit);
         cypher.push_str(&format!("LIMIT {limit}\n"));
     }
 
@@ -1635,7 +1660,7 @@ pub fn recommend_users(user_id: &str, limit: usize) -> Query {
     ",
     )
     .param("user_id", user_id.to_string())
-    .param("limit", limit as i64)
+    .param("limit", bounded_query_limit(limit) as i64)
 }
 
 /// Retrieve specific tag created by the user
@@ -1681,7 +1706,7 @@ fn reputation_return(seller_fields: &str) -> String {
             sum(CASE WHEN r.has_response THEN 1 ELSE 0 END) AS response_count,
             sum(CASE WHEN r.edited_late THEN 1 ELSE 0 END) AS edited_late_count,
             [x IN collect(CASE WHEN r.verified THEN r.attestor_id ELSE null END) WHERE x IS NOT NULL] AS attestors,
-            max(r.created_at) AS last_reviewed_at
+            collect(r.created_at)[0] AS last_reviewed_at
         "
     )
 }
@@ -1697,6 +1722,20 @@ const SELLER_FIELDS_ONCE_PER_ORDER: &str = "coalesce(r.seller_fields_counted, tr
 /// The aggregates leave out reviews the moderator excluded (see
 /// [`crate::models::marketplace::ReviewModerationState::Excluded`]).
 const REPUTATION_NOT_EXCLUDED: &str = "coalesce(r.moderation, '') <> 'excluded'";
+
+/// Orders reviews by their created instant, then by the greater review id.
+/// Edges indexed before the instant was stored sort after the others and
+/// among themselves by their timestamp string.
+const GROUP_REPUTATION_REVIEWS: &str = "
+        WITH reviewer, r
+        ORDER BY coalesce(r.created_at_ms, -9223372036854775808) DESC,
+            CASE WHEN r.created_at_ms IS NULL THEN r.created_at END DESC, r.review_id DESC
+        WITH CASE WHEN r.verified THEN 'v:' + reviewer.id + ':' + r.review_id
+             ELSE 'u:' + reviewer.id + ':' + coalesce(r.listing_id, '')
+             END AS review_group, collect(r)[0] AS r
+        WITH r
+        ORDER BY coalesce(r.created_at_ms, -9223372036854775808) DESC,
+            CASE WHEN r.created_at_ms IS NULL THEN r.created_at END DESC, r.review_id DESC";
 
 /// The reviewer's other verified review edges in one role that carry the
 /// same attested order `(attestor_id, order_ref)` for the same listing: a
@@ -1729,15 +1768,17 @@ pub fn review_order_twins(
     .param("listing_id", listing_id.to_string())
 }
 
-/// Aggregates every `REVIEWED` edge pointing at a subject in one role into
-/// the reputation summary row, leaving out legacy records superseded by
-/// their order-scoped twin and reviews moderation excluded. Seller fields
-/// count once per attested order.
+/// Builds the reputation summary for one subject and role. Verified records
+/// count individually; unverified records use the latest created instant per
+/// author and listing. Superseded and excluded records are removed before selection.
+/// Seller fields count once per attested order.
 pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
     let cypher = format!(
-        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
-        WHERE r.role = $role AND coalesce(r.superseded, false) = false
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {{id: $subject_id}})
+        WHERE reviewer.id <> subject.id AND r.role = $role
+            AND coalesce(r.superseded, false) = false
             AND {REPUTATION_NOT_EXCLUDED}
+        {GROUP_REPUTATION_REVIEWS}
         {}",
         reputation_return(SELLER_FIELDS_ONCE_PER_ORDER)
     );
@@ -1753,10 +1794,12 @@ pub fn subject_reputation(subject_id: &str, role: &str) -> Query {
 /// which anchors the scan.
 pub fn listing_reputation(listing_owner_id: &str, listing_id: &str) -> Query {
     let cypher = format!(
-        "MATCH (:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
-        WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {{id: $listing_owner_id}})
+        WHERE reviewer.id <> subject.id AND r.role = 'buyer_reviewing_seller'
+            AND r.listing_id = $listing_id
             AND coalesce(r.superseded, false) = false
             AND {REPUTATION_NOT_EXCLUDED}
+        {GROUP_REPUTATION_REVIEWS}
         {}",
         reputation_return("true")
     );
@@ -1790,8 +1833,8 @@ fn review_counting_rows(scope_match: &str, seller_fields: &str) -> String {
 /// [`review_counting_rows`]).
 pub fn subject_counting_rows(subject_id: &str, role: &str) -> Query {
     let cypher = review_counting_rows(
-        "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
-        WHERE r.role = $role",
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $subject_id})
+        WHERE reviewer.id <> subject.id AND r.role = $role",
         SELLER_FIELDS_ONCE_PER_ORDER,
     );
     Query::new("subject_counting_rows", &cypher)
@@ -1803,8 +1846,9 @@ pub fn subject_counting_rows(subject_id: &str, role: &str) -> Query {
 /// [`review_counting_rows`]).
 pub fn listing_counting_rows(listing_owner_id: &str, listing_id: &str) -> Query {
     let cypher = review_counting_rows(
-        "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $listing_owner_id})
-        WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
+        "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $listing_owner_id})
+        WHERE reviewer.id <> subject.id AND r.role = 'buyer_reviewing_seller'
+            AND r.listing_id = $listing_id",
         "true",
     );
     Query::new("listing_counting_rows", &cypher)
@@ -1842,12 +1886,12 @@ pub fn filtered_review_rows(
     }
     match scope {
         ReviewStreamScope::Subject { .. } => cypher.push_str(
-            "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
-            WHERE r.role = $role",
+            "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $subject_id})
+            WHERE reviewer.id <> subject.id AND r.role = $role",
         ),
         ReviewStreamScope::Listing { .. } => cypher.push_str(
-            "MATCH (reviewer:User)-[r:REVIEWED]->(:User {id: $subject_id})
-            WHERE r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
+            "MATCH (reviewer:User)-[r:REVIEWED]->(subject:User {id: $subject_id})
+            WHERE reviewer.id <> subject.id AND r.role = 'buyer_reviewing_seller' AND r.listing_id = $listing_id",
         ),
     }
     cypher.push_str("\n    AND coalesce(r.superseded, false) = false");
@@ -2103,5 +2147,28 @@ mod listing_stream_state_tests {
         }
         let cypher = stream_cypher(None, 1_790_000_000_000);
         assert!(!cypher.contains("1790000000000"), "{cypher}");
+    }
+}
+
+#[cfg(test)]
+mod query_page_tests {
+    use super::*;
+
+    #[test]
+    fn query_page_values_keep_values_inside_bounds() {
+        assert_eq!(bounded_query_skip(10), 10);
+        assert_eq!(bounded_query_limit(100), 100);
+        assert_eq!(bounded_query_skip(MAX_QUERY_SKIP), MAX_QUERY_SKIP);
+        assert_eq!(bounded_query_limit(MAX_QUERY_LIMIT), MAX_QUERY_LIMIT);
+    }
+
+    #[test]
+    fn query_page_values_above_the_skip_bound_use_an_empty_offset() {
+        let empty_offset = (i64::MAX as usize) - MAX_QUERY_LIMIT;
+        assert_eq!(bounded_query_skip(MAX_QUERY_SKIP + 1), empty_offset);
+        assert_eq!(bounded_query_skip(usize::MAX), empty_offset);
+        assert_eq!(empty_offset + MAX_QUERY_LIMIT, i64::MAX as usize);
+        assert_eq!(bounded_query_limit(MAX_QUERY_LIMIT + 1), MAX_QUERY_LIMIT);
+        assert_eq!(bounded_query_limit(usize::MAX), MAX_QUERY_LIMIT);
     }
 }

@@ -6,6 +6,15 @@ use utoipa::ToSchema;
 /// `limit` is served as this many items instead of sizing Redis ranges,
 /// hydration and response buffers by the caller's number.
 pub const MAX_PAGE_LIMIT: usize = 1_000;
+pub const MAX_PAGE_SKIP: usize = 10_000;
+
+/// Returns an offset that yields an empty page when `requested` exceeds [MAX_PAGE_SKIP].
+pub fn bounded_page_skip(requested: Option<usize>) -> usize {
+    match requested {
+        Some(skip) if skip > MAX_PAGE_SKIP => usize::MAX,
+        skip => skip.unwrap_or(0),
+    }
+}
 
 /// `requested`, or `default` when absent, never above [MAX_PAGE_LIMIT].
 pub fn bounded_page_limit(requested: Option<usize>, default: usize) -> usize {
@@ -28,6 +37,10 @@ impl Pagination {
     /// The requested page size, `default` when absent, never above [MAX_PAGE_LIMIT].
     pub fn bounded_limit(&self, default: usize) -> usize {
         bounded_page_limit(self.limit, default)
+    }
+
+    pub fn bounded_skip(&self) -> usize {
+        bounded_page_skip(self.skip)
     }
 }
 
@@ -91,5 +104,31 @@ mod tests {
     #[test]
     fn a_default_above_the_bound_is_clamped_too() {
         assert_eq!(bounded_page_limit(None, usize::MAX), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn an_absent_skip_uses_zero() {
+        assert_eq!(Pagination::default().bounded_skip(), 0);
+        assert_eq!(bounded_page_skip(None), 0);
+    }
+
+    #[test]
+    fn a_skip_inside_the_bound_is_kept() {
+        let page = Pagination {
+            skip: Some(MAX_PAGE_SKIP),
+            ..Default::default()
+        };
+        assert_eq!(page.bounded_skip(), MAX_PAGE_SKIP);
+        assert_eq!(bounded_page_skip(Some(3)), 3);
+    }
+
+    #[test]
+    fn a_skip_above_the_bound_requests_an_empty_page() {
+        let page = Pagination {
+            skip: Some(usize::MAX),
+            ..Default::default()
+        };
+        assert_eq!(page.bounded_skip(), usize::MAX);
+        assert_eq!(bounded_page_skip(Some(MAX_PAGE_SKIP + 1)), usize::MAX);
     }
 }

@@ -2,7 +2,13 @@ use super::{listing_details, seed_user, shop_details};
 use crate::utils::{get_request, invalid_get_request};
 use anyhow::Result;
 use axum::http::StatusCode;
-use nexus_common::models::marketplace::{ReputationSummary, ReviewDetails};
+use nexus_common::db::graph::Query;
+use nexus_common::db::{exec_single_row, queries};
+use nexus_common::models::marketplace::{
+    ListingDetails, ReputationSummary, ReviewDetails, ReviewModeration, ReviewModerationState,
+    ShopDetails,
+};
+use nexus_common::models::user::UserDetails;
 use pubky::Keypair;
 use pubky_app_specs::{PubkyAppListingCondition, PubkyAppReviewRole};
 use serde_json::Value;
@@ -14,6 +20,11 @@ struct Seeded {
     attestor_id: String,
     verified_reviewer: String,
     unverified_reviewer: String,
+    reviews: [ReviewDetails; 2],
+}
+
+fn random_id() -> String {
+    Keypair::random().public_key().to_z32()
 }
 
 pub(super) fn review(
@@ -51,6 +62,130 @@ pub(super) fn review(
         revision: 1,
         indexed_at,
     }
+}
+
+fn listing_review(
+    reviewer_id: &str,
+    seller_id: &str,
+    listing_id: &str,
+    overall: i64,
+    attested: Option<(&str, &str, i64, u8)>,
+    indexed_at: i64,
+) -> ReviewDetails {
+    let mut details = review(
+        reviewer_id,
+        seller_id,
+        &random_id(),
+        overall,
+        attested,
+        indexed_at,
+    );
+    details.listing_id = listing_id.to_string();
+    details
+}
+
+async fn put_graph_reviews(reviews: &[ReviewDetails]) -> Result<()> {
+    for details in reviews {
+        details.put_to_graph().await?;
+    }
+    Ok(())
+}
+
+async fn recompute_pair(
+    seller_id: &str,
+    listing_id: &str,
+) -> Result<(ReputationSummary, ReputationSummary)> {
+    let subject =
+        ReputationSummary::recompute_subject(seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await?
+            .expect("the subject aggregate exists");
+    let listing = ReputationSummary::recompute_listing(seller_id, listing_id)
+        .await?
+        .expect("the listing aggregate exists");
+    Ok((subject, listing))
+}
+
+async fn cleanup_reviews(
+    seller_id: &str,
+    reviews: &[ReviewDetails],
+    listing_ids: &[&str],
+    user_ids: &[&str],
+    listings_created: bool,
+    shop_created: bool,
+) -> Result<()> {
+    for details in reviews {
+        details.delete().await?;
+    }
+    ReputationSummary::recompute_subject(seller_id, PubkyAppReviewRole::BuyerReviewingSeller)
+        .await?;
+    for listing_id in listing_ids {
+        ReputationSummary::recompute_listing(seller_id, listing_id).await?;
+        if listings_created {
+            ListingDetails::delete(seller_id, listing_id).await?;
+        }
+    }
+    if shop_created {
+        ShopDetails::delete_indexes(seller_id).await?;
+        exec_single_row(queries::del::delete_untagged_shop(seller_id)).await?;
+    }
+    for user_id in user_ids {
+        UserDetails::delete(user_id).await?;
+    }
+    Ok(())
+}
+
+async fn seed_unverified_reviews(
+    inputs: [(&str, &str, i64); 2],
+) -> Result<(String, String, String, [ReviewDetails; 2])> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let author = random_id();
+    let listing_id = random_id();
+    for user in [&seller, &author] {
+        seed_user(user).await?;
+    }
+    let shop = shop_details(&seller);
+    shop.put_to_graph().await?;
+    shop.put_to_index().await?;
+    let category = format!("cat-{}", chrono::Utc::now().timestamp_micros());
+    let listing = listing_details(
+        &seller,
+        &listing_id,
+        "Lamp",
+        &category,
+        PubkyAppListingCondition::Good,
+        4_000,
+        chrono::Utc::now().timestamp_millis(),
+    );
+    listing.put_to_graph().await?;
+    listing.put_to_index(false).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = inputs.map(|(review_id, created_at, rating)| {
+        let mut details = review(&author, &seller, review_id, rating, None, now);
+        details.listing_id = listing_id.clone();
+        details.created_at = created_at.to_string();
+        details
+    });
+    put_graph_reviews(&reviews).await?;
+    Ok((seller, author, listing_id, reviews))
+}
+
+async fn unverified_aggregates_for(
+    inputs: [(&str, &str, i64); 2],
+) -> Result<(ReputationSummary, ReputationSummary)> {
+    let (seller, author, listing_id, reviews) = seed_unverified_reviews(inputs).await?;
+    let computed = recompute_pair(&seller, &listing_id).await;
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &author],
+        true,
+        true,
+    )
+    .await?;
+
+    computed
 }
 
 /// Seeds a shop, one listing, one verified review (iat 1790002000, price
@@ -121,7 +256,24 @@ async fn seed_reviews() -> Result<Seeded> {
         attestor_id,
         verified_reviewer,
         unverified_reviewer,
+        reviews,
     })
+}
+
+async fn cleanup_seeded(seeded: &Seeded) -> Result<()> {
+    cleanup_reviews(
+        &seeded.seller_id,
+        &seeded.reviews,
+        &[LISTING_ID],
+        &[
+            &seeded.seller_id,
+            &seeded.verified_reviewer,
+            &seeded.unverified_reviewer,
+        ],
+        true,
+        true,
+    )
+    .await
 }
 
 fn review_by<'a>(stream: &'a Value, reviewer_id: &str) -> &'a Value {
@@ -160,6 +312,7 @@ async fn test_review_streams_serve_the_attestation_iat_next_to_the_attestor() ->
         }
     }
 
+    cleanup_seeded(&seeded).await?;
     Ok(())
 }
 
@@ -241,5 +394,505 @@ async fn test_reputation_serves_buckets_and_scopes_them_by_attestor_windows() ->
         .await?;
     }
 
+    cleanup_seeded(&seeded).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_same_user_edges_do_not_shape_reputation() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let other_user = random_id();
+    let attestor = random_id();
+    let listing_id = random_id();
+    let order_ref = random_id();
+    for user in [&seller, &other_user] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = [
+        listing_review(&seller, &seller, &listing_id, 1, None, now),
+        listing_review(
+            &seller,
+            &seller,
+            &listing_id,
+            3,
+            Some((&attestor, &order_ref, 1_790_002_000, 2)),
+            now + 1,
+        ),
+        listing_review(&other_user, &seller, &listing_id, 5, None, now + 2),
+    ];
+    put_graph_reviews(&reviews).await?;
+
+    let (subject, listing) = recompute_pair(&seller, &listing_id).await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.verified_count, 0);
+        assert_eq!(summary.unverified_count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert!(summary.attestors.is_empty());
+        assert!(summary.buckets.is_empty());
+    }
+
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &other_user],
+        false,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_verified_records_from_different_reviewers_count_separately() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let first_reviewer = random_id();
+    let second_reviewer = random_id();
+    let attestor = random_id();
+    let review_id = random_id();
+    for user in [&seller, &first_reviewer, &second_reviewer] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = [
+        review(
+            &first_reviewer,
+            &seller,
+            &review_id,
+            5,
+            Some((&attestor, &random_id(), 1_790_002_000, 2)),
+            now,
+        ),
+        review(
+            &second_reviewer,
+            &seller,
+            &review_id,
+            3,
+            Some((&attestor, &random_id(), 1_790_002_001, 4)),
+            now + 1,
+        ),
+    ];
+    put_graph_reviews(&reviews).await?;
+
+    let (subject, listing) = recompute_pair(&seller, LISTING_ID).await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.verified_count, 2);
+        assert_eq!(summary.unverified_count, 0);
+        assert_eq!(summary.avg, 4.0);
+        assert_eq!(summary.histogram, [0, 0, 1, 0, 1]);
+        assert_eq!(summary.attestors.get(&attestor), Some(&2));
+        let bucket = summary.buckets.get(&attestor).expect("attestor bucket");
+        assert_eq!(bucket.orders, 2);
+        assert_eq!(bucket.buyers, 2);
+        assert_eq!(bucket.sum_buyer_means, 8.0);
+        assert_eq!(bucket.histogram, [0, 0, 1, 0, 1]);
+    }
+
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[LISTING_ID],
+        &[&seller, &first_reviewer, &second_reviewer],
+        false,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_filtered_streams_leave_out_same_user_edges() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let reviewer = random_id();
+    let listing_id = random_id();
+    for user in [&seller, &reviewer] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = [
+        listing_review(&seller, &seller, &listing_id, 1, None, now),
+        listing_review(&reviewer, &seller, &listing_id, 5, None, now + 1),
+    ];
+    put_graph_reviews(&reviews).await?;
+    for details in &reviews {
+        details.put_to_index(false).await?;
+    }
+
+    for route in [
+        format!("/v0/shop/{seller}/reviews?sort=newest"),
+        format!("/v0/listing/{seller}/{listing_id}/reviews?sort=newest"),
+    ] {
+        let body = get_request(&route).await?;
+        let stream = body["reviews"].as_array().expect("filtered reviews");
+        assert_eq!(stream.len(), 1, "{route}");
+        assert_eq!(stream[0]["review"]["reviewer_id"], reviewer);
+    }
+
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &reviewer],
+        false,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_collapse_to_latest_per_user_and_listing() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let author = random_id();
+    let listing_id = random_id();
+    for user in [&seller, &author] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut older = listing_review(&author, &seller, &listing_id, 1, None, now);
+    older.created_at = "2026-08-20T12:00:00Z".to_string();
+    older.order_ref = Some(random_id());
+    let mut tie_a = listing_review(&author, &seller, &listing_id, 3, None, now + 1);
+    tie_a.created_at = "2026-08-22T12:00:00Z".to_string();
+    tie_a.order_ref = Some(random_id());
+    let mut tie_b = listing_review(&author, &seller, &listing_id, 3, None, now + 2);
+    tie_b.created_at = "2026-08-22T12:00:00Z".to_string();
+    tie_b.order_ref = Some(random_id());
+    if tie_a.review_id > tie_b.review_id {
+        tie_a.rating_overall = 5;
+    } else {
+        tie_b.rating_overall = 5;
+    }
+    let reviews = [older, tie_a, tie_b];
+    put_graph_reviews(&reviews).await?;
+
+    let (subject, listing) = recompute_pair(&seller, &listing_id).await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.verified_count, 0);
+        assert_eq!(summary.unverified_count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(summary.histogram, [0, 0, 0, 0, 1]);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-22T12:00:00Z")
+        );
+    }
+
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_use_the_latest_created_instant() -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("Z0AAAAAAAAAAA", "2026-08-20T13:00:00+02:00", 1),
+        ("A0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.verified_count, 0);
+        assert_eq!(summary.unverified_count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_order_offsets_beyond_eighteen_hours_by_instant() -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("Z0AAAAAAAAAAA", "2026-08-21T06:00:00+19:00", 1),
+        ("A0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_order_negative_offsets_beyond_eighteen_hours_by_instant(
+) -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("Z0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 1),
+        ("A0AAAAAAAAAAA", "2026-08-19T13:00:00-23:59", 5),
+    ])
+    .await?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-19T13:00:00-23:59")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_reviews_indexed_without_instants_still_recompute() -> Result<()> {
+    let (seller, author, listing_id, reviews) = seed_unverified_reviews([
+        ("A0AAAAAAAAAAA", "2026-08-21T06:00:00+19:00", 1),
+        ("Z0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+
+    let legacy = async {
+        exec_single_row(
+            Query::new(
+                "test_remove_review_instants",
+                "MATCH (:User {id: $author})-[r:REVIEWED]->(:User {id: $seller})
+                 REMOVE r.created_at_ms, r.updated_at_ms RETURN true AS flag",
+            )
+            .param("author", author.as_str())
+            .param("seller", seller.as_str()),
+        )
+        .await?;
+        recompute_pair(&seller, &listing_id).await
+    }
+    .await;
+    let restored = async {
+        for details in &reviews {
+            details.store_instants().await?;
+        }
+        recompute_pair(&seller, &listing_id).await
+    }
+    .await;
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&listing_id],
+        &[&seller, &author],
+        true,
+        true,
+    )
+    .await?;
+
+    let (subject, listing) = legacy?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.avg, 1.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-21T06:00:00+19:00")
+        );
+    }
+    let (subject, listing) = restored?;
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_seller_fields_use_the_latest_updated_instant() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let author = random_id();
+    let attestor = random_id();
+    let order_ref = random_id();
+    let first_listing = random_id();
+    let second_listing = random_id();
+    for user in [&seller, &author] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let attested = Some((attestor.as_str(), order_ref.as_str(), 1_790_002_000, 2));
+    let mut first = listing_review(&author, &seller, &first_listing, 4, attested, now);
+    first.updated_at = "2026-08-21T06:00:00+19:00".to_string();
+    first.rating_shipping = Some(1);
+    first.rating_communication = Some(2);
+    let mut second = listing_review(&author, &seller, &second_listing, 4, attested, now + 1);
+    second.updated_at = "2026-08-20T12:00:00Z".to_string();
+    second.rating_shipping = Some(5);
+    second.rating_communication = Some(4);
+    let reviews = [first, second];
+
+    let computed = async {
+        for details in &reviews {
+            details.put_to_graph().await?;
+        }
+        ReviewDetails::resolve_seller_fields(
+            &author,
+            &attestor,
+            &order_ref,
+            PubkyAppReviewRole::BuyerReviewingSeller,
+        )
+        .await?;
+        ReputationSummary::recompute_subject(&seller, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await
+    }
+    .await;
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&first_listing, &second_listing],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
+
+    let subject = computed?.expect("the subject aggregate exists");
+    assert_eq!(subject.count, 2);
+    assert_eq!(subject.avg_shipping, Some(5.0));
+    assert_eq!(subject.avg_communication, Some(4.0));
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_equal_created_instants_use_the_greater_review_id() -> Result<()> {
+    let (subject, listing) = unverified_aggregates_for([
+        ("A0AAAAAAAAAAA", "2026-08-20T14:00:00+02:00", 1),
+        ("Z0AAAAAAAAAAA", "2026-08-20T12:00:00Z", 5),
+    ])
+    .await?;
+
+    for summary in [&subject, &listing] {
+        assert_eq!(summary.count, 1);
+        assert_eq!(summary.verified_count, 0);
+        assert_eq!(summary.unverified_count, 1);
+        assert_eq!(summary.avg, 5.0);
+        assert_eq!(
+            summary.last_reviewed_at.as_deref(),
+            Some("2026-08-20T12:00:00Z")
+        );
+    }
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_unverified_records_on_two_listings_count_separately() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let author = random_id();
+    let first_listing = random_id();
+    let second_listing = random_id();
+    for user in [&seller, &author] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let reviews = [
+        listing_review(&author, &seller, &first_listing, 4, None, now),
+        listing_review(&author, &seller, &second_listing, 2, None, now + 1),
+    ];
+    put_graph_reviews(&reviews).await?;
+
+    let (subject, first) = recompute_pair(&seller, &first_listing).await?;
+    let second = ReputationSummary::recompute_listing(&seller, &second_listing)
+        .await?
+        .expect("the second listing aggregate exists");
+    assert_eq!(subject.count, 2);
+    assert_eq!(subject.unverified_count, 2);
+    assert_eq!(subject.avg, 3.0);
+    assert_eq!(first.count, 1);
+    assert_eq!(first.avg, 4.0);
+    assert_eq!(second.count, 1);
+    assert_eq!(second.avg, 2.0);
+
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&first_listing, &second_listing],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_filtered_records_do_not_replace_counted_unverified_records() -> Result<()> {
+    crate::utils::host_url().await;
+    let seller = random_id();
+    let author = random_id();
+    let first_listing = random_id();
+    let second_listing = random_id();
+    for user in [&seller, &author] {
+        seed_user(user).await?;
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut kept_first = listing_review(&author, &seller, &first_listing, 4, None, now);
+    kept_first.created_at = "2026-08-20T12:00:00Z".to_string();
+    let mut superseded = listing_review(&author, &seller, &first_listing, 1, None, now + 1);
+    superseded.created_at = "2026-08-22T12:00:00Z".to_string();
+    superseded.superseded = true;
+    let superseded_id = superseded.review_id.clone();
+    let mut kept_second = listing_review(&author, &seller, &second_listing, 2, None, now + 2);
+    kept_second.created_at = "2026-08-20T12:00:00Z".to_string();
+    let mut excluded = listing_review(&author, &seller, &second_listing, 5, None, now + 3);
+    excluded.created_at = "2026-08-22T12:00:00Z".to_string();
+    excluded.moderation = Some(ReviewModeration {
+        state: ReviewModerationState::Excluded,
+        reason: "not_counted".to_string(),
+    });
+    let reviews = [kept_first, superseded, kept_second, excluded];
+    put_graph_reviews(&reviews).await?;
+    exec_single_row(queries::put::set_review_superseded(
+        &author,
+        &superseded_id,
+        true,
+    ))
+    .await?;
+
+    let subject =
+        ReputationSummary::recompute_subject(&seller, PubkyAppReviewRole::BuyerReviewingSeller)
+            .await?
+            .expect("the subject aggregate exists");
+    let first = ReputationSummary::recompute_listing(&seller, &first_listing)
+        .await?
+        .expect("the first listing aggregate exists");
+    let second = ReputationSummary::recompute_listing(&seller, &second_listing)
+        .await?
+        .expect("the second listing aggregate exists");
+    assert_eq!(subject.count, 2);
+    assert_eq!(subject.unverified_count, 2);
+    assert_eq!(subject.avg, 3.0);
+    assert_eq!(subject.histogram, [0, 1, 0, 1, 0]);
+    assert_eq!(first.count, 1);
+    assert_eq!(first.avg, 4.0);
+    assert_eq!(second.count, 1);
+    assert_eq!(second.avg, 2.0);
+
+    cleanup_reviews(
+        &seller,
+        &reviews,
+        &[&first_listing, &second_listing],
+        &[&seller, &author],
+        false,
+        false,
+    )
+    .await?;
     Ok(())
 }

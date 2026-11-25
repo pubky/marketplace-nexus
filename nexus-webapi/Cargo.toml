@@ -29,17 +29,21 @@ tower-http = { version = "0.6.8", features = [
     "fs",
     "cors",
     "compression-full",
+    "limit",
+    "timeout",
 ] }
 tracing = { workspace = true }
 utoipa = "5.4.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
 [dev-dependencies]
+nexus-common = { path = "../nexus-common", features = ["test-utils"] }
 anyhow = { workspace = true }
 criterion = { version = "0.8", features = ["async_tokio"] }
 httpc-test = "0.1.10"
 pubky-testnet = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-shared-rt = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 url = "2.5.8"

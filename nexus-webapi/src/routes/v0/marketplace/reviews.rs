@@ -61,7 +61,7 @@ pub struct ReputationQuery {
 
 impl ReviewStreamQuery {
     pub fn initialize_defaults(&mut self) {
-        self.pagination.skip.get_or_insert(0);
+        self.pagination.skip = Some(self.pagination.bounded_skip());
         self.pagination.limit = Some(self.pagination.limit.unwrap_or(10).min(30));
     }
 

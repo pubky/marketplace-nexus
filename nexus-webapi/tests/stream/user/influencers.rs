@@ -88,6 +88,19 @@ async fn test_global_influencers_preview() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn test_global_influencers_preview_ignores_over_cap_skip() -> Result<()> {
+    let preview =
+        get_request("/v0/stream/users?source=influencers&preview=true&skip=20000").await?;
+    let preview = preview.as_array().expect("preview user stream");
+    assert!(!preview.is_empty());
+    assert!(preview.len() <= 3);
+
+    let paged = get_request("/v0/stream/users?source=influencers&skip=20000").await?;
+    assert!(paged.as_array().expect("paged user stream").is_empty());
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn test_global_influencers_skip_limit() -> Result<()> {
     let body = get_request("/v0/stream/users?source=influencers&skip=3&limit=3").await?;
     assert!(body.is_array());

@@ -47,6 +47,29 @@ async fn test_stream_users_for_post_replies() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn test_stream_users_for_post_replies_ignores_over_cap_skip() -> Result<()> {
+    let author_id = "emq37ky6fbnaun7q1ris6rx3mqmw3a33so1txfesg9jj3ak9ryoy";
+    let post_id = "1A1P4D8C9K0F";
+    let base =
+        format!("/v0/stream/users?source=post_replies&post_id={post_id}&author_id={author_id}");
+    let without_skip = get_request(&base).await?;
+    let over_cap = get_request(&format!("{base}&skip=20000")).await?;
+    let ids = |body: &serde_json::Value| {
+        let mut ids: Vec<String> = body
+            .as_array()
+            .expect("user stream")
+            .iter()
+            .map(|user| user["details"]["id"].as_str().expect("user id").to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert!(!without_skip.as_array().expect("user stream").is_empty());
+    assert_eq!(ids(&over_cap), ids(&without_skip));
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn test_stream_users_for_post_replies_no_post_id() -> Result<()> {
     let author_id = "emq37ky6fbnaun7q1ris6rx3mqmw3a33so1txfesg9jj3ak9ryoy";
 

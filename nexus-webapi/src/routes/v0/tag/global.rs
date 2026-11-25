@@ -62,7 +62,7 @@ pub async fn tag_taggers_handler(
         ));
     }
 
-    let skip = query.pagination.skip.unwrap_or(0);
+    let skip = query.pagination.bounded_skip();
     let limit = query.pagination.limit.unwrap_or(20).min(20);
     let timeframe = query.timeframe.unwrap_or(Timeframe::AllTime);
 
@@ -109,7 +109,7 @@ pub async fn hot_tags_handler(Query(query): Query<HotTagsQuery>) -> Result<Json<
         ));
     }
 
-    let skip = query.pagination.skip.unwrap_or(0);
+    let skip = query.pagination.bounded_skip();
     let limit = query.pagination.limit.unwrap_or(40).min(40);
     let taggers_limit = query.taggers_limit.unwrap_or(20).min(20);
     let timeframe = query.timeframe.unwrap_or(Timeframe::AllTime);

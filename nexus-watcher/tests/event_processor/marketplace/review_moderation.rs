@@ -57,6 +57,8 @@ struct Market {
     seller_kp: Keypair,
     seller_id: String,
     listing_id: String,
+    shop_path: ResourcePath,
+    listing_path: ResourcePath,
 }
 
 async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
@@ -74,11 +76,13 @@ async fn market(test: &mut WatcherTest, name: &str) -> Result<Market> {
         PubkyAppListingCondition::Excellent,
         20_000,
     );
-    let (listing_id, _path) = test.create_listing(&seller_kp, &listing).await?;
+    let (listing_id, listing_path) = test.create_listing(&seller_kp, &listing).await?;
     Ok(Market {
         seller_kp,
         seller_id,
         listing_id,
+        shop_path,
+        listing_path,
     })
 }
 
@@ -311,6 +315,61 @@ async fn a_moderator_tag_replayed_before_or_after_the_review_moderates_it() -> R
     assert_counted(&market, 1, 1.0).await;
 
     test.del(&buyer_kp, &review_path).await?;
+    test.cleanup_user(&buyer_kp).await?;
+    test.cleanup_user(&market.seller_kp).await?;
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn a_replayed_tag_recomputes_after_the_details_write_was_missed() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    let market = market(&mut test, "Watcher:ReviewDetailsReplay").await?;
+    let buyer_kp = Keypair::random();
+    let buyer_id = test
+        .create_user(
+            &buyer_kp,
+            &seller_profile("Watcher:ReviewDetailsReplay:Buyer"),
+        )
+        .await?;
+    let moderator_kp = moderator_keypair().await;
+    let moderator_id = test
+        .create_user(
+            &moderator_kp,
+            &seller_profile("Watcher:ReviewDetailsReplay:Moderator"),
+        )
+        .await?;
+
+    let text = "Counted until the replay stores its exclusion.";
+    let review = buyer_review(&market, &buyer_id, 'd', 4, text);
+    let (review_id, review_path) = test.create_review(&buyer_kp, &review).await?;
+    assert_counted(&market, 1, 4.0).await;
+
+    let tag = tag_on_review(&buyer_id, &review_id, EXCLUDE_LABEL);
+    ModeratedReview::put(
+        &buyer_id,
+        &review_id,
+        &tag.uri,
+        &moderator_id,
+        &tag.create_id(),
+        EXCLUDE_LABEL,
+        ReviewModerationState::Excluded,
+        Utc::now().timestamp_millis(),
+    )
+    .await?;
+    let derived = ReviewModeration::derive_and_store(&buyer_id, &review_id).await?;
+    let excluded = moderation(ReviewModerationState::Excluded, EXCLUDE_LABEL);
+    assert_eq!(derived.moderation, excluded);
+    assert_counted(&market, 1, 4.0).await;
+    assert_moderation(&market, &buyer_id, &review_id, None, text).await;
+
+    test.put(&moderator_kp, &tag.hs_path(), &tag).await?;
+    assert_moderation(&market, &buyer_id, &review_id, excluded, text).await;
+    assert_counted(&market, 0, 0.0).await;
+
+    test.del(&moderator_kp, &tag.hs_path()).await?;
+    test.del(&buyer_kp, &review_path).await?;
+    test.del(&market.seller_kp, &market.listing_path).await?;
+    test.del(&market.seller_kp, &market.shop_path).await?;
     test.cleanup_user(&buyer_kp).await?;
     test.cleanup_user(&market.seller_kp).await?;
     Ok(())

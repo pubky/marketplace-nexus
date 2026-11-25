@@ -3,6 +3,10 @@ name = "nexus.example.api"
 public_ip = "127.0.0.1"
 public_addr = "127.0.0.1:8081"
 pubky_listen_socket = "127.0.0.1:8082"
+# Time (in seconds) before a request is answered with 408 Request Timeout; must be at least 1 and greater than stack.media.process_timeout_secs
+request_timeout_secs = 30
+# Maximum size (in bytes) accepted for a request body
+max_body_size_bytes = 1048576
 
 [stack]
 # Logging, options: error, warn, info, debug and trace
@@ -10,6 +14,10 @@ log_level = "debug"
 files_path = "./examples/static/files"
 # OTLP_ENDPOINT is set to empty by default. If you want to enable tracing, set it to the OpenTelemetry Collector endpoint
 #otlp_endpoint="http://localhost:4317"
+
+[stack.media]
+max_concurrency = 2
+process_timeout_secs = 20
 
 [stack.db]
 redis = "redis://127.0.0.1:6379"

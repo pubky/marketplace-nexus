@@ -4,7 +4,7 @@ use std::{
 };
 
 use clap::Parser;
-use nexus_common::{file::validate_and_expand_path, types::DynError, ApiConfig, StackConfig};
+use nexus_common::{file::validate_and_expand_path, types::DynError, ApiConfig};
 use nexus_webapi::{api_context::ApiContextBuilder, NexusApi, NexusApiBuilder};
 
 #[derive(Parser)]
@@ -30,7 +30,7 @@ async fn main() -> Result<(), DynError> {
                 public_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 public_addr: SocketAddr::from(([127, 0, 0, 1], 8081)),
                 pubky_listen_socket: SocketAddr::from(([127, 0, 0, 1], 8082)),
-                stack: StackConfig::default(),
+                ..Default::default()
             };
 
             let api_context = ApiContextBuilder::from_default_config_dir()

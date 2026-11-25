@@ -1,6 +1,17 @@
 use crate::db::get_redis_conn;
 use crate::db::kv::RedisResult;
+use crate::types::MAX_PAGE_SKIP;
 use deadpool_redis::redis::AsyncCommands;
+
+const MAX_SSCAN_COUNT: usize = 1_000;
+
+fn sscan_count(limit: usize) -> usize {
+    limit.min(MAX_SSCAN_COUNT)
+}
+
+fn sscan_batch(skip: usize, limit: usize) -> usize {
+    sscan_count(skip.saturating_add(limit))
+}
 
 /// Adds elements to a Redis set.
 ///
@@ -69,6 +80,10 @@ pub async fn get_range(
     skip: Option<usize>,
     limit: Option<usize>,
 ) -> RedisResult<Option<Vec<String>>> {
+    if skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+        return Ok(Some(Vec::new()));
+    }
+
     let mut redis_conn = get_redis_conn().await?;
 
     let index_key = format!("{prefix}:{key}");
@@ -84,7 +99,7 @@ pub async fn get_range(
             .arg(&index_key)
             .arg(&cursor)
             .arg("COUNT")
-            .arg(limit)
+            .arg(sscan_batch(skip, limit))
             .query_async(&mut redis_conn)
             .await?;
 
@@ -370,4 +385,38 @@ pub async fn get_random_members(
         .await?;
 
     Ok(Some(random_members))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sscan_count_keeps_small_limits() {
+        assert_eq!(sscan_count(0), 0);
+        assert_eq!(sscan_count(40), 40);
+        assert_eq!(sscan_count(MAX_SSCAN_COUNT), MAX_SSCAN_COUNT);
+    }
+
+    #[test]
+    fn sscan_count_caps_large_limits() {
+        assert_eq!(sscan_count(MAX_SSCAN_COUNT + 1), MAX_SSCAN_COUNT);
+        assert_eq!(sscan_count(usize::MAX), MAX_SSCAN_COUNT);
+    }
+
+    #[test]
+    fn sscan_batch_covers_skip_and_limit() {
+        assert_eq!(sscan_batch(900, 5), 905);
+        assert_eq!(sscan_batch(10_000, 5), MAX_SSCAN_COUNT);
+        assert_eq!(sscan_batch(0, 40), 40);
+        assert_eq!(sscan_batch(usize::MAX, 5), MAX_SSCAN_COUNT);
+    }
+
+    #[tokio::test]
+    async fn set_range_above_the_skip_bound_returns_an_empty_page() {
+        let page = get_range("Missing", "set", Some(MAX_PAGE_SKIP + 1), Some(1))
+            .await
+            .expect("empty page");
+        assert_eq!(page, Some(Vec::new()));
+    }
 }

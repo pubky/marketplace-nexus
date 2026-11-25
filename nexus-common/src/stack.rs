@@ -1,4 +1,5 @@
 use crate::db::{Neo4jConnector, RedisConnector};
+use crate::media::processors::init_media_config;
 use crate::models::homeserver::HomeserverAllowlist;
 use crate::types::DynError;
 use crate::{Level, StackConfig};
@@ -18,6 +19,7 @@ pub struct StackManager {}
 
 impl StackManager {
     pub async fn setup(name: &str, config: &StackConfig) -> Result<(), DynError> {
+        init_media_config(&config.media);
         // Initialize logging and metrics
         Self::setup_logging(name, &config.otlp_endpoint, config.log_level).await;
         Self::setup_metrics(name, &config.otlp_endpoint).await;

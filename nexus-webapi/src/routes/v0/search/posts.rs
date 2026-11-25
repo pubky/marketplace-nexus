@@ -47,7 +47,7 @@ pub async fn search_posts_by_tag_handler(
         tag, sorting, pagination.start, pagination.end, pagination.skip, pagination.limit
     );
 
-    let skip = pagination.skip.unwrap_or(0);
+    let skip = pagination.bounded_skip();
     let limit = pagination.bounded_limit(20);
 
     pagination.skip = Some(skip);

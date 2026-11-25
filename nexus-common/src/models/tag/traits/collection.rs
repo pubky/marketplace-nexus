@@ -4,7 +4,7 @@ use crate::db::{
     execute_graph_operation, fetch_row_from_graph, queries, GraphResult, OperationOutcome, RedisOps,
 };
 use crate::models::error::ModelResult;
-use crate::types::bounded_page_limit;
+use crate::types::{bounded_page_limit, bounded_page_skip, Pagination};
 use async_trait::async_trait;
 use tracing::error;
 
@@ -16,6 +16,55 @@ const CACHE_SORTED_SET_PREFIX: &str = "Cache:Sorted";
 pub const CACHE_SET_PREFIX: &str = "Cache";
 // TTL, 3HR
 const CACHE_TTL: i64 = 3 * 60 * 60;
+pub(crate) const MAX_TAG_PAGE: usize = 100;
+pub(crate) const MAX_TAG_SKIP: usize = 10_000;
+
+fn tag_skip(requested: Option<usize>) -> usize {
+    match bounded_page_skip(requested) {
+        skip if skip > MAX_TAG_SKIP => usize::MAX,
+        skip => skip,
+    }
+}
+
+pub(crate) fn tag_page(
+    skip_tags: Option<usize>,
+    limit_tags: Option<usize>,
+    limit_taggers: Option<usize>,
+) -> (usize, usize, usize) {
+    (
+        tag_skip(skip_tags),
+        limit_tags.unwrap_or(5).min(MAX_TAG_PAGE),
+        limit_taggers.unwrap_or(5).min(MAX_TAG_PAGE),
+    )
+}
+
+pub(crate) fn taggers_page(pagination: &Pagination) -> (usize, usize) {
+    (
+        tag_skip(pagination.skip),
+        bounded_page_limit(pagination.limit, 40).min(MAX_TAG_PAGE),
+    )
+}
+
+fn page_tag_details(
+    mut tags: Vec<TagDetails>,
+    skip_tags: usize,
+    limit_tags: usize,
+    limit_taggers: usize,
+) -> Vec<TagDetails> {
+    tags.sort_by(|a, b| {
+        b.taggers_count
+            .cmp(&a.taggers_count)
+            .then_with(|| b.label.cmp(&a.label))
+    });
+    tags.into_iter()
+        .skip(skip_tags)
+        .take(limit_tags)
+        .map(|mut tag| {
+            tag.taggers.truncate(limit_taggers);
+            tag
+        })
+        .collect()
+}
 
 /// Details of a deleted `TAGGED` relationship's target, as returned by the
 /// `delete_tag` graph query. Exactly one target shape is populated:
@@ -70,6 +119,7 @@ where
         viewer_id: Option<&str>,
         depth: Option<u8>,
     ) -> ModelResult<Option<Vec<TagDetails>>> {
+        let (skip_tags, limit_tags, limit_taggers) = tag_page(skip_tags, limit_tags, limit_taggers);
         // Query for the tags that are in its WoT
         // Actually we just apply that search to User node
         if viewer_id.is_some() && matches!(depth, Some(1..=3)) {
@@ -77,9 +127,9 @@ where
                 user_id,
                 viewer_id,
                 viewer_id,
-                skip_tags,
-                limit_tags,
-                limit_taggers,
+                Some(skip_tags),
+                Some(limit_tags),
+                Some(limit_taggers),
                 true,
             )
             .await?
@@ -91,7 +141,12 @@ where
                         Self::get_from_graph(user_id, viewer_id, Some(depth)).await?;
                     if let Some(tag_details) = graph_response {
                         Self::put_to_index(user_id, viewer_id, &tag_details, true).await?;
-                        return Ok(Some(tag_details));
+                        return Ok(Some(page_tag_details(
+                            tag_details,
+                            skip_tags,
+                            limit_tags,
+                            limit_taggers,
+                        )));
                     }
                     return Ok(None);
                 }
@@ -102,9 +157,9 @@ where
             user_id,
             extra_param,
             viewer_id,
-            skip_tags,
-            limit_tags,
-            limit_taggers,
+            Some(skip_tags),
+            Some(limit_tags),
+            Some(limit_taggers),
             false,
         )
         .await?
@@ -114,7 +169,12 @@ where
                 let graph_response = Self::get_from_graph(user_id, extra_param, None).await?;
                 if let Some(tag_details) = graph_response {
                     Self::put_to_index(user_id, extra_param, &tag_details, false).await?;
-                    return Ok(Some(tag_details));
+                    return Ok(Some(page_tag_details(
+                        tag_details,
+                        skip_tags,
+                        limit_tags,
+                        limit_taggers,
+                    )));
                 }
                 Ok(None)
             }
@@ -142,9 +202,9 @@ where
         limit_taggers: Option<usize>,
         is_cache: bool,
     ) -> RedisResult<Option<Vec<TagDetails>>> {
-        let limit_tags = bounded_page_limit(limit_tags, 5);
+        let limit_tags = limit_tags.unwrap_or(5);
         let skip_tags = skip_tags.unwrap_or(0);
-        let limit_taggers = bounded_page_limit(limit_taggers, 5);
+        let limit_taggers = limit_taggers.unwrap_or(5);
         let key_parts = Self::create_sorted_set_key_parts(user_id, extra_param, is_cache);
         // Prepare the extra prefix for cache search
         let cache_prefix = match is_cache {
@@ -502,5 +562,88 @@ where
             },
             None => format!("{user_id}:{label}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_page_uses_defaults() {
+        assert_eq!(tag_page(None, None, None), (0, 5, 5));
+        assert_eq!(taggers_page(&Pagination::default()), (0, 40));
+    }
+
+    #[test]
+    fn tag_page_keeps_values_inside_bounds() {
+        assert_eq!(tag_page(Some(10), Some(20), Some(30)), (10, 20, 30));
+        let pagination = Pagination {
+            skip: Some(10),
+            limit: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(taggers_page(&pagination), (10, 20));
+    }
+
+    #[test]
+    fn tag_page_above_the_skip_bound_requests_an_empty_page() {
+        assert_eq!(
+            tag_page(Some(MAX_TAG_SKIP + 1), Some(101), Some(101)),
+            (usize::MAX, MAX_TAG_PAGE, MAX_TAG_PAGE)
+        );
+        let pagination = Pagination {
+            skip: Some(MAX_TAG_SKIP + 1),
+            limit: Some(101),
+            ..Default::default()
+        };
+        assert_eq!(taggers_page(&pagination), (usize::MAX, MAX_TAG_PAGE));
+    }
+
+    #[test]
+    fn tag_page_maximum_skip_requests_an_empty_page() {
+        assert_eq!(
+            tag_page(Some(usize::MAX), Some(usize::MAX), Some(usize::MAX)),
+            (usize::MAX, MAX_TAG_PAGE, MAX_TAG_PAGE)
+        );
+        let pagination = Pagination {
+            skip: Some(usize::MAX),
+            limit: Some(usize::MAX),
+            ..Default::default()
+        };
+        assert_eq!(taggers_page(&pagination), (usize::MAX, MAX_TAG_PAGE));
+    }
+
+    #[test]
+    fn graph_tag_page_slices_tags_and_taggers() {
+        let tags = (0..3)
+            .map(|index| TagDetails {
+                label: index.to_string(),
+                taggers: vec!["a".into(), "b".into()],
+                taggers_count: 2,
+                relationship: false,
+            })
+            .collect();
+        let page = page_tag_details(tags, 1, 1, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].label, "1");
+        assert_eq!(page[0].taggers, ["a"]);
+        assert_eq!(page[0].taggers_count, 2);
+    }
+
+    #[test]
+    fn graph_tag_page_sorts_counts_and_labels_before_slicing() {
+        let tags = ["p2p", "privacy", "cycle", "pubky", "pkarr"]
+            .into_iter()
+            .map(|label| TagDetails {
+                label: label.into(),
+                taggers: vec!["a".into()],
+                taggers_count: if label == "privacy" { 3 } else { 1 },
+                relationship: false,
+            })
+            .collect();
+        let page = page_tag_details(tags, 1, 4, 1);
+        let labels: Vec<&str> = page.iter().map(|tag| tag.label.as_str()).collect();
+        assert_eq!(labels, ["pubky", "pkarr", "p2p", "cycle"]);
     }
 }

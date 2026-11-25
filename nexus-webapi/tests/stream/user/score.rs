@@ -128,6 +128,36 @@ async fn test_stream_recommended() -> Result<()> {
 }
 
 #[tokio_shared_rt::test(shared)]
+async fn test_stream_recommended_ignores_over_cap_skip() -> Result<()> {
+    use nexus_common::models::user::{UserStream, UserStreamInput, UserStreamSource};
+
+    crate::utils::host_url().await;
+    let user_id = "4snwyct86m383rsduhw5xgcxpw7c63j3pq8x4ycqikxgik8y64ro";
+    let input = |skip| UserStreamInput {
+        user_id: Some(user_id.to_string()),
+        skip,
+        limit: Some(100),
+        source: UserStreamSource::Recommended,
+        reach: None,
+        timeframe: None,
+        preview: None,
+        author_id: None,
+        post_id: None,
+    };
+    let mut without_skip = UserStream::get_user_list_from_source(input(None))
+        .await?
+        .expect("recommendations");
+    let mut over_cap = UserStream::get_user_list_from_source(input(Some(20_000)))
+        .await?
+        .expect("recommendations over the skip cap");
+    without_skip.sort();
+    over_cap.sort();
+    assert!(!without_skip.is_empty());
+    assert_eq!(over_cap, without_skip);
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
 async fn test_stream_recommended_missing_user_id() -> Result<()> {
     // Test retrieving recommended users without providing user_id
     let res = invalid_get_request(

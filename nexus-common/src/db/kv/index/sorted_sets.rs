@@ -1,5 +1,6 @@
 use crate::db::get_redis_conn;
 use crate::db::kv::RedisResult;
+use crate::types::MAX_PAGE_SKIP;
 use redis::AsyncCommands;
 use serde::Deserialize;
 use utoipa::ToSchema;
@@ -143,6 +144,10 @@ pub async fn get_range(
     limit: Option<usize>,
     sorting: SortOrder,
 ) -> RedisResult<Option<Vec<(String, f64)>>> {
+    if skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+        return Ok(Some(Vec::new()));
+    }
+
     let mut redis_conn = get_redis_conn().await?;
     let index_key = format!("{prefix}:{key}");
 
@@ -153,8 +158,8 @@ pub async fn get_range(
 
     let min_score = min_score.unwrap_or(f64::MIN);
     let max_score = max_score.unwrap_or(f64::MAX);
-    let skip = skip.unwrap_or(0) as isize;
-    let limit = limit.unwrap_or(1000) as isize;
+    let skip = isize::try_from(skip.unwrap_or(0)).unwrap_or(isize::MAX);
+    let limit = isize::try_from(limit.unwrap_or(1000)).unwrap_or(isize::MAX);
 
     // ZRANGE with the WITHSCORES option retrieves both: the elements and their scores
     let elements: Vec<(String, f64)> = match sorting {
@@ -190,10 +195,14 @@ pub async fn get_lex_range(
     skip: Option<usize>,
     limit: Option<usize>,
 ) -> RedisResult<Option<Vec<String>>> {
+    if skip.is_some_and(|skip| skip > MAX_PAGE_SKIP) {
+        return Ok(Some(Vec::new()));
+    }
+
     let mut redis_conn = get_redis_conn().await?;
     let index_key = format!("{prefix}:{key}");
-    let skip = skip.unwrap_or(0) as isize;
-    let limit = limit.unwrap_or(1000) as isize;
+    let skip = isize::try_from(skip.unwrap_or(0)).unwrap_or(isize::MAX);
+    let limit = isize::try_from(limit.unwrap_or(1000)).unwrap_or(isize::MAX);
 
     let elements: Vec<String> = redis_conn
         .zrangebylex_limit(index_key, min, max, skip, limit)
@@ -246,4 +255,40 @@ pub async fn del(prefix: &str, key: &str, values: &[&str]) -> RedisResult<()> {
     // Remove the elements from the sorted set
     let _: () = redis_conn.zrem(index_key, values).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn score_range_above_the_skip_bound_returns_an_empty_page() {
+        let page = get_range(
+            "Missing",
+            "score",
+            None,
+            None,
+            Some(MAX_PAGE_SKIP + 1),
+            Some(1),
+            SortOrder::Descending,
+        )
+        .await
+        .expect("empty page");
+        assert_eq!(page, Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn lex_range_above_the_skip_bound_returns_an_empty_page() {
+        let page = get_lex_range(
+            "Missing",
+            "lex",
+            "[a",
+            "(z",
+            Some(MAX_PAGE_SKIP + 1),
+            Some(1),
+        )
+        .await
+        .expect("empty page");
+        assert_eq!(page, Some(Vec::new()));
+    }
 }
