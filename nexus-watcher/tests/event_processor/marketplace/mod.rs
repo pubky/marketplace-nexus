@@ -12,6 +12,7 @@ mod review_moderation;
 mod review_per_item;
 mod review_trust_buckets;
 mod shop;
+mod social_v1;
 mod stale_prune;
 mod tag;
 mod tag_cleanup;
