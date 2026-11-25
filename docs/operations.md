@@ -126,6 +126,13 @@ whether a listing is moderated, through the listing's own marker or its
 seller's, for a listing the index holds or not; the transaction service reads
 it before it sells, takes a bid on, or takes an offer on a listing.
 
+The moderator account may migrate to Social v1 like any user (README,
+"Social v1: two epochs per user"). Its tags under `/pub/pubky.app/tags/` count
+until its `/pub/social/v1/profile.json` is indexed, and its tags under
+`/pub/social/v1/tags/` from then on. Takedowns placed before the migration
+hold, and are lifted by deleting their `social/v1` copy; deleting only the
+`pubky.app` copy after the migration lifts nothing.
+
 ### Index discovery: launched setting
 
 | Setting | Launched value | Where |
