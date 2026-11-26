@@ -10,6 +10,7 @@ license = "MIT"
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
+deadpool-redis = { workspace = true }
 futures = { workspace = true }
 neo4rs = { workspace = true }
 opentelemetry = { workspace = true }
@@ -29,6 +30,7 @@ anyhow = { workspace = true }
 base32 = "0.5"
 ed25519-dalek = "2"
 httpc-test = "0.1.10"
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 pubky-testnet = { workspace = true }
 # The migrator is only a test oracle: the agreement test in `events::flip` compares the ids the
 # flip leaves with the ones the migrator writes from the same `pubky.app` bytes.
@@ -36,3 +38,4 @@ pubky-social-specs = { workspace = true, features = ["migrator"] }
 rand = "0.10.0"
 tokio = { workspace = true, features = ["test-util"] }
 tokio-shared-rt = { workspace = true }
+tracing-test = { workspace = true }

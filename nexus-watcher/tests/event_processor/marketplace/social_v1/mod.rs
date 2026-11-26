@@ -2,6 +2,7 @@
 //! `pubky.app` until their `social/v1/profile.json` flips them, then through `social/v1` only,
 //! while their marketplace records index in every epoch.
 
+mod flip_retry;
 mod flip_transaction;
 mod follows;
 mod invalid;

@@ -17,10 +17,14 @@
 //! Follows are keyed by the two users and need no rewrite. The user's edges are read in keyset
 //! pages and their markers in one read; every rewrite and the epoch are then written by one
 //! statement, one transaction, so a flip that fails leaves nothing half rewritten: the user
-//! stays at `v0` with their `pubky.app` ids, and their next `social/v1` profile PUT runs it again.
+//! stays at `v0` with their `pubky.app` ids, and the retry queue runs it again
+//! ([`flip_and_settle`]).
 
+use crate::events::epoch_gate::flip_profile_uri;
+use crate::events::epoch_metrics::{self, RetryOutcome};
 use crate::events::handlers;
 use crate::events::remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
+use crate::events::retry::queue::{RetryKind, RetryQueue};
 use crate::events::social_v1;
 use nexus_common::db::queries::social_v1::FlipRewrite;
 use nexus_common::db::{fetch_all_rows_from_graph, fetch_key_from_graph, queries, GraphError};
@@ -35,6 +39,46 @@ use tracing::{debug, info, warn};
 
 /// `TAGGED` edges read per keyset page.
 const EDGE_BATCH: usize = 500;
+
+/// Runs [`flip`] for `event` and settles the user's flip in `retry_queue`.
+///
+/// A flip that leaves the user at `v0` for a reason that can pass is a
+/// [`EventProcessorError::FlipFailed`], which the caller queues: the user's `social/v1` writes
+/// are deferred behind it. Otherwise the flip is settled, whatever `flip` returned: the user
+/// moved to `v1`, or had no profile to flip with, or one the reader refuses for good. Their
+/// queued flip, if any, is removed and the writes deferred behind it are woken, to run through
+/// the gate again: at `v1` they are handled, at `v0` they are ignored as before.
+///
+/// A failed epoch read after the flip leaves it undecided, and is a `FlipFailed` too: the retry
+/// reads the epoch again, and a user found at `v1` settles there.
+pub async fn flip_and_settle(
+    event: &Event,
+    retry_queue: &RetryQueue,
+) -> Result<(), EventProcessorError> {
+    let result = flip(event).await;
+    let user_id = &event.parsed_uri.user_id;
+    let landed = match Epoch::get_from_graph(user_id).await {
+        Ok(epoch) => epoch == Epoch::V1,
+        Err(read_error) => {
+            let cause = result.err().unwrap_or_else(|| read_error.into());
+            return Err(EventProcessorError::FlipFailed(Box::new(cause)));
+        }
+    };
+    match result {
+        Err(error) if !landed && !error.is_permanent() => {
+            Err(EventProcessorError::FlipFailed(Box::new(error)))
+        }
+        result => {
+            let flip_uri = flip_profile_uri(user_id);
+            let woken = retry_queue.resolve_flip(&flip_uri).await?;
+            if woken > 0 {
+                info!(%user_id, %flip_uri, woken, landed, "Flip settled; woke the writes deferred behind it");
+                epoch_metrics::record_retry(RetryKind::Deferred, RetryOutcome::Woken, woken as u64);
+            }
+            result
+        }
+    }
+}
 
 /// Flips the user of `event`, a `social/v1` profile PUT of a user at `v0`.
 ///

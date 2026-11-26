@@ -7,12 +7,14 @@ use nexus_common::models::marketplace::{
 use nexus_common::models::user::Epoch;
 use pubky_app_specs::{PubkyAppObject, PubkyId, Resource, VALIDATION_LIMITS};
 use remote_body::{fetch_record_capped, MAX_RECORD_BYTES};
+use retry::queue::RetryQueue;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
 mod directory_page;
 pub mod epoch_gate;
+pub mod epoch_metrics;
 pub mod flip;
 pub mod handlers;
 mod moderation;
@@ -22,12 +24,41 @@ pub mod social_v1;
 
 pub use moderation::Moderation;
 
+/// What [`handle_gated`] did with an event it did not fail on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handled {
+    Applied,
+    /// The epoch gate ignored it.
+    Ignored,
+}
+
+/// Handles one event after the epoch gate (see [`epoch_gate`]), as [`handle_gated`] does,
+/// without saying whether the gate ignored it.
+pub async fn handle(
+    event: &Event,
+    moderation: Arc<Moderation>,
+    retry_queue: &RetryQueue,
+) -> Result<(), EventProcessorError> {
+    handle_gated(event, moderation, retry_queue).await.map(drop)
+}
+
 /// Handles one event after the epoch gate (see [`epoch_gate`]). An ignored event is skipped
-/// without a fetch, an error or a stored event line.
-pub async fn handle(event: &Event, moderation: Arc<Moderation>) -> Result<(), EventProcessorError> {
-    match epoch_gate::check(event).await? {
-        Gate::Ignore => return Ok(()),
-        Gate::Flip => Box::pin(flip::flip(event)).await?,
+/// without a fetch, an error or a stored event line. A deferred one is the
+/// [`EventProcessorError::DeferredUntilFlip`] the caller parks in `retry_queue`, and a flip
+/// that fails is the [`EventProcessorError::FlipFailed`] the caller queues there.
+pub async fn handle_gated(
+    event: &Event,
+    moderation: Arc<Moderation>,
+    retry_queue: &RetryQueue,
+) -> Result<Handled, EventProcessorError> {
+    match epoch_gate::check(event, retry_queue).await? {
+        Gate::Ignore => return Ok(Handled::Ignored),
+        Gate::Defer => {
+            return Err(EventProcessorError::DeferredUntilFlip {
+                flip_uri: epoch_gate::flip_profile_uri(&event.parsed_uri.user_id),
+            })
+        }
+        Gate::Flip => Box::pin(flip::flip_and_settle(event, retry_queue)).await?,
         Gate::Handle => match event.event_type {
             EventType::Put => Box::pin(handle_put_event(event, moderation)).await?,
             EventType::Del => Box::pin(handle_del_event(event)).await?,
@@ -35,7 +66,7 @@ pub async fn handle(event: &Event, moderation: Arc<Moderation>) -> Result<(), Ev
     }
 
     event.store_event().await?;
-    Ok(())
+    Ok(Handled::Applied)
 }
 
 /// Handles a PUT of one of the `social/v1` objects the marketplace indexer reads, its record

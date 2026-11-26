@@ -432,14 +432,40 @@ finds its edge or marker and changes no count. The epoch is the
 `epoch` property of the `User` node (absent means `v0`). The user's edges are
 read in pages, then every rewrite and the epoch are written in one Neo4j
 transaction. For a user already in the graph, a failure before that commit
-writes nothing and reruns the whole flip on the user's next `social/v1` profile
-PUT. A user new to the graph is created from the profile and then given the
-epoch, in two writes; a failure between them leaves the new user at `v0` until
-their next `social/v1` profile PUT runs the flip again. For a user already in the
-graph the profile is read after the commit, as in `pubky-nexus`, so a profile
-that is gone or rejected leaves them at `v1` with the profile they had, and
-their next profile PUT is an ordinary edit. The user's other events in between
-are not deferred.
+writes nothing. A user new to the graph is created from the profile and then
+given the epoch, in two writes; a failure between them leaves the new user at
+`v0`. For a user already in the graph the profile is read after the commit, as
+in `pubky-nexus`, so a profile that is gone or rejected leaves them at `v1` with
+the profile they had, and their next profile PUT is an ordinary edit.
+
+A flip that fails and leaves the user at `v0` goes to the watcher's retry queue
+in Redis (`RetryQueue:entry:{uri}`, the `RetryQueue:due` schedule and the
+`RetryQueue:parked` set) and runs again after a backoff that doubles from 10
+seconds to an hour, without limit, until it lands; a profile the reader rejects
+is not retried, and a new profile PUT runs the flip at once. While the flip
+waits, the user's other `social/v1` writes, PUT and DEL, among them the
+moderator's takedowns and untags, are deferred instead of ignored: each is
+parked, one entry per address holding its latest event, at most 10 000 per
+user, a write parked again included (a write over the cap is logged and
+dropped). The writes a flip wakes are due at once: a flip that lands in a retry
+pass has them replayed in that pass, unless the pass reaches its attempt limit
+or timeout, and a flip that lands on a new profile PUT has them replayed in the
+pass after the polls. A woken write is replayed at most 10 times in all, Neo4j
+and Redis failures uncounted. A flip that settles without landing, the profile
+gone or rejected, leaves the user at `v0`, so their woken writes are ignored as
+before and counted as `ignored`. A woken PUT reads its record as it is when
+replayed, and a woken DEL applies only while its record is still gone, read
+within the 30 second record fetch deadline, so a replay never undoes a newer
+write, and that read gives up after the deadline when the homeserver hangs. The
+user's `pubky.app` DELs are not deferred, unlike in `pubky-nexus`: this flip
+rewrites ids in place, so they apply to the records the flip will move. The
+queue runs once per watcher loop, after the homeserver polls, attempting at
+most 10 000 entries per pass and each entry at most once per pass. The counters
+`watcher.epoch.skipped` (labels `epoch`, `resource`, `reason`: `gated` or
+`deferred`) and `watcher.retry.events` (labels `kind`: `flip` or `deferred`;
+`outcome`: `queued`, `parked`, `overflow`, `woken`, `applied`, `ignored`,
+`rescheduled`, `dropped`, `exhausted`) count gated and deferred events and
+every retry outcome, and deferrals and failed retries log at warn.
 
 Tags take their target from either epoch: a user is named by either profile
 address or the bare key, a post by either post address, and listings, shops

@@ -1,3 +1,5 @@
+use crate::events::retry::processor::{RetryPolicy, RetryProcessor};
+use crate::events::retry::queue::RetryQueue;
 use crate::events::Moderation;
 use crate::service::traits::{TEventProcessor, TEventProcessorRunner};
 use crate::service::{processor::EventProcessor, HomeserverPollBackoff};
@@ -21,9 +23,22 @@ pub struct EventProcessorRunner {
     /// See [WatcherConfig::homeserver]
     pub default_homeserver: PubkyId,
     pub poll_backoff: Arc<HomeserverPollBackoff>,
+    pub retry_queue: RetryQueue,
+    pub retry_policy: RetryPolicy,
 }
 
 impl EventProcessorRunner {
+    /// The processor that replays this runner's retry queue, with its moderation and files path.
+    pub fn retry_processor(&self) -> RetryProcessor {
+        RetryProcessor {
+            retry_queue: self.retry_queue.clone(),
+            policy: self.retry_policy,
+            moderation: self.moderation.clone(),
+            files_path: self.files_path.clone(),
+            shutdown_rx: self.shutdown_rx.clone(),
+        }
+    }
+
     /// Creates a new instance from the provided configuration
     pub fn from_config(config: &WatcherConfig, shutdown_rx: Receiver<bool>) -> Self {
         Self {
@@ -39,6 +54,8 @@ impl EventProcessorRunner {
             shutdown_rx,
             default_homeserver: config.homeserver.clone(),
             poll_backoff: Arc::new(HomeserverPollBackoff::default()),
+            retry_queue: RetryQueue::default(),
+            retry_policy: RetryPolicy::default(),
         }
     }
 }
@@ -103,6 +120,8 @@ impl TEventProcessorRunner for EventProcessorRunner {
             moderation: self.moderation.clone(),
             shutdown_rx: self.shutdown_rx.clone(),
             poll_backoff: self.poll_backoff.clone(),
+            retry_queue: self.retry_queue.clone(),
+            retry_policy: self.retry_policy,
         }))
     }
 }

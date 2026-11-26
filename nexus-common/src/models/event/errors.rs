@@ -40,6 +40,16 @@ pub enum EventProcessorError {
     #[error("UnsupportedTarget: {0}")]
     UnsupportedTarget(String),
 
+    /// A `v0` user's flip did not land: they stay at `v0`. Their `social/v1` profile PUT waits
+    /// in the watcher's retry queue, retried without limit while they are at `v0`, and their
+    /// `social/v1` writes are deferred behind it.
+    #[error("FlipFailed: {0}")]
+    FlipFailed(Box<EventProcessorError>),
+
+    /// A `v0` user's `social/v1` write, held until their flip, queued at `flip_uri`, lands.
+    #[error("DeferredUntilFlip: waits for the flip at {flip_uri}")]
+    DeferredUntilFlip { flip_uri: String },
+
     /// The Pubky client could not resolve the pubky
     #[error("PubkyClientError: {0}")]
     PubkyClientError(#[from] crate::db::PubkyClientError),
@@ -127,5 +137,83 @@ impl EventProcessorError {
 
     pub fn generic(source: impl std::fmt::Display) -> Self {
         Self::Generic(source.to_string())
+    }
+
+    /// Whether the same event fails the same way on every attempt: its line, its record's
+    /// bytes or its tag target is refused. Such an event is never retried.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidEventLine(_) | Self::SpecValidation(_) | Self::UnsupportedTarget(_)
+        )
+    }
+
+    /// Whether Neo4j or Redis failed the operation, rather than the event itself.
+    pub fn is_store_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::GraphQueryFailed(_) | Self::IndexOperationFailed(_)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EventProcessorError;
+
+    #[test]
+    fn only_refused_lines_records_and_targets_are_permanent() {
+        let permanent = [
+            EventProcessorError::InvalidEventLine("line".into()),
+            EventProcessorError::SpecValidation("bytes".into()),
+            EventProcessorError::UnsupportedTarget("target".into()),
+        ];
+        for error in &permanent {
+            assert!(error.is_permanent(), "{error}");
+        }
+        let retried = [
+            EventProcessorError::GraphQueryFailed("down".into()),
+            EventProcessorError::IndexOperationFailed("down".into()),
+            EventProcessorError::missing_dependencies(vec!["pubky://dep".into()]),
+            EventProcessorError::SkipIndexing,
+            EventProcessorError::client_error("unreachable".into()),
+            EventProcessorError::FlipFailed(Box::new(EventProcessorError::SpecValidation(
+                "bytes".into(),
+            ))),
+            EventProcessorError::DeferredUntilFlip {
+                flip_uri: "pubky://user/pub/social/v1/profile.json".into(),
+            },
+        ];
+        for error in &retried {
+            assert!(!error.is_permanent(), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_failed_flip_keeps_its_cause_through_serde() {
+        let error = EventProcessorError::FlipFailed(Box::new(
+            EventProcessorError::GraphQueryFailed("missing label".into()),
+        ));
+        let json = serde_json::to_string(&error).unwrap();
+        let back: EventProcessorError = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.to_string(),
+            "FlipFailed: GraphQueryFailed: missing label"
+        );
+    }
+
+    #[test]
+    fn only_neo4j_and_redis_failures_are_store_failures() {
+        assert!(EventProcessorError::GraphQueryFailed("down".into()).is_store_failure());
+        assert!(EventProcessorError::IndexOperationFailed("down".into()).is_store_failure());
+        for error in [
+            EventProcessorError::SkipIndexing,
+            EventProcessorError::client_error("unreachable".into()),
+            EventProcessorError::FlipFailed(Box::new(EventProcessorError::GraphQueryFailed(
+                "down".into(),
+            ))),
+        ] {
+            assert!(!error.is_store_failure(), "{error}");
+        }
     }
 }
