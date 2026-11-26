@@ -446,19 +446,26 @@ is not retried, and a new profile PUT runs the flip at once. While the flip
 waits, the user's other `social/v1` writes, PUT and DEL, among them the
 moderator's takedowns and untags, are deferred instead of ignored: each is
 parked, one entry per address holding its latest event, at most 10 000 per
-user (a write over the cap is logged and dropped). The pass that lands the flip
-replays them in the same pass; a replay that fails again is retried, up to 10
-times, Neo4j and Redis failures uncounted. A woken PUT reads its record as it is
-when replayed, and a woken DEL applies only while its record is still gone, so
-a replay never undoes a newer write. The user's `pubky.app` DELs are not
-deferred, unlike in `pubky-nexus`: this flip rewrites ids in place, so they
-apply to the records the flip will move. The queue runs once per watcher loop,
-after the homeserver polls, attempting at most 10 000 entries per pass and each
-entry at most once per pass. The counters `watcher.epoch.skipped` (labels
-`epoch`, `resource`, `reason`: `gated` or `deferred`) and
-`watcher.retry.events` (labels `kind`: `flip` or `deferred`; `outcome`:
-`queued`, `parked`, `overflow`, `woken`, `applied`, `rescheduled`, `dropped`,
-`exhausted`) count them, and deferrals and retries log at warn.
+user, a write parked again included (a write over the cap is logged and
+dropped). The writes a flip wakes are due at once: a flip that lands in a retry
+pass has them replayed in that pass, unless the pass reaches its attempt limit
+or timeout, and a flip that lands on a new profile PUT has them replayed in the
+pass after the polls. A woken write is replayed at most 10 times in all, Neo4j
+and Redis failures uncounted. A flip that settles without landing, the profile
+gone or rejected, leaves the user at `v0`, so their woken writes are ignored as
+before and counted as `ignored`. A woken PUT reads its record as it is when
+replayed, and a woken DEL applies only while its record is still gone, read
+within the 30 second record fetch deadline, so a replay never undoes a newer
+write and a hung homeserver holds the pass one deadline per woken DEL. The
+user's `pubky.app` DELs are not deferred, unlike in `pubky-nexus`: this flip
+rewrites ids in place, so they apply to the records the flip will move. The
+queue runs once per watcher loop, after the homeserver polls, attempting at
+most 10 000 entries per pass and each entry at most once per pass. The counters
+`watcher.epoch.skipped` (labels `epoch`, `resource`, `reason`: `gated` or
+`deferred`) and `watcher.retry.events` (labels `kind`: `flip` or `deferred`;
+`outcome`: `queued`, `parked`, `overflow`, `woken`, `applied`, `ignored`,
+`rescheduled`, `dropped`, `exhausted`) count gated and deferred events and
+every retry outcome, and deferrals and failed retries log at warn.
 
 Tags take their target from either epoch: a user is named by either profile
 address or the bare key, a post by either post address, and listings, shops

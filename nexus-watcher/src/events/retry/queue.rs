@@ -89,6 +89,16 @@ pub struct FetchedEntry {
     stored: String,
 }
 
+/// What [`RetryQueue::repark_if`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repark {
+    Parked,
+    /// Removed: its user already holds the most parked entries.
+    Overflow,
+    /// Left as stored: a newer entry replaced it, or it is gone.
+    Superseded,
+}
+
 /// How many entries the queue holds in each set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueSizes {
@@ -152,13 +162,21 @@ static RESCHEDULE_IF: LazyLock<Script> = LazyLock::new(|| {
     )
 });
 
-/// `KEYS`: entry, due, parked. `ARGV`: expected JSON, new JSON, address. Parks the new entry
-/// while the stored one is the expected one; returns 1 when it did.
+/// `KEYS`: entry, due, parked. `ARGV`: expected JSON, new JSON, address, first and last parked
+/// address of the user, the most the user may hold parked. While the stored entry is the
+/// expected one, parks the new entry and returns 1, or, when the address is not parked and the
+/// user already holds the most, removes the entry and returns 2. Returns 0 otherwise.
 static REPARK_IF: LazyLock<Script> = LazyLock::new(|| {
     Script::new(
         r#"
         if redis.call('GET', KEYS[1]) ~= ARGV[1] then
             return 0
+        end
+        if not redis.call('ZSCORE', KEYS[3], ARGV[3])
+            and redis.call('ZLEXCOUNT', KEYS[3], ARGV[4], ARGV[5]) >= tonumber(ARGV[6]) then
+            redis.call('DEL', KEYS[1])
+            redis.call('ZREM', KEYS[2], ARGV[3])
+            return 2
         end
         redis.call('SET', KEYS[1], ARGV[2])
         redis.call('ZADD', KEYS[3], 0, ARGV[3])
@@ -453,24 +471,39 @@ impl RetryQueue {
     }
 
     /// Parks `fetched` again, a deferred entry whose user has a flip queued anew, while it is
-    /// still the stored entry. Returns whether it did.
-    pub async fn repark_if(&self, fetched: &FetchedEntry) -> RedisResult<bool> {
+    /// still the stored entry, under the same per-user cap of `max_parked` as [`Self::park`].
+    pub async fn repark_if(
+        &self,
+        fetched: &FetchedEntry,
+        max_parked: usize,
+    ) -> RedisResult<Repark> {
+        let user_id = Self::user_of(&fetched.entry.uri).ok_or_else(|| {
+            RedisError::InvalidInput(format!("{} names no user", fetched.entry.uri))
+        })?;
+        let (first, last) = Self::user_range(user_id);
         let updated = RetryEntry {
             next_retry_at: 0,
             ..fetched.entry.clone()
         };
         let payload = serialize(&updated)?;
         let mut conn = get_redis_conn().await?;
-        let written: i64 = REPARK_IF
+        let outcome: i64 = REPARK_IF
             .key(self.entry_key(&updated.uri))
             .key(self.due_key())
             .key(self.parked_key())
             .arg(&fetched.stored)
             .arg(payload)
             .arg(&updated.uri)
+            .arg(first)
+            .arg(last)
+            .arg(max_parked)
             .invoke_async(&mut conn)
             .await?;
-        Ok(written == 1)
+        Ok(match outcome {
+            1 => Repark::Parked,
+            2 => Repark::Overflow,
+            _ => Repark::Superseded,
+        })
     }
 
     /// How many entries `user_id` holds parked.

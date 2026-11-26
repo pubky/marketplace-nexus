@@ -29,12 +29,16 @@ pub enum RetryOutcome {
     Queued,
     /// A deferred write was parked behind its user's flip.
     Parked,
-    /// A deferred write was refused: its user already holds the most parked writes.
+    /// A deferred write was refused, or removed when parked again: its user already holds the
+    /// most parked writes.
     Overflow,
     /// A parked write was woken by its user's flip settling.
     Woken,
     /// A replay succeeded and left the queue.
     Applied,
+    /// A woken write met the epoch gate's ignore, its user left at `v0` by a flip that settled
+    /// without landing, and left the queue.
+    Ignored,
     /// A replay failed and was scheduled again.
     Rescheduled,
     /// A replay failed for good, or the entry could not be replayed, and left the queue.
@@ -51,6 +55,7 @@ impl RetryOutcome {
             Self::Overflow => "overflow",
             Self::Woken => "woken",
             Self::Applied => "applied",
+            Self::Ignored => "ignored",
             Self::Rescheduled => "rescheduled",
             Self::Dropped => "dropped",
             Self::Exhausted => "exhausted",
@@ -292,10 +297,12 @@ mod tests {
         instruments.retry(RetryKind::Flip, RetryOutcome::Rescheduled, 1);
         instruments.retry(RetryKind::Flip, RetryOutcome::Rescheduled, 1);
         instruments.retry(RetryKind::Deferred, RetryOutcome::Woken, 3);
+        instruments.retry(RetryKind::Deferred, RetryOutcome::Ignored, 1);
         instruments.retry(RetryKind::Deferred, RetryOutcome::Exhausted, 0);
         assert_eq!(
             sums(&provider, &exporter, "watcher.retry.events"),
             BTreeMap::from([
+                ("kind=deferred,outcome=ignored".to_string(), 1),
                 ("kind=deferred,outcome=woken".to_string(), 3),
                 ("kind=flip,outcome=queued".to_string(), 1),
                 ("kind=flip,outcome=rescheduled".to_string(), 2),

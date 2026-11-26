@@ -416,6 +416,80 @@ async fn a_woken_untag_older_than_the_tag_written_again_is_dropped() -> Result<(
     Ok(())
 }
 
+/// Woken writes whose user has a flip queued anew are parked again under the same per-user cap
+/// as a first park: one is parked again, the one over the cap is dropped. When that flip then
+/// settles without landing, the user left at `v0`, the woken writes meet the gate's ignore and
+/// are counted as ignored, not applied.
+#[tokio_shared_rt::test(shared)]
+async fn a_write_parked_again_obeys_the_cap_and_one_left_at_v0_counts_as_ignored() -> Result<()> {
+    let mut test = WatcherTest::setup().await?;
+    test.event_processor_runner.retry_policy.max_parked_per_user = 2;
+    let user_kp = Keypair::random();
+    let user_id = test
+        .create_user(&user_kp, &seller_profile("Watcher:FlipRetry:Repark"))
+        .await?;
+    let friend_kp = Keypair::random();
+    let friend_id = test
+        .create_user(
+            &friend_kp,
+            &seller_profile("Watcher:FlipRetry:ReparkFriend"),
+        )
+        .await?;
+    let friend_social_uri = pubky_social_specs::user_uri_builder(friend_id.clone());
+    let run = Utc::now().timestamp_micros() % 1_000_000;
+    let mut writes = Vec::new();
+    for label in ["first", "second", "third"] {
+        let tag = social_tag(&friend_social_uri, &format!("{label}{run}"));
+        let line = event_line("PUT", &user_id, &tag_path(&tag));
+        writes.push(Event::parse_event(&line, PathBuf::new())?.expect("a social/v1 tag PUT"));
+    }
+    let profile_line = event_line("PUT", &user_id, &profile_path());
+    let profile = Event::parse_event(&profile_line, PathBuf::new())?.expect("a profile PUT");
+    let flip_uri = flip_profile_uri(&user_id);
+    let queue = test.event_processor_runner.retry_queue.clone();
+    let now = Utc::now().timestamp_millis();
+
+    assert!(queue.park(&RetryEntry::deferred(&writes[0]), 2).await?);
+    assert!(queue.park(&RetryEntry::deferred(&writes[1]), 2).await?);
+    assert_eq!(queue.resolve_flip(&flip_uri).await?, 2);
+    queue
+        .queue_flip(&RetryEntry::failed_flip(&profile, now + HOUR_MS))
+        .await?;
+    assert!(queue.park(&RetryEntry::deferred(&writes[2]), 2).await?);
+    assert_eq!(sizes(&test).await?, QueueSizes { due: 3, parked: 1 });
+
+    let reparked = retry_pass(&test, now).await?;
+    assert_eq!(
+        reparked,
+        RetryPassStats {
+            attempted: 2,
+            reparked: 1,
+            dropped: 1,
+            ..RetryPassStats::default()
+        },
+        "the first parked again, the second over the cap"
+    );
+    assert_eq!(parked(&test, &user_id).await?, 2);
+    assert_eq!(sizes(&test).await?, QueueSizes { due: 1, parked: 2 });
+
+    assert_eq!(queue.resolve_flip(&flip_uri).await?, 2);
+    let ignored = retry_pass(&test, now).await?;
+    assert_eq!(
+        ignored,
+        RetryPassStats {
+            attempted: 2,
+            ignored: 2,
+            ..RetryPassStats::default()
+        }
+    );
+    assert_eq!(graph_epoch(&user_id).await?, None);
+    assert_eq!(sizes(&test).await?, QueueSizes { due: 0, parked: 0 });
+
+    test.cleanup_user(&user_kp).await?;
+    test.cleanup_user(&friend_kp).await?;
+    Ok(())
+}
+
 /// Before the profile, with no flip queued, a `v0` user's `social/v1` writes are the migrator's
 /// copies: ignored, never parked.
 #[tokio_shared_rt::test(shared)]

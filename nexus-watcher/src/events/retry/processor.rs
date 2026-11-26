@@ -7,25 +7,31 @@
 //!
 //! - an entry that fails again is scheduled after its backoff, later than the pass's start;
 //! - a deferred write still waiting is parked, out of the due set;
-//! - the writes a settled flip wakes are due at once, and replayed before the pass ends.
+//! - the writes a flip settled in the pass wakes are due at once, and replayed before the pass
+//!   ends unless it reaches its attempt limit or shutdown first; those a flip settled on a new
+//!   profile PUT wakes are replayed by the next pass.
 //!
 //! Once the flip lands the user's new writes are handled as they arrive, so a woken write
 //! replayed later may be older than them. A PUT replay reads the record as it is then; a DEL
-//! replays only while its record is still gone.
+//! replays only while its record is still gone, read within the record fetch deadline.
 //!
 //! A pass also stops after [`RetryPolicy::max_entries_per_pass`] attempts, so no state the
 //! queue can hold makes it spin. A deferred write is replayed at most
 //! [`RetryPolicy::max_replays`] times once woken, Neo4j and Redis failures uncounted, and a
-//! user holds at most [`RetryPolicy::max_parked_per_user`] parked writes.
+//! user holds at most [`RetryPolicy::max_parked_per_user`] parked writes, a write parked again
+//! included.
 
-use super::queue::{FetchedEntry, RetryEntry, RetryKind, RetryQueue};
+use super::queue::{FetchedEntry, Repark, RetryEntry, RetryKind, RetryQueue};
 use crate::events::epoch_metrics::{self, RetryOutcome};
 use crate::events::handlers::listing::{record_on_homeserver, HomeserverRecord};
-use crate::events::{handle, Moderation};
+use crate::events::remote_body::{within, RECORD_FETCH_TIMEOUT};
+use crate::events::{handle_gated, Handled, Moderation};
 use chrono::{DateTime, Utc};
 use nexus_common::models::event::{Event, EventProcessorError, EventType};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch::Receiver;
 use tracing::{debug, info, warn};
 
@@ -130,6 +136,8 @@ pub struct RetryPassStats {
     pub attempted: usize,
     /// Entries handled, out of the queue.
     pub applied: usize,
+    /// Woken writes the epoch gate ignored, their user left at `v0`, out of the queue.
+    pub ignored: usize,
     /// Entries scheduled again.
     pub rescheduled: usize,
     /// Deferred writes parked again.
@@ -212,14 +220,20 @@ impl RetryProcessor {
                     .settle_removal(fetched, RetryOutcome::Dropped, stats)
                     .await;
             }
-            Ok(false) => handle(&event, self.moderation.clone(), &self.retry_queue).await,
+            Ok(false) => handle_gated(&event, self.moderation.clone(), &self.retry_queue).await,
             Err(error) => Err(error),
         };
         let error = match replayed {
-            Ok(()) => {
+            Ok(Handled::Applied) => {
                 debug!(%user_id, uri = %entry.uri, kind = ?entry.kind, attempts = entry.attempts, "Retry applied");
                 return self
                     .settle_removal(fetched, RetryOutcome::Applied, stats)
+                    .await;
+            }
+            Ok(Handled::Ignored) => {
+                info!(%user_id, uri = %entry.uri, kind = ?entry.kind, "Woken write ignored: its user stayed at v0; removing it");
+                return self
+                    .settle_removal(fetched, RetryOutcome::Ignored, stats)
                     .await;
             }
             Err(error) => error,
@@ -243,11 +257,26 @@ impl RetryProcessor {
                     .await
             }
             Decision::Repark => {
-                if self.retry_queue.repark_if(fetched).await? {
-                    stats.reparked += 1;
-                    epoch_metrics::record_retry(entry.kind, RetryOutcome::Parked, 1);
-                } else {
-                    stats.superseded += 1;
+                match self
+                    .retry_queue
+                    .repark_if(fetched, self.policy.max_parked_per_user)
+                    .await?
+                {
+                    Repark::Parked => {
+                        stats.reparked += 1;
+                        epoch_metrics::record_retry(entry.kind, RetryOutcome::Parked, 1);
+                    }
+                    Repark::Overflow => {
+                        warn!(
+                            %user_id,
+                            uri = %entry.uri,
+                            max_parked = self.policy.max_parked_per_user,
+                            "Deferred write dropped: parked again, the user already holds the most parked writes"
+                        );
+                        stats.dropped += 1;
+                        epoch_metrics::record_retry(entry.kind, RetryOutcome::Overflow, 1);
+                    }
+                    Repark::Superseded => stats.superseded += 1,
                 }
                 Ok(())
             }
@@ -294,7 +323,12 @@ impl RetryProcessor {
         if entry.kind != RetryKind::Deferred || event.event_type != EventType::Del {
             return Ok(false);
         }
-        Ok(record_on_homeserver(&entry.uri).await? == HomeserverRecord::Present)
+        record_present_within(
+            &entry.uri,
+            RECORD_FETCH_TIMEOUT,
+            record_on_homeserver(&entry.uri),
+        )
+        .await
     }
 
     /// Removes `fetched`, settled with `outcome`. An applied event counts as applied even when
@@ -312,11 +346,24 @@ impl RetryProcessor {
                 stats.superseded += 1;
                 return Ok(());
             }
+            RetryOutcome::Ignored => stats.ignored += 1,
             _ => stats.dropped += 1,
         }
         epoch_metrics::record_retry(fetched.entry.kind, outcome, 1);
         Ok(())
     }
+}
+
+/// Whether the record at `uri` is on its homeserver, as `check` reads it within `deadline`. The
+/// pass runs on the watcher's only task, so a homeserver that hangs costs one deadline: the read
+/// fails as a client error and the replay is counted and scheduled again.
+async fn record_present_within(
+    uri: &str,
+    deadline: Duration,
+    check: impl Future<Output = Result<HomeserverRecord, EventProcessorError>>,
+) -> Result<bool, EventProcessorError> {
+    let record = within(deadline, &format!("checking {uri}"), check).await?;
+    Ok(record == HomeserverRecord::Present)
 }
 
 fn retry_time(unix_ms: i64) -> DateTime<Utc> {
@@ -397,6 +444,7 @@ pub fn log_pass(stats: &RetryPassStats) {
         info!(
             attempted = stats.attempted,
             applied = stats.applied,
+            ignored = stats.ignored,
             rescheduled = stats.rescheduled,
             reparked = stats.reparked,
             dropped = stats.dropped,
@@ -453,6 +501,41 @@ mod tests {
             Decision::Exhausted,
             "a flip entry whose user is at v1 is a profile edit, under the replay limit"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_del_read_that_hangs_fails_at_the_record_fetch_deadline() {
+        let uri = "pubky://user/pub/social/v1/tags/TAG";
+        let started = tokio::time::Instant::now();
+        let read = record_present_within(uri, RECORD_FETCH_TIMEOUT, std::future::pending());
+        let error = tokio::time::timeout(RECORD_FETCH_TIMEOUT * 2, read)
+            .await
+            .expect("the read ends at its own deadline")
+            .expect_err("a homeserver that never answers must not hold the pass");
+        assert_eq!(started.elapsed(), RECORD_FETCH_TIMEOUT);
+        assert!(
+            matches!(error, EventProcessorError::PubkyClientError(_)),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains(uri), "{error}");
+        assert_eq!(
+            decide_failure(RetryKind::Deferred, 0, &error, &policy()),
+            Decision::Reschedule { attempts: 1 },
+            "the replay is counted, so a homeserver that keeps hanging uses it up"
+        );
+
+        let answered = |record| async move { Ok(record) };
+        for (record, present) in [
+            (HomeserverRecord::Present, true),
+            (HomeserverRecord::Gone, false),
+        ] {
+            assert_eq!(
+                record_present_within(uri, RECORD_FETCH_TIMEOUT, answered(record))
+                    .await
+                    .unwrap(),
+                present
+            );
+        }
     }
 
     #[test]
