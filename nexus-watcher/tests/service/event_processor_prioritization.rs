@@ -4,6 +4,8 @@ use crate::service::utils::{create_mock_event_processors, setup, MockEventProces
 use anyhow::Result;
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::types::DynError;
+use nexus_watcher::events::retry::processor::RetryPolicy;
+use nexus_watcher::events::retry::queue::RetryQueue;
 use nexus_watcher::service::TEventProcessorRunner;
 use nexus_watcher::service::{EventProcessorRunner, HomeserverPollBackoff};
 use pubky_app_specs::PubkyId;
@@ -24,6 +26,8 @@ async fn test_event_processor_runner_default_homeserver_prioritization() -> Resu
         tracer_name: String::from("unit-test-hs-list-test"),
         moderation: Arc::new(default_moderation_tests()),
         poll_backoff: Arc::new(HomeserverPollBackoff::default()),
+        retry_queue: RetryQueue::default(),
+        retry_policy: RetryPolicy::default(),
     };
 
     // Persist the homeservers
@@ -52,6 +56,8 @@ async fn rate_limited_homeserver_does_not_consume_the_next_poll_slot() -> Result
         tracer_name: String::from("unit-test-rate-limit-backoff"),
         moderation: Arc::new(default_moderation_tests()),
         poll_backoff: Arc::new(HomeserverPollBackoff::default()),
+        retry_queue: RetryQueue::default(),
+        retry_policy: RetryPolicy::default(),
     };
 
     for hs_id in &HS_IDS[..2] {
@@ -85,6 +91,8 @@ async fn rate_limited_default_homeserver_does_not_schedule_one_beyond_the_limit(
         tracer_name: String::from("unit-test-rate-limit-monitored-set"),
         moderation: Arc::new(default_moderation_tests()),
         poll_backoff: Arc::new(HomeserverPollBackoff::default()),
+        retry_queue: RetryQueue::default(),
+        retry_policy: RetryPolicy::default(),
     };
 
     for hs_id in &HS_IDS[..2] {

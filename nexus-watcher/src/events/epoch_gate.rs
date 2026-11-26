@@ -14,14 +14,18 @@
 //! The marketplace records under `/pub/pubky.app/marketplace/` have no `social/v1` form; they
 //! are handled for a user at either epoch.
 //!
-//! `pubky-nexus` also defers events while a failed flip waits in its retry queue. This watcher
-//! has no retry replay: a failed flip leaves the user at `v0`, and their next `social/v1`
-//! profile PUT runs the whole flip again.
+//! A flip that fails leaves the user at `v0` and waits in the retry queue
+//! ([`crate::events::retry`]), retried without limit while they are at `v0`. While it waits,
+//! the user's `social/v1` writes are not the migrator's copies but their own edits, or the
+//! moderator's takedowns and lifts: they are deferred behind the flip and replayed once it
+//! settles, as in `pubky-nexus`. Unlike there, a waiting user's `pubky.app` DEL is handled at
+//! once: this watcher's flip moves no content a DEL could race, only ids it rewrites in place.
 
+use crate::events::epoch_metrics;
+use crate::events::retry::queue::RetryQueue;
 use nexus_common::models::event::{Event, EventProcessorError, EventType};
 use nexus_common::models::user::Epoch;
 use pubky_app_specs::Resource;
-use tracing::debug;
 
 /// What the gate does with an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +37,24 @@ pub enum Gate {
     Flip,
     /// The event is skipped: no fetch, no stored event line, no error.
     Ignore,
+    /// A `v0` user's `social/v1` write while their flip waits in the retry queue: held there
+    /// until the flip settles, then run through the gate again.
+    Defer,
+}
+
+/// The address of `user_id`'s `social/v1` profile: where their flip waits in the retry queue.
+pub fn flip_profile_uri(user_id: &str) -> String {
+    pubky_social_specs::user_uri_builder(user_id.to_string())
+}
+
+/// Whether `event`, decided `gate` for a user at `user_epoch`, waits for that user's flip when
+/// one is queued: a `v0` user's `social/v1` write. Their profile never waits: its PUT is the
+/// flip itself, and its DEL would take the flip's place at the same address in the queue.
+pub fn waits_for_flip(event: &Event, gate: Gate, user_epoch: Epoch) -> bool {
+    gate == Gate::Ignore
+        && user_epoch == Epoch::V0
+        && event.epoch == Epoch::V1
+        && event.parsed_uri.resource != Resource::User
 }
 
 /// Whether `resource`, at a `pubky.app` address, is a marketplace record. Exhaustive, so a
@@ -78,19 +100,24 @@ pub fn decide(event: &Event, user_epoch: Epoch) -> Gate {
     }
 }
 
-/// The gate's decision for `event`, by its user's epoch in the graph. A marketplace record is
-/// decided without a graph read.
-pub async fn check(event: &Event) -> Result<Gate, EventProcessorError> {
+/// The gate's decision for `event`, by its user's epoch in the graph and, for an event that
+/// [waits for a flip](waits_for_flip), whether `retry_queue` holds that flip. A marketplace
+/// record is decided without a read.
+pub async fn check(event: &Event, retry_queue: &RetryQueue) -> Result<Gate, EventProcessorError> {
     if event.epoch == Epoch::V0 && is_marketplace(&event.parsed_uri.resource) {
         return Ok(Gate::Handle);
     }
     let user_epoch = Epoch::get_from_graph(&event.parsed_uri.user_id).await?;
     let gate = decide(event, user_epoch);
+    if waits_for_flip(event, gate, user_epoch) {
+        let flip_uri = flip_profile_uri(&event.parsed_uri.user_id);
+        if retry_queue.flip_queued(&flip_uri).await? {
+            epoch_metrics::record_deferred(event, &flip_uri);
+            return Ok(Gate::Defer);
+        }
+    }
     if gate == Gate::Ignore {
-        debug!(
-            "Ignoring {} {} of a user read through {user_epoch}",
-            event.event_type, event.uri
-        );
+        epoch_metrics::record_gated(event, user_epoch);
     }
     Ok(gate)
 }
@@ -193,6 +220,43 @@ mod tests {
         for line in social_v1_lines() {
             assert_eq!(decide(&event(&line), Epoch::V1), Gate::Handle, "{line}");
         }
+    }
+
+    /// Only a `v0` user's `social/v1` writes other than their profile wait for a queued flip:
+    /// never a `pubky.app` event, a marketplace record, a profile event or a `v1` user's event.
+    #[test]
+    fn only_a_v0_users_social_v1_writes_but_the_profile_wait_for_a_flip() {
+        let profile_lines = [
+            format!("PUT pubky://{USER}/pub/social/v1/profile.json"),
+            format!("DEL pubky://{USER}/pub/social/v1/profile.json"),
+        ];
+        for line in social_v1_lines() {
+            let event = event(&line);
+            let waits = waits_for_flip(&event, decide(&event, Epoch::V0), Epoch::V0);
+            assert_eq!(waits, !profile_lines.contains(&line), "{line} at v0");
+            assert!(
+                !waits_for_flip(&event, decide(&event, Epoch::V1), Epoch::V1),
+                "{line} at v1"
+            );
+        }
+        for line in pubky_app_social_lines()
+            .into_iter()
+            .chain(marketplace_lines())
+        {
+            let event = event(&line);
+            for epoch in [Epoch::V0, Epoch::V1] {
+                assert!(
+                    !waits_for_flip(&event, decide(&event, epoch), epoch),
+                    "{line} at {epoch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_flip_waits_at_the_address_of_the_users_social_v1_profile() {
+        let line = format!("PUT pubky://{USER}/pub/social/v1/profile.json");
+        assert_eq!(flip_profile_uri(USER), event(&line).uri);
     }
 
     #[test]

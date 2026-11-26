@@ -15,7 +15,9 @@ pub use processor::EventProcessor;
 pub use processor_runner::{order_homeservers, EventProcessorRunner};
 pub use traits::{TEventProcessor, TEventProcessorRunner};
 
+use crate::events::retry::processor::log_pass;
 use crate::NexusWatcherBuilder;
+use chrono::Utc;
 use nexus_common::file::ConfigLoader;
 use nexus_common::models::homeserver::{Homeserver, HomeserverAllowlist};
 use nexus_common::utils::create_shutdown_rx;
@@ -97,6 +99,7 @@ impl NexusWatcher {
 
         let mut interval = tokio::time::interval(Duration::from_millis(config.watcher_sleep));
         let ev_processor_runner = EventProcessorRunner::from_config(&config, shutdown_rx.clone());
+        let retry_processor = ev_processor_runner.retry_processor();
 
         loop {
             tokio::select! {
@@ -110,6 +113,12 @@ impl NexusWatcher {
                         .run_all()
                         .await
                         .inspect_err(|e| error!("Failed to start event processors run: {e}"));
+                    let pass = retry_processor.run_pass(Utc::now().timestamp_millis());
+                    match tokio::time::timeout(Duration::from_secs(PROCESSING_TIMEOUT_SECS), pass).await {
+                        Ok(Ok(stats)) => log_pass(&stats),
+                        Ok(Err(e)) => error!("Retry pass failed: {e}"),
+                        Err(_) => error!("Retry pass timed out"),
+                    }
                 }
             }
         }

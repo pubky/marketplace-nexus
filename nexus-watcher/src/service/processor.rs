@@ -3,9 +3,12 @@ use nexus_common::models::event::{Event, EventProcessorError};
 use crate::events::handle;
 use crate::events::remote_body::{event_feed_budget, event_lines, read_capped, within};
 use crate::events::retry::event::RetryEvent;
+use crate::events::retry::processor::{park_deferred, queue_failed_flip, RetryPolicy};
+use crate::events::retry::queue::RetryQueue;
 use crate::events::Moderation;
 use crate::service::traits::TEventProcessor;
 use crate::service::{HomeserverPollBackoff, POLL_TIMEOUT_SECS, RATE_LIMIT_BACKOFF_SECS};
+use chrono::Utc;
 use nexus_common::db::PubkyConnector;
 use nexus_common::models::homeserver::Homeserver;
 use opentelemetry::trace::{FutureExt, Span, TraceContextExt, Tracer};
@@ -29,6 +32,8 @@ pub struct EventProcessor {
     pub moderation: Arc<Moderation>,
     pub shutdown_rx: Receiver<bool>,
     pub poll_backoff: Arc<HomeserverPollBackoff>,
+    pub retry_queue: RetryQueue,
+    pub retry_policy: RetryPolicy,
 }
 
 #[async_trait::async_trait]
@@ -235,15 +240,26 @@ impl EventProcessor {
         ))
     }
 
-    /// Processes an event and track the fail event it if necessary
+    /// Processes an event and track the fail event it if necessary. A failed flip and a write
+    /// deferred behind one go to the retry queue, which replays them.
     /// # Parameters:
     /// - `event`: The event to be processed
     async fn handle_event(&self, event: &Event) -> Result<(), EventProcessorError> {
-        if let Err(e) = handle(event, self.moderation.clone()).await {
-            if let Some((index_key, retry_event)) = extract_retry_event_info(event, e) {
-                error!("{}, {}", retry_event.error_type, index_key);
-                if let Err(err) = retry_event.put_to_index(index_key).await {
-                    error!("Failed to put event to retry index: {}", err);
+        match handle(event, self.moderation.clone(), &self.retry_queue).await {
+            Ok(()) => {}
+            Err(EventProcessorError::FlipFailed(cause)) => {
+                let now = Utc::now().timestamp_millis();
+                queue_failed_flip(&self.retry_queue, &self.retry_policy, event, &cause, now).await
+            }
+            Err(EventProcessorError::DeferredUntilFlip { flip_uri }) => {
+                park_deferred(&self.retry_queue, &self.retry_policy, event, &flip_uri).await
+            }
+            Err(e) => {
+                if let Some((index_key, retry_event)) = extract_retry_event_info(event, e) {
+                    error!("{}, {}", retry_event.error_type, index_key);
+                    if let Err(err) = retry_event.put_to_index(index_key).await {
+                        error!("Failed to put event to retry index: {}", err);
+                    }
                 }
             }
         }

@@ -35,6 +35,8 @@ async fn processor_for_another_homeserver(test: &mut WatcherTest) -> Result<Even
         moderation: Arc::new(default_moderation_tests()),
         shutdown_rx,
         poll_backoff: Arc::new(HomeserverPollBackoff::default()),
+        retry_queue: test.event_processor_runner.retry_queue.clone(),
+        retry_policy: test.event_processor_runner.retry_policy,
     })
 }
 

@@ -3117,12 +3117,14 @@ dependencies = [
  "async-trait",
  "base32",
  "chrono",
+ "deadpool-redis",
  "ed25519-dalek 2.2.0",
  "futures",
  "httpc-test",
  "neo4rs",
  "nexus-common",
  "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "pubky 0.9.3",
  "pubky-app-specs",
  "pubky-social-specs",
@@ -3135,6 +3137,7 @@ dependencies = [
  "tokio",
  "tokio-shared-rt",
  "tracing",
+ "tracing-test",
 ]
 
 [[package]]

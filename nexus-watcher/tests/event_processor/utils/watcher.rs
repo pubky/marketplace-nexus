@@ -10,6 +10,8 @@ use nexus_common::models::file::FileDetails;
 use nexus_common::models::homeserver::Homeserver;
 use nexus_common::models::traits::Collection;
 use nexus_watcher::events::retry::event::RetryEvent;
+use nexus_watcher::events::retry::processor::RetryPolicy;
+use nexus_watcher::events::retry::queue::RetryQueue;
 use nexus_watcher::events::{handle, Moderation};
 use nexus_watcher::service::EventProcessorRunner;
 use nexus_watcher::service::TEventProcessorRunner;
@@ -80,6 +82,7 @@ impl WatcherTest {
         let moderation = Arc::new(default_moderation_tests());
 
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let retry_queue = RetryQueue::with_prefix(format!("RetryQueue:test:{default_homeserver}"));
 
         EventProcessorRunner {
             limit: 1000,
@@ -90,6 +93,8 @@ impl WatcherTest {
             shutdown_rx,
             default_homeserver,
             poll_backoff: Arc::new(HomeserverPollBackoff::default()),
+            retry_queue,
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -349,8 +354,10 @@ pub async fn retrieve_and_handle_event_line(
     event_line: &str,
     moderation: Arc<Moderation>,
 ) -> Result<(), EventProcessorError> {
+    let retry_queue =
+        RetryQueue::with_prefix(format!("RetryQueue:test:direct:{}", std::process::id()));
     match Event::parse_event(event_line, get_files_dir_pathbuf())? {
-        Some(event) => handle(&event, moderation).await,
+        Some(event) => handle(&event, moderation, &retry_queue).await,
         None => Ok(()),
     }
 }
