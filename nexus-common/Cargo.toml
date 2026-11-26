@@ -17,8 +17,8 @@ chrono = { workspace = true }
 futures = { workspace = true }
 neo4rs = { workspace = true }
 opentelemetry = { workspace = true }
-opentelemetry-appender-tracing = "0.31.1"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry-appender-tracing = "0.33.1"
+opentelemetry-otlp = { version = "0.33", features = ["grpc-tonic"] }
 opentelemetry_sdk = { workspace = true }
 pubky = { workspace = true }
 pubky-app-specs = { workspace = true }
