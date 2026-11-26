@@ -3079,8 +3079,9 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk 0.31.0",
- "pubky",
+ "pubky 0.9.3",
  "pubky-app-specs",
+ "pubky-social-specs",
  "redis",
  "serde",
  "serde_json",
@@ -3122,8 +3123,9 @@ dependencies = [
  "neo4rs",
  "nexus-common",
  "opentelemetry 0.31.0",
- "pubky",
+ "pubky 0.9.3",
  "pubky-app-specs",
+ "pubky-social-specs",
  "pubky-testnet",
  "rand 0.10.0",
  "reqwest 0.13.2",
@@ -3152,7 +3154,7 @@ dependencies = [
  "neo4rs",
  "nexus-common",
  "opentelemetry 0.31.0",
- "pubky",
+ "pubky 0.9.3",
  "pubky-app-specs",
  "pubky-testnet",
  "serde",
@@ -4055,6 +4057,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pubky"
+version = "0.10.0"
+dependencies = [
+ "pubky 0.9.3",
+]
+
+[[package]]
 name = "pubky-app-specs"
 version = "0.6.2-marketplace.16"
 source = "git+https://github.com/BitcoinErrorLog/pubky-app-specs.git?rev=5ef6e31e89530a58e66044a08fb6baf704adabc7#5ef6e31e89530a58e66044a08fb6baf704adabc7"
@@ -4064,7 +4073,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "js-sys",
  "mime",
- "pubky",
+ "pubky 0.9.3",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
@@ -4161,6 +4170,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pubky-social-specs"
+version = "1.0.0-rc.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64d56ea5ec9f5def66a41e64fd5c3359b00ea809a1ead2e619396e5a73d43b98"
+dependencies = [
+ "base32",
+ "base64",
+ "blake3",
+ "js-sys",
+ "mime",
+ "pubky 0.10.0",
+ "serde",
+ "serde_json",
+ "url",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "pubky-testnet"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4174,7 +4201,7 @@ dependencies = [
  "once_cell",
  "pkarr",
  "pkarr-relay",
- "pubky",
+ "pubky 0.9.3",
  "pubky-common",
  "pubky-homeserver",
  "pubky_test_utils",

@@ -28,6 +28,18 @@ pub enum EventProcessorError {
     #[error("InvalidEventLine: {0}")]
     InvalidEventLine(String),
 
+    /// The record's bytes fail the `social/v1` reader. The same bytes fail the same way, so the
+    /// event is never retried.
+    #[error("SpecValidation: {0}")]
+    SpecValidation(String),
+
+    /// An ordinary tag whose target is never indexed as a tag: a follow, mute, bookmark, feed,
+    /// tag, last-read or private address, or a resource this indexer keeps no tags for. The
+    /// configured moderator's tag on a tag address is not one: it deletes that tag. Never
+    /// retried.
+    #[error("UnsupportedTarget: {0}")]
+    UnsupportedTarget(String),
+
     /// The Pubky client could not resolve the pubky
     #[error("PubkyClientError: {0}")]
     PubkyClientError(#[from] crate::db::PubkyClientError),

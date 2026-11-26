@@ -20,20 +20,38 @@ use nexus_common::models::tag::shop::{TagShop, SHOP_TAGS_KEY_PARTS};
 use nexus_common::models::tag::traits::{TagCollection, TaggersCollection};
 use nexus_common::models::tag::user::TagUser;
 use nexus_common::models::user::UserCounts;
-use pubky_app_specs::{post_uri_builder, ParsedUri, PubkyAppTag, PubkyId, Resource};
+use pubky_app_specs::{post_uri_builder, ParsedUri, PubkyId, Resource};
 use tracing::debug;
+
+use crate::events::social_v1::TaggedResource;
 
 use super::utils::post_relationships_is_reply;
 
+/// Indexes the tag `tag_id` that `tagger_id` placed with `label` on `tagged_uri`, of either
+/// epoch; `target` is what `tagged_uri` resolves to. Posts, users, listings and shops are
+/// tagged; any other target is [`EventProcessorError::UnsupportedTarget`].
 pub async fn sync_put(
-    tag: PubkyAppTag,
+    label: &str,
+    tagged_uri: &str,
+    target: TaggedResource,
     tagger_id: PubkyId,
     tag_id: String,
 ) -> Result<(), EventProcessorError> {
     debug!("Indexing new tag: {} -> {}", tagger_id, tag_id);
 
-    // Parse the embeded URI to extract author_id and post_id using parse_tagged_post_uri
-    let parsed_uri = ParsedUri::try_from(tag.uri.as_str()).map_err(EventProcessorError::generic)?;
+    let parsed_uri = match target {
+        TaggedResource::Resource(parsed_uri) => *parsed_uri,
+        TaggedResource::Prohibited(kind) => {
+            return Err(EventProcessorError::UnsupportedTarget(format!(
+                "A {kind} address is never a tag target: {tagged_uri}"
+            )))
+        }
+        TaggedResource::SocialFile | TaggedResource::Unindexed => {
+            return Err(EventProcessorError::UnsupportedTarget(format!(
+                "The tagged address is not a post, user, listing or shop: {tagged_uri}"
+            )))
+        }
+    };
     let user_id = parsed_uri.user_id.clone();
     // Retry-manager key of the tagged target, used as the missing-dependency
     // key for marketplace targets (matches how their PUT events are keyed).
@@ -45,12 +63,12 @@ pub async fn sync_put(
         Resource::Post(post_id) => {
             // Place the tag on post
             put_sync_post(
-                tagger_id, user_id, &post_id, &tag_id, &tag.label, &tag.uri, indexed_at,
+                tagger_id, user_id, &post_id, &tag_id, label, tagged_uri, indexed_at,
             )
             .await
         }
         // If no post_id in the tagged URI, we place tag to a user.
-        Resource::User => put_sync_user(tagger_id, user_id, &tag_id, &tag.label, indexed_at).await,
+        Resource::User => put_sync_user(tagger_id, user_id, &tag_id, label, indexed_at).await,
         // Marketplace targets: tags on listings and shops (community layer).
         Resource::Listing(listing_id) => {
             put_sync_listing(
@@ -58,7 +76,7 @@ pub async fn sync_put(
                 user_id,
                 &listing_id,
                 &tag_id,
-                &tag.label,
+                label,
                 target_dependency_key,
                 indexed_at,
             )
@@ -69,13 +87,16 @@ pub async fn sync_put(
                 tagger_id,
                 user_id,
                 &tag_id,
-                &tag.label,
+                label,
                 target_dependency_key,
                 indexed_at,
             )
             .await
         }
-        other => Err(EventProcessorError::generic(format!(
+        Resource::Tag(_) => Err(EventProcessorError::UnsupportedTarget(format!(
+            "A tag address is never a tag target: {tagged_uri}"
+        ))),
+        other => Err(EventProcessorError::UnsupportedTarget(format!(
             "The tagged resource is not Post, User, Listing or Shop, instead is: {other:?}"
         ))),
     }

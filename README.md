@@ -321,7 +321,8 @@ from the graph, the details cache and every stream, and its community tags go
 with it. Tags by anyone else, or with other labels, have no effect.
 
 The same key and labels, on a user's profile
-(`pubky://<user>/pub/pubky.app/profile.json`), hide the user and cascade to the
+(`pubky://<user>/pub/pubky.app/profile.json`, `pubky://<user>/pub/social/v1/profile.json`
+or the bare `pubky://<user>`), hide the user and cascade to the
 user's marketplace shop and every listing: they leave the graph, the details
 cache and every stream. Like a listing tag, the user tag leaves a marker node
 (`ModeratedUser`, keyed by the moderator's tag record) that does not depend on
@@ -386,6 +387,78 @@ tags are on a homeserver the Nexus watches, and that `NEXUS_MODERATION_ID` is th
 key that placed them. After it, a spot check of `/v0/stream/listings` against
 the moderated list confirms none came back. The marker is stored in Neo4j: a
 Redis-only flush keeps it, and a Neo4j wipe is repaired by the replay itself.
+
+### Social v1: two epochs per user
+
+The watcher reads three public objects of
+[`pubky-social-specs`](https://github.com/pubky/pubky-social-specs) 1.0
+(`1.0.0-rc.2`, the latest release; the unreleased `1.0.0` changes no stored
+bytes) besides the `pubky.app` ones:
+`/pub/social/v1/profile.json`, `/pub/social/v1/follows/{key}.json` and
+`/pub/social/v1/tags/{hash}.json`, each checked by the spec reader. Social v1
+posts, files and feeds are served by the social Nexus and skipped here, and
+`/priv/` paths never reach the event stream's handlers. A migrated profile's
+`image` is a `social/v1/files` address this index holds no file for, so
+`/static/avatar/{user_id}` answers 404 for it, as for any image that is not an
+indexed `pubky.app` file; clients load that avatar from the social Nexus.
+
+Every user is read through one epoch, as in `pubky/pubky-nexus`:
+
+- A user starts at `v0` and is read through `pubky.app`. Their `social/v1`
+  writes are the migrator's copies of what is already indexed, and are
+  ignored, except the PUT of their `social/v1/profile.json`. The migrator
+  writes the profile last, so its PUT moves the user to `v1` (the flip).
+  A user who signs up with a Social v1 client is created at `v1` by that
+  profile.
+- A user at `v1` is read through `social/v1` only: their `pubky.app` profile,
+  follows, tags, posts and files are ignored, PUT and DEL. A client that
+  deletes a migrated object deletes both copies, so the `social/v1` DEL
+  applies it. A user at `v1` who deletes their profile, or whom the moderator
+  hides, keeps their `User` node as the `[DELETED]` tombstone with its epoch,
+  even with nothing pointing at it (`pubky-nexus` removes such a node), so
+  their stale `pubky.app` writes stay ignored.
+- Marketplace records under `/pub/pubky.app/marketplace/` have no `social/v1`
+  form and are read for users at either epoch.
+
+At the flip, the records whose id hashes an address the migrator rewrote move
+to the id of the user's `social/v1` copy, so a later `social/v1` untag finds
+them: the user's tags on users (written on `pubky.app/profile.json`) and on
+posts, and, when the user is the moderator, its `ModeratedUser` and
+`ExcludedReviewer` markers. Tags and markers on listings, shops and reviews
+keep their id, because the migrator keeps those addresses. A test checks each
+of these ids against the file `pubky-social-specs`' migrator writes for the
+same tag. A copy that arrives after the flip, or again on a migrator rerun,
+finds its edge or marker and changes no count. The epoch is the
+`epoch` property of the `User` node (absent means `v0`). The user's edges are
+read in pages, then every rewrite and the epoch are written in one Neo4j
+transaction. For a user already in the graph, a failure before that commit
+writes nothing and reruns the whole flip on the user's next `social/v1` profile
+PUT. A user new to the graph is created from the profile and then given the
+epoch, in two writes; a failure between them leaves the new user at `v0` until
+their next `social/v1` profile PUT runs the flip again. For a user already in the
+graph the profile is read after the commit, as in `pubky-nexus`, so a profile
+that is gone or rejected leaves them at `v1` with the profile they had, and
+their next profile PUT is an ordinary edit. The user's other events in between
+are not deferred.
+
+Tags take their target from either epoch: a user is named by either profile
+address or the bare key, a post by either post address, and listings, shops
+and reviews by their marketplace address. An ordinary tag on a follow, mute,
+bookmark, feed, tag, last-read or private address is refused, as is any record
+the spec reader rejects; neither is retried (the moderator's tag on a tag
+address deletes that tag). The moderator's `social/v1` tags take down and
+restore listings, users and reviews as its `pubky.app` tags do, and a takedown
+it placed through `pubky.app` holds across its own migration until it deletes
+the `social/v1` copy. Lifting a takedown restores a user from their
+`social/v1` profile; a profile that is gone or that the reader rejects is not
+there, so a user at `v0` or out of the graph is restored from `pubky.app`, and
+a user at `v1` stays the tombstone until their next valid profile.
+
+`pubky-social-specs` 1.0 needs `pubky` 0.10, which cannot share a build with
+the workspace's `pubky` 0.9.3 (their `ed25519` pins conflict).
+`compat/pubky-social-specs-keys` gives the specs crate its key types from
+`pubky` 0.9.3 through `[patch.crates-io]`; it goes when the workspace moves to
+a `pubky` release the specs crate accepts.
 
 ## 🧪 Running Tests
 

@@ -1,0 +1,23 @@
+# Stands in for `pubky` 0.10 as the dependency of `pubky-social-specs`.
+#
+# `pubky-social-specs` 1.0 requires `pubky = "0.10"` for its key conversions only
+# (`PublicKey::try_from(&str)`, `PublicKey::to_z32`, `Keypair::public_key`). The
+# workspace runs `pubky` 0.9.3, which the `pubky-app-specs` fork also requires, and
+# the two cannot share a build: `pkarr` 6 pins `ed25519 = "=3.0.0-rc.4"` while
+# `pkarr` 7 needs `ed25519` 3.0.0. This crate re-exports those key types from the
+# workspace's `pubky` 0.9.3, whose keys are the same Ed25519 z-base-32 keys.
+#
+# Remove it, with the `[patch.crates-io]` entry in the root manifest, once the
+# workspace moves to a `pubky` release `pubky-social-specs` accepts.
+[package]
+name = "pubky"
+version = "0.10.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+pubky-sdk = { package = "pubky", version = "0.9.3" }

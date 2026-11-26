@@ -1,5 +1,6 @@
 mod counts;
 mod details;
+mod epoch;
 //mod id;
 mod influencers;
 mod relationship;
@@ -10,6 +11,7 @@ mod view;
 
 pub use counts::UserCounts;
 pub use details::UserDetails;
+pub use epoch::Epoch;
 pub use influencers::Influencers;
 pub use relationship::Relationship;
 pub use search::{UserSearch, USER_NAME_KEY_PARTS};

@@ -21,6 +21,7 @@ opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 pubky = "0.9.3"
 pubky-app-specs = { git = "https://github.com/BitcoinErrorLog/pubky-app-specs.git", rev = "5ef6e31e89530a58e66044a08fb6baf704adabc7", features = ["openapi"] }
+pubky-social-specs = "=1.0.0-rc.2"
 pubky-testnet = "0.9.3"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.149"
@@ -31,3 +32,8 @@ tokio-shared-rt = "0.1"
 tracing = "0.1.44"
 tracing-test = "0.2"
 futures = "0.3"
+
+# `pubky-social-specs` reads its key types from the workspace's `pubky`; see
+# compat/pubky-social-specs-keys/Cargo.toml.
+[patch.crates-io]
+pubky = { path = "compat/pubky-social-specs-keys" }

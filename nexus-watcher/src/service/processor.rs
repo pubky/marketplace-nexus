@@ -12,6 +12,7 @@ use opentelemetry::trace::{FutureExt, Span, TraceContextExt, Tracer};
 use opentelemetry::{global, Context, KeyValue};
 use pubky::{Method, PublicKey};
 use pubky_app_specs::PubkyId;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -282,15 +283,22 @@ fn extract_retry_event_info(
     error: EventProcessorError,
 ) -> Option<(String, RetryEvent)> {
     let retry_event = match error {
-        EventProcessorError::InvalidEventLine(ref message) => {
-            error!("{}", message);
+        EventProcessorError::InvalidEventLine(ref message)
+        | EventProcessorError::SpecValidation(ref message)
+        | EventProcessorError::UnsupportedTarget(ref message) => {
+            error!(
+                "{} {:?}: {:?}",
+                event.event_type,
+                bounded_detail(&event.uri),
+                bounded_detail(message)
+            );
             return None;
         }
         _ => RetryEvent::new(error),
     };
 
     // Generate a compress index to save in the cache
-    let index = match RetryEvent::generate_index_key(&event.uri) {
+    let index = match RetryEvent::generate_index_key_for_event(event) {
         Some(retry_index) => retry_index,
         None => {
             return None;
@@ -299,9 +307,46 @@ fn extract_retry_event_info(
     Some((format!("{}:{}", event.event_type, index), retry_event))
 }
 
+/// Most bytes of an address or a reader message, both written by the user, one log line keeps.
+const MAX_LOGGED_DETAIL: usize = 512;
+
+/// `text` cut on a character boundary to at most [`MAX_LOGGED_DETAIL`] bytes, the cut noted
+/// with the full length.
+fn bounded_detail(text: &str) -> Cow<'_, str> {
+    if text.len() <= MAX_LOGGED_DETAIL {
+        return Cow::Borrowed(text);
+    }
+    let mut end = MAX_LOGGED_DETAIL;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}... ({} bytes)", &text[..end], text.len()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EventProcessor, HomeserverPollBackoff, UserHosting};
+    use super::{
+        bounded_detail, EventProcessor, HomeserverPollBackoff, UserHosting, MAX_LOGGED_DETAIL,
+    };
+
+    #[test]
+    fn a_logged_detail_is_cut_on_a_character_boundary_and_notes_its_length() {
+        let short = "pubky://user/pub/social/v1/tags/X.json";
+        assert_eq!(bounded_detail(short), short);
+        let exact = "a".repeat(MAX_LOGGED_DETAIL);
+        assert_eq!(bounded_detail(&exact), exact);
+
+        let long = format!("{}{}", "a".repeat(MAX_LOGGED_DETAIL - 1), "é".repeat(100));
+        let cut = bounded_detail(&long);
+        assert_eq!(
+            cut,
+            format!(
+                "{}... ({} bytes)",
+                "a".repeat(MAX_LOGGED_DETAIL - 1),
+                long.len()
+            )
+        );
+    }
 
     #[test]
     fn events_are_only_applied_for_users_hosted_on_the_polled_homeserver() {

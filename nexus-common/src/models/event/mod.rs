@@ -1,7 +1,9 @@
 mod errors;
 
 use crate::db::{kv::RedisResult, RedisOps};
-use pubky_app_specs::{ParsedUri, Resource};
+use crate::models::user::Epoch;
+use pubky_app_specs::{ParsedUri, PubkyId, Resource};
+use pubky_social_specs::{ParsedUri as SocialParsedUri, Resource as SocialResource};
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::PathBuf};
 use tracing::{debug, error};
@@ -14,8 +16,13 @@ pub use errors::EventProcessorError;
 pub const MARKETPLACE_DELIVERABLES_PATH: &str = "/pub/pubky.app/marketplace/v1/deliverables/";
 
 /// Homeservers list every write in `/events`, including files of other apps
-/// such as Paykit. Nexus only indexes this app's namespace.
+/// such as Paykit. Nexus indexes this app's namespace and the public objects
+/// of the social spec.
 const PUBKY_APP_PATH: &str = "/pub/pubky.app/";
+
+/// The public namespace of the social spec, every epoch of it. The spec reader
+/// judges the epoch segment and the resource.
+const SOCIAL_PATH: &str = "/pub/social/";
 
 fn uri_path(uri: &str) -> Option<&str> {
     uri.strip_prefix("pubky://")
@@ -26,8 +33,41 @@ fn is_marketplace_deliverable(uri: &str) -> bool {
     uri_path(uri).is_some_and(|path| path.starts_with(MARKETPLACE_DELIVERABLES_PATH))
 }
 
+fn is_social(uri: &str) -> bool {
+    uri_path(uri).is_some_and(|path| path.starts_with(SOCIAL_PATH))
+}
+
 fn is_other_app(uri: &str) -> bool {
     uri_path(uri).is_some_and(|path| !path.starts_with(PUBKY_APP_PATH))
+}
+
+/// The user and resource of a `/pub/social/` address in the vocabulary of the
+/// `pubky.app` reader, for the three public `social/v1` objects the
+/// marketplace indexer reads: the profile, a follow and a tag. `None` for a
+/// resource it does not index (posts, files, feeds, other kinds, another
+/// epoch). The spec parser refuses an address that is not the canonical
+/// spelling of its resource.
+fn social_v1_address(uri: &str) -> Result<Option<ParsedUri>, EventProcessorError> {
+    let parsed = SocialParsedUri::try_from(uri).map_err(|e| {
+        EventProcessorError::InvalidEventLine(format!("Cannot parse event URI: {e}"))
+    })?;
+    let resource = match &parsed.resource {
+        SocialResource::User => Resource::User,
+        SocialResource::Follow(followee_id) => Resource::Follow(pubky_app_id(followee_id)?),
+        SocialResource::Tag(tag_id) => Resource::Tag(tag_id.clone()),
+        other => {
+            debug!("Skipping a social/v1 resource the marketplace indexer does not read ({other}): {uri}");
+            return Ok(None);
+        }
+    };
+    Ok(Some(ParsedUri {
+        user_id: pubky_app_id(&parsed.user_id)?,
+        resource,
+    }))
+}
+
+fn pubky_app_id(id: &pubky_social_specs::PubkyId) -> Result<PubkyId, EventProcessorError> {
+    PubkyId::try_from(id.as_ref()).map_err(EventProcessorError::InvalidEventLine)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -50,7 +90,13 @@ impl fmt::Display for EventType {
 pub struct Event {
     pub uri: String,
     pub event_type: EventType,
+    /// The user and resource the event addresses. A `social/v1` address is
+    /// named in the same vocabulary as a `pubky.app` one (its profile is
+    /// [`Resource::User`], a follow [`Resource::Follow`], a tag
+    /// [`Resource::Tag`]); [`Event::epoch`] says which reader its record takes.
     pub parsed_uri: ParsedUri,
+    /// The spec epoch the address is written in.
+    pub epoch: Epoch,
     pub files_path: PathBuf,
     event_line: String,
 }
@@ -93,6 +139,19 @@ impl Event {
             debug!("Skipping {event_type} for a marketplace deliverable");
             return Ok(None);
         }
+        if is_social(&uri) {
+            let Some(parsed_uri) = social_v1_address(&uri)? else {
+                return Ok(None);
+            };
+            return Ok(Some(Event {
+                uri,
+                event_type,
+                parsed_uri,
+                epoch: Epoch::V1,
+                files_path,
+                event_line: line.to_string(),
+            }));
+        }
         if is_other_app(&uri) {
             debug!("Skipping {event_type} for another app: {uri}");
             return Ok(None);
@@ -119,6 +178,7 @@ impl Event {
             uri,
             event_type,
             parsed_uri,
+            epoch: Epoch::V0,
             files_path,
             event_line,
         }))
@@ -238,5 +298,98 @@ mod tests {
             Event::parse_event(&line("PUT", "/pub/pubky.app/unknown/abc"), PathBuf::new()),
             Err(EventProcessorError::InvalidEventLine(_))
         ));
+    }
+
+    const OTHER: &str = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
+    const TAG_ID: &str = "8Z8CWH8NVYQY39ZEBFGKQWWEKG";
+
+    #[test]
+    fn social_v1_profile_follow_and_tag_are_events_of_epoch_v1() {
+        let cases = [
+            ("/pub/social/v1/profile.json".to_string(), Resource::User),
+            (
+                format!("/pub/social/v1/follows/{OTHER}.json"),
+                Resource::Follow(PubkyId::try_from(OTHER).unwrap()),
+            ),
+            (
+                format!("/pub/social/v1/tags/{TAG_ID}.json"),
+                Resource::Tag(TAG_ID.to_string()),
+            ),
+        ];
+        for kind in ["PUT", "DEL"] {
+            for (path, resource) in &cases {
+                let event = Event::parse_event(&line(kind, path), PathBuf::new())
+                    .expect("a social/v1 event parses")
+                    .expect("a social/v1 profile, follow or tag is handled");
+                assert_eq!(event.epoch, Epoch::V1, "{kind} {path}");
+                assert_eq!(&event.parsed_uri.resource, resource, "{kind} {path}");
+                assert_eq!(event.parsed_uri.user_id.to_string(), USER);
+            }
+        }
+    }
+
+    #[test]
+    fn pubky_app_events_are_of_epoch_v0() {
+        let event = Event::parse_event(&line("PUT", "/pub/pubky.app/profile.json"), PathBuf::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.epoch, Epoch::V0);
+        assert_eq!(event.parsed_uri.resource, Resource::User);
+    }
+
+    /// Posts, files and feeds are served by the social indexer; other epochs, an epoch-less
+    /// path and a malformed leaf name no object this indexer reads.
+    #[test]
+    fn social_resources_the_marketplace_indexer_does_not_read_are_skipped() {
+        for kind in ["PUT", "DEL"] {
+            for path in [
+                "/pub/social/v1/posts/0032SSN7Q4EVG/0032SSN7Q4EVJ.json".to_string(),
+                format!("/pub/social/v1/files/{TAG_ID}.png"),
+                format!("/pub/social/v1/feeds/{TAG_ID}.json"),
+                "/pub/social/v1/Profile.json".to_string(),
+                format!("/pub/social/v1/follows/{OTHER}"),
+                format!("/pub/social/v1/tags/{}.json", TAG_ID.to_lowercase()),
+                "/pub/social/v2/profile.json".to_string(),
+                "/pub/social/profile.json".to_string(),
+            ] {
+                let parsed = Event::parse_event(&line(kind, &path), PathBuf::new())
+                    .expect("a social path the indexer does not read is not an error");
+                assert!(parsed.is_none(), "{kind} {path} yields no event to handle");
+            }
+        }
+    }
+
+    #[test]
+    fn private_paths_are_never_events() {
+        for kind in ["PUT", "DEL"] {
+            for path in [
+                format!("/priv/social/v1/mutes/{OTHER}.json"),
+                format!("/priv/social/v1/feeds/{TAG_ID}.json"),
+                "/priv/app.pubky/v1/last_read.json".to_string(),
+                "/priv/pubky.app/marketplace/v2/s/abc".to_string(),
+            ] {
+                let parsed = Event::parse_event(&line(kind, &path), PathBuf::new())
+                    .expect("a private path is not an error");
+                assert!(parsed.is_none(), "{kind} {path} yields no event to handle");
+            }
+        }
+    }
+
+    #[test]
+    fn non_canonical_social_v1_addresses_are_refused() {
+        for path in [
+            "/pub/social/v1/profile.json/".to_string(),
+            "/pub/social/v1//profile.json".to_string(),
+            "/pub/social/v1/%70rofile.json".to_string(),
+            format!("/pub/social/v1/tags/{TAG_ID}.json?x=1"),
+        ] {
+            assert!(
+                matches!(
+                    Event::parse_event(&line("PUT", &path), PathBuf::new()),
+                    Err(EventProcessorError::InvalidEventLine(_))
+                ),
+                "{path}"
+            );
+        }
     }
 }

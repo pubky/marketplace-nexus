@@ -2,36 +2,39 @@ use super::listing::{self, ModerationChecks};
 use super::{review, shop};
 use crate::events::directory_page::{DirectoryPager, PageStep};
 use crate::events::remote_body::{fetch_record_capped, within, MAX_RECORD_BYTES};
-use crate::events::EventProcessorError;
+use crate::events::{flip, social_v1, EventProcessorError};
 
 use nexus_common::db::queries::get::user_is_safe_to_delete;
 use nexus_common::db::{execute_graph_operation, OperationOutcome, PubkyConnector};
 use nexus_common::models::{
     marketplace::{ListingDetails, ModeratedUser},
     traits::Collection,
-    user::{UserCounts, UserDetails, UserSearch, USER_DELETED_SENTINEL},
+    user::{Epoch, UserCounts, UserDetails, UserSearch, USER_DELETED_SENTINEL},
 };
 use pubky::PubkyResource;
 use pubky_app_specs::{
     listing_uri_builder, shop_uri_builder, user_uri_builder, PubkyAppObject, PubkyAppUser, PubkyId,
     Resource,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Listing directory entries read per LIST page when a released user's
 /// listings are restored.
 const LISTING_RESTORE_PAGE: u16 = 500;
 
 pub async fn sync_put(user: PubkyAppUser, user_id: PubkyId) -> Result<(), EventProcessorError> {
+    sync_put_details(UserDetails::from_homeserver(user, &user_id)).await
+}
+
+/// Indexes a profile of either epoch. The node keeps its epoch.
+pub async fn sync_put_details(user_details: UserDetails) -> Result<(), EventProcessorError> {
+    let user_id = user_details.id.clone();
     debug!("Indexing new user profile: {}", user_id);
 
-    // Step 1: Create `UserDetails` object
-    let user_details = UserDetails::from_homeserver(user, &user_id);
-
-    // Step 2: Save to graph
+    // Save to graph
     user_details.put_to_graph().await?;
 
-    // Step 3: Run in parallel the cache process: SAVE TO INDEX
+    // Run in parallel the cache process: SAVE TO INDEX
     let indexing_results = tokio::join!(
         async {
             UserSearch::put_to_index(&[&user_details]).await?;
@@ -68,10 +71,20 @@ pub async fn del(user_id: PubkyId) -> Result<(), EventProcessorError> {
     // 3. But if there is any relationship (OperationOutcome::Updated), then we simply update the user with empty profile
     // and keyword username [DELETED].
     // A deleted user is a user whose profile is empty and has username `"[DELETED]"`
-    match execute_graph_operation(query)
+    let outcome = execute_graph_operation(query)
         .await
-        .map_err(EventProcessorError::graph_query_failed)?
-    {
+        .map_err(EventProcessorError::graph_query_failed)?;
+    // A user at `v1` always keeps their node, as the tombstone: the epoch on it is what keeps
+    // their stale `pubky.app` events ignored, and a removed node reads as `v0`.
+    let outcome = match outcome {
+        OperationOutcome::CreatedOrDeleted
+            if Epoch::get_from_graph_if_present(&user_id).await? == Some(Epoch::V1) =>
+        {
+            OperationOutcome::Updated
+        }
+        outcome => outcome,
+    };
+    match outcome {
         OperationOutcome::CreatedOrDeleted => {
             // UserSearch::delete reads UserDetails from the index to find the username,
             // so it must complete before UserDetails::delete runs.
@@ -216,19 +229,9 @@ async fn restore_from_homeserver(user_id: &PubkyId) -> Result<(), EventProcessor
 }
 
 async fn restore_steps(user_id: &PubkyId) -> Result<(), EventProcessorError> {
-    let Some(blob) = fetch_record(&user_uri_builder(user_id.to_string())).await? else {
+    if !restore_profile(user_id).await? {
         info!("User {user_id} has no profile on their homeserver; nothing to restore");
         return Ok(());
-    };
-    match PubkyAppObject::from_resource(&Resource::User, &blob)
-        .map_err(EventProcessorError::generic)?
-    {
-        PubkyAppObject::User(profile) => sync_put(profile, user_id.clone()).await?,
-        _ => {
-            return Err(EventProcessorError::generic(format!(
-                "Expected a profile record for {user_id}"
-            )))
-        }
     }
 
     if let Some(blob) = fetch_record(&shop_uri_builder(user_id.to_string())).await? {
@@ -255,6 +258,68 @@ async fn restore_steps(user_id: &PubkyId) -> Result<(), EventProcessorError> {
         .await?;
     }
     Ok(())
+}
+
+/// Indexes the user's profile again from the epoch they are read through, and returns whether
+/// they had one. A `social/v1` profile is read first: it is the last file the migrator writes,
+/// so a user still at `v0` who has one migrated while hidden (their node, and the epoch on it,
+/// may have been removed with their profile) and flips here as their profile PUT would have
+/// flipped them. A `social/v1` profile that is gone or fails the reader is not there to restore
+/// from: a user at `v0` or out of the graph is restored from `pubky.app`, and a user at `v1`,
+/// who is never restored from `pubky.app`, keeps their tombstone until their next valid profile
+/// PUT, while the release of the marker still completes.
+async fn restore_profile(user_id: &PubkyId) -> Result<bool, EventProcessorError> {
+    let epoch = Epoch::get_from_graph_if_present(user_id).await?;
+    if let Some(details) = social_profile_to_restore(user_id).await? {
+        match epoch {
+            Some(Epoch::V1) => sync_put_details(details).await?,
+            Some(Epoch::V0) => {
+                flip::move_to_v1(user_id).await?;
+                sync_put_details(details).await?;
+            }
+            None => {
+                sync_put_details(details).await?;
+                Epoch::set_v1_in_graph(user_id).await?;
+            }
+        }
+        return Ok(true);
+    }
+    if epoch == Some(Epoch::V1) {
+        return Ok(false);
+    }
+    let Some(blob) = fetch_record(&user_uri_builder(user_id.to_string())).await? else {
+        return Ok(false);
+    };
+    match PubkyAppObject::from_resource(&Resource::User, &blob)
+        .map_err(EventProcessorError::generic)?
+    {
+        PubkyAppObject::User(profile) => sync_put(profile, user_id.clone()).await?,
+        _ => {
+            return Err(EventProcessorError::generic(format!(
+                "Expected a profile record for {user_id}"
+            )))
+        }
+    }
+    Ok(true)
+}
+
+/// The user's `social/v1` profile, `None` when it is gone from their homeserver or fails the
+/// reader. A homeserver that cannot be read is an error, never a missing profile.
+async fn social_profile_to_restore(
+    user_id: &PubkyId,
+) -> Result<Option<UserDetails>, EventProcessorError> {
+    let uri = pubky_social_specs::user_uri_builder(user_id.to_string());
+    let Some(blob) = fetch_record(&uri).await? else {
+        return Ok(None);
+    };
+    match social_v1::read_profile(&blob) {
+        Ok(profile) => Ok(Some(UserDetails::from_social_v1(profile, user_id))),
+        Err(EventProcessorError::SpecValidation(reason)) => {
+            warn!(%user_id, %reason, "Social v1 profile fails the reader; not restored from it");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The record at `uri`, or `None` when the homeserver answers 404. Every

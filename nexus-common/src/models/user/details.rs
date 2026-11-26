@@ -7,6 +7,7 @@ use crate::models::traits::Collection;
 use async_trait::async_trait;
 use chrono::Utc;
 use pubky_app_specs::{PubkyAppUser, PubkyAppUserLink, PubkyId};
+use pubky_social_specs::PubkySocialUser;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json;
 use utoipa::ToSchema;
@@ -97,6 +98,28 @@ impl UserDetails {
             status: homeserver_user.status,
             links: homeserver_user.links,
             image: homeserver_user.image,
+            id: user_id.clone(),
+            indexed_at: Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// The details of a `social/v1` profile. Unknown members the reader preserves are dropped,
+    /// as they are on a `pubky.app` profile.
+    pub fn from_social_v1(profile: PubkySocialUser, user_id: &PubkyId) -> Self {
+        UserDetails {
+            name: profile.name,
+            bio: profile.bio,
+            status: profile.status,
+            links: profile.links.map(|links| {
+                links
+                    .into_iter()
+                    .map(|link| PubkyAppUserLink {
+                        title: link.title,
+                        url: link.url,
+                    })
+                    .collect()
+            }),
+            image: profile.image,
             id: user_id.clone(),
             indexed_at: Utc::now().timestamp_millis(),
         }
