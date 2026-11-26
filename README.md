@@ -456,7 +456,7 @@ gone or rejected, leaves the user at `v0`, so their woken writes are ignored as
 before and counted as `ignored`. A woken PUT reads its record as it is when
 replayed, and a woken DEL applies only while its record is still gone, read
 within the 30 second record fetch deadline, so a replay never undoes a newer
-write and a hung homeserver holds the pass one deadline per woken DEL. The
+write, and that read gives up after the deadline when the homeserver hangs. The
 user's `pubky.app` DELs are not deferred, unlike in `pubky-nexus`: this flip
 rewrites ids in place, so they apply to the records the flip will move. The
 queue runs once per watcher loop, after the homeserver polls, attempting at
