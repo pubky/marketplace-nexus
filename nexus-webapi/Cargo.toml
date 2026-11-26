@@ -33,8 +33,8 @@ tower-http = { version = "0.6.8", features = [
     "timeout",
 ] }
 tracing = { workspace = true }
-utoipa = "5.4.0"
-utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+utoipa = "6.0.0"
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum"] }
 
 [dev-dependencies]
 nexus-common = { path = "../nexus-common", features = ["test-utils"] }
