@@ -1,3 +1,6 @@
 #!/bin/sh
+# Portable pre-push hook for Linux and macOS.
+# Default (fast): cargo fmt --check + cargo check for changed packages.
+# Full suite (opt-in): PREPUSH_FULL=1 git push
 cd "$(dirname "$0")/.." || exit 1
 exec bash scripts/prepush.sh "$@"

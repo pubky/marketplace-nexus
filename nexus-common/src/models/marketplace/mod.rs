@@ -19,9 +19,13 @@ pub use drop::{
     DROP_STARTS_KEY_PARTS,
 };
 pub use listing::{ListingDetails, ListingSaleFormat};
+#[cfg(feature = "test-utils")]
+pub use moderation::{acquire_listing_lease_for_test, populate_listing_cache_if_lease_matches};
 pub use moderation::{
+    listing_moderation_cache_key, listing_moderation_lease_key, user_moderation_cache_key,
     DerivedReviewModeration, ExcludedReviewer, ListingModerationState, ModeratedListing,
     ModeratedReview, ModeratedUser, ReviewModeration, ReviewModerationState,
+    MODERATION_CACHE_TTL_SECS,
 };
 pub use reputation::{
     AttestorWindow, CountedReview, ReputationBucket, ReputationSnippet, ReputationSummary,
