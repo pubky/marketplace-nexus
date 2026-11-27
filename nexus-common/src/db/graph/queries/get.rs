@@ -955,6 +955,23 @@ pub fn get_shop_by_owner(owner_id: &str) -> Query {
     .param("owner_id", owner_id)
 }
 
+/// One row (`listing_moderated`, `seller_moderated`) answering whether any
+/// moderator tag hides the listing itself or its seller, in a single graph
+/// roundtrip.
+pub fn listing_moderation_state(owner_id: &str, listing_id: &str) -> Query {
+    Query::new(
+        "listing_moderation_state",
+        "RETURN EXISTS {
+             MATCH (:ModeratedListing {owner_id: $owner_id, listing_id: $listing_id})
+         } AS listing_moderated,
+         EXISTS {
+             MATCH (:ModeratedUser {user_id: $owner_id})
+         } AS seller_moderated",
+    )
+    .param("owner_id", owner_id)
+    .param("listing_id", listing_id)
+}
+
 /// One row (`tag_id`) when any moderator tag hides the listing, no row otherwise.
 pub fn listing_moderation_marker(owner_id: &str, listing_id: &str) -> Query {
     Query::new(

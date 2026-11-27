@@ -6,9 +6,11 @@ mod reviews;
 use crate::utils::{get_request, invalid_get_request};
 use anyhow::Result;
 use axum::http::StatusCode;
-use nexus_common::db::{exec_single_row, queries, OperationOutcome};
+use nexus_common::db::{exec_single_row, get_redis_conn, queries, OperationOutcome};
 use nexus_common::models::marketplace::{
+    listing_moderation_cache_key, populate_listing_cache_if_gen_matches, user_moderation_cache_key,
     ListingDetails, ListingSaleFormat, ModeratedListing, ModeratedUser, ShopDetails,
+    MODERATION_CACHE_TTL_SECS,
 };
 use nexus_common::models::traits::Collection;
 use nexus_common::models::user::UserDetails;
@@ -608,6 +610,154 @@ async fn test_listing_moderation_state_follows_the_listing_and_seller_markers() 
         .await?
         .is_some());
     assert!(ShopDetails::get_from_graph(&seller_id).await?.is_some());
+
+    Ok(())
+}
+
+#[tokio_shared_rt::test(shared)]
+async fn test_listing_moderation_cache_serves_hits_and_invalidates_immediately() -> Result<()> {
+    use deadpool_redis::redis::AsyncCommands;
+
+    let (seller_id, _, listing_ids) = seed_marketplace().await?;
+    let moderator_id = Keypair::random().public_key().to_z32();
+    let listing_a = &listing_ids[0];
+    let listing_b = &listing_ids[1];
+    let route_a = format!("/v0/listing/{seller_id}/{listing_a}/moderation");
+    let route_b = format!("/v0/listing/{seller_id}/{listing_b}/moderation");
+
+    let listing_a_key = listing_moderation_cache_key(&seller_id, listing_a);
+    let listing_b_key = listing_moderation_cache_key(&seller_id, listing_b);
+    let user_key = user_moderation_cache_key(&seller_id);
+
+    // Cold read populates both the listing and seller cache keys with a bounded short TTL.
+    let body = get_request(&route_a).await?;
+    assert_eq!(body["moderated"], false);
+
+    let mut conn = get_redis_conn().await?;
+    let cached_listing: Option<String> = conn.get(&listing_a_key).await?;
+    let cached_user: Option<String> = conn.get(&user_key).await?;
+    let listing_ttl: i64 = conn.ttl(&listing_a_key).await?;
+    let user_ttl: i64 = conn.ttl(&user_key).await?;
+    assert_eq!(cached_listing.as_deref(), Some("0"));
+    assert_eq!(cached_user.as_deref(), Some("0"));
+    assert!(
+        listing_ttl > 0 && listing_ttl <= MODERATION_CACHE_TTL_SECS,
+        "unexpected listing TTL: {listing_ttl}"
+    );
+    assert!(
+        user_ttl > 0 && user_ttl <= MODERATION_CACHE_TTL_SECS,
+        "unexpected user TTL: {user_ttl}"
+    );
+
+    // Prove subsequent reads are served from Redis without querying Neo4j:
+    // insert a raw marker bypassing ModeratedListing::put and verify the
+    // cached Clear response is still served until invalidation runs.
+    let raw_tag_id = "raw-bypass-tag";
+    exec_single_row(queries::put::put_moderated_listing(
+        &seller_id,
+        listing_a,
+        &listing_uri_builder(seller_id.clone(), listing_a.clone()),
+        &moderator_id,
+        raw_tag_id,
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    ))
+    .await?;
+    let body = get_request(&route_a).await?;
+    assert_eq!(
+        body["moderated"], false,
+        "warm cache hit must not re-query Neo4j"
+    );
+
+    // Writing through ModeratedListing::put invalidates immediately even while
+    // the short TTL is still active.
+    ModeratedListing::put(
+        &seller_id,
+        listing_a,
+        &listing_uri_builder(seller_id.clone(), listing_a.clone()),
+        &moderator_id,
+        "listing-tag",
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    let body = get_request(&route_a).await?;
+    assert_eq!(body["moderated"], true);
+    assert_eq!(body["listing_moderated"], true);
+    assert_eq!(body["seller_moderated"], false);
+
+    // Warm listing_b as Clear, then moderate the seller: ModeratedUser::put
+    // must immediately invalidate seller state across every listing of the seller.
+    let body = get_request(&route_b).await?;
+    assert_eq!(body["moderated"], false);
+    assert_eq!(
+        conn.get::<_, Option<String>>(&listing_b_key)
+            .await?
+            .as_deref(),
+        Some("0")
+    );
+
+    ModeratedUser::put(
+        &seller_id,
+        &format!("pubky://{seller_id}/pub/pubky.app/profile.json"),
+        &moderator_id,
+        "user-tag",
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    let body = get_request(&route_b).await?;
+    assert_eq!(body["moderated"], true);
+    assert_eq!(body["listing_moderated"], false);
+    assert_eq!(body["seller_moderated"], true);
+
+    // Deleting the markers immediately invalidates cached true entries back to Clear.
+    ModeratedListing::delete(&moderator_id, raw_tag_id).await?;
+    ModeratedListing::delete(&moderator_id, "listing-tag").await?;
+    ModeratedUser::delete(&moderator_id, "user-tag").await?;
+    let body = get_request(&route_a).await?;
+    assert_eq!(body["moderated"], false);
+    let body = get_request(&route_b).await?;
+    assert_eq!(body["moderated"], false);
+
+    // Oversized path segments bypass Redis caching instead of creating large keys.
+    let huge_listing = "X".repeat(200);
+    let huge_key = listing_moderation_cache_key(&seller_id, &huge_listing);
+    let body = get_request(&format!(
+        "/v0/listing/{seller_id}/{huge_listing}/moderation"
+    ))
+    .await?;
+    assert_eq!(body["moderated"], false);
+    assert_eq!(conn.get::<_, Option<String>>(&huge_key).await?, None);
+
+    // Generation-counter race guard: a slow cache-miss read that began before
+    // a concurrent takedown must not write stale Clear back into Redis.
+    let racing_listing = &listing_ids[2];
+    let racing_key = listing_moderation_cache_key(&seller_id, racing_listing);
+    ModeratedListing::put(
+        &seller_id,
+        racing_listing,
+        &listing_uri_builder(seller_id.clone(), racing_listing.clone()),
+        &moderator_id,
+        "race-tag",
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    let wrote_stale =
+        populate_listing_cache_if_gen_matches(&seller_id, racing_listing, false, "").await?;
+    assert!(
+        !wrote_stale,
+        "stale fill with pre-invalidation generation must be rejected"
+    );
+    assert_eq!(conn.get::<_, Option<String>>(&racing_key).await?, None);
+    let body = get_request(&format!(
+        "/v0/listing/{seller_id}/{racing_listing}/moderation"
+    ))
+    .await?;
+    assert_eq!(body["moderated"], true);
+    assert_eq!(body["listing_moderated"], true);
+    ModeratedListing::delete(&moderator_id, "race-tag").await?;
 
     Ok(())
 }

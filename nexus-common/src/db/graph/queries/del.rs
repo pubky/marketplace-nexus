@@ -160,23 +160,29 @@ pub fn delete_tag_cleanup_marker(id: &str) -> Query {
     .param("id", id)
 }
 
-/// Deletes the listing moderation marker written for one moderator tag.
+/// Deletes the listing moderation marker written for one moderator tag and
+/// returns the affected `(owner_id, listing_id)` target, if a marker existed.
 pub fn delete_moderated_listing(moderator_id: &str, tag_id: &str) -> Query {
     Query::new(
         "delete_moderated_listing",
         "MATCH (marker:ModeratedListing {moderator_id: $moderator_id, tag_id: $tag_id})
-         DELETE marker",
+         WITH marker, marker.owner_id AS owner_id, marker.listing_id AS listing_id
+         DELETE marker
+         RETURN owner_id, listing_id",
     )
     .param("moderator_id", moderator_id)
     .param("tag_id", tag_id)
 }
 
-/// Deletes the user moderation marker written for one moderator tag.
+/// Deletes the user moderation marker written for one moderator tag and
+/// returns the affected `user_id`, if a marker existed.
 pub fn delete_moderated_user(moderator_id: &str, tag_id: &str) -> Query {
     Query::new(
         "delete_moderated_user",
         "MATCH (marker:ModeratedUser {moderator_id: $moderator_id, tag_id: $tag_id})
-         DELETE marker",
+         WITH marker, marker.user_id AS user_id
+         DELETE marker
+         RETURN user_id",
     )
     .param("moderator_id", moderator_id)
     .param("tag_id", tag_id)

@@ -450,11 +450,13 @@ pub fn put_moderated_listing(
     Query::new(
         "put_moderated_listing",
         "MERGE (marker:ModeratedListing {moderator_id: $moderator_id, tag_id: $tag_id})
+         WITH marker, marker.owner_id AS prev_owner_id, marker.listing_id AS prev_listing_id
          SET marker.owner_id = $owner_id,
              marker.listing_id = $listing_id,
              marker.uri = $uri,
              marker.label = $label,
-             marker.moderated_at = $moderated_at",
+             marker.moderated_at = $moderated_at
+         RETURN prev_owner_id, prev_listing_id",
     )
     .param("owner_id", owner_id)
     .param("listing_id", listing_id)
@@ -480,11 +482,13 @@ pub fn put_moderated_user(
     Query::new(
         "put_moderated_user",
         "MERGE (marker:ModeratedUser {moderator_id: $moderator_id, tag_id: $tag_id})
+         WITH marker, marker.user_id AS prev_user_id
          SET marker.user_id = $user_id,
              marker.uri = $uri,
              marker.label = $label,
              marker.moderated_at = $moderated_at
-         REMOVE marker.releasing",
+         REMOVE marker.releasing
+         RETURN prev_user_id",
     )
     .param("user_id", user_id)
     .param("uri", uri)
