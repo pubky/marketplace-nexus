@@ -1,35 +1,26 @@
 #!/usr/bin/env bash
-# Fair slots for pre-push work that used to share one heavy.lock.
+# Fair slots for optional full pre-push runs (PREPUSH_FULL=1).
 #
-# lockf without -k removes the lock file on exit, so waiters are not ordered.
-# Each class has its own ticket queue. A process may run only when fewer than
-# SLOTS older live tickets exist, then it holds one slot with lockf -k.
-# Each scan drops a ticket whose PID is dead, a zombie, or reused.
-# EXIT, INT, and TERM remove the current ticket immediately. SIGKILL cannot
-# be caught; the next scan expires that ticket so it cannot block the queue.
+# Each class has its own FIFO ticket queue. A process may run only when fewer
+# than SLOTS older live tickets exist, then it holds one slot lock while the
+# command runs. Each scan drops a ticket whose PID is dead, a zombie, or
+# reused. EXIT, INT, and TERM remove the current ticket immediately. SIGKILL
+# cannot be caught; the next scan expires that ticket so it cannot block the
+# queue.
 #
-#   vrt    1 slot   Playwright in Docker. Browsers and /dev/shm are what
-#                   exhaust the Docker VM, so this stays exclusive.
-#   cargo  2 slots  Rust clippy and tests, plus their Postgres or Neo4j.
-#                   Those containers are small next to a 16GB Docker VM, and
-#                   the compilers run on the host.
-#   node   1 slot   Host typecheck and vitest. Separate from cargo and vrt,
-#                   so a Shop typecheck does not wait behind either.
+# Locking uses `flock` when available (Linux and macOS with flock) and falls
+# back to POSIX atomic `mkdir` directories with PID liveness reaping on systems
+# without `flock` (such as stock macOS).
 #
-# Classes do not exclude each other. A VRT run and two cargo runs can overlap.
+#   vrt    1 slot   Browser/container runs.
+#   cargo  2 slots  Rust clippy and tests.
+#   node   1 slot   Host Node checks.
 #
-# vrt and cargo refuse to take a slot when a volume in HEAVY_DISK_VOLUMES has
-# less than HEAVY_DISK_FLOOR_GIB free. VRT and Rust builds are what filled
-# /Volumes/vibedrive to 100% and failed with ENOSPC. A volume that is not
-# mounted is skipped. node is not checked.
-#
-# HEAVY_LOCK_DIR overrides the directory (tests). The default is the shared
-# lock directory. This does not take heavy.lock; in-flight worktrees that
-# still lock that file keep their old behavior until they update.
+# Classes do not exclude each other.
+# HEAVY_LOCK_DIR overrides the lock directory (defaults to a per-user TMPDIR).
+# HEAVY_LOCK_BACKEND overrides lock backend selection (`flock` or `mkdir`).
 
-HEAVY_LOCK_DIR="${HEAVY_LOCK_DIR:-/Volumes/t7/vibes-dev/.locks}"
-HEAVY_DISK_FLOOR_GIB="${HEAVY_DISK_FLOOR_GIB:-25}"
-HEAVY_DISK_VOLUMES="${HEAVY_DISK_VOLUMES:-/Volumes/vibedrive /Volumes/t7}"
+HEAVY_LOCK_DIR="${HEAVY_LOCK_DIR:-${TMPDIR:-/tmp}/marketplace-nexus-locks-$(id -u)}"
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   echo "source scripts/heavy-lock.sh" >&2
@@ -48,28 +39,23 @@ heavy_slots() {
   esac
 }
 
-# 0 when every mounted volume has at least the floor free. Otherwise prints
-# the refusal and returns 1.
-heavy_disk_ok() {
-  local class="$1" vol free_kib free_gib status=0
-  case "$class" in
-    vrt|cargo) ;;
-    *) return 0 ;;
+heavy_lock_backend() {
+  case "${HEAVY_LOCK_BACKEND:-}" in
+    flock|mkdir)
+      printf '%s\n' "$HEAVY_LOCK_BACKEND"
+      ;;
+    "")
+      if command -v flock >/dev/null 2>&1; then
+        echo flock
+      else
+        echo mkdir
+      fi
+      ;;
+    *)
+      echo "heavy-lock: unknown HEAVY_LOCK_BACKEND: ${HEAVY_LOCK_BACKEND}" >&2
+      return 1
+      ;;
   esac
-  for vol in $HEAVY_DISK_VOLUMES; do
-    [ -d "$vol" ] || continue
-    free_kib=$(df -Pk "$vol" 2>/dev/null | awk 'NR == 2 { print $4 }')
-    [[ "$free_kib" =~ ^[0-9]+$ ]] || continue
-    free_gib=$((free_kib / 1048576))
-    if [ "$free_gib" -lt "$HEAVY_DISK_FLOOR_GIB" ]; then
-      echo "heavy-lock: refusing class=${class}: ${vol} has ${free_gib} GiB free, floor is ${HEAVY_DISK_FLOOR_GIB} GiB" >&2
-      status=1
-    fi
-  done
-  if [ "$status" -ne 0 ]; then
-    echo "heavy-lock: free space first: stale worktree target dirs under /Volumes/t7/vibes-dev/.cargo-target, unused docker volumes (docker volume ls), and old VRT attachments; see the fleet-resource-hygiene skill" >&2
-  fi
-  return "$status"
 }
 
 etime_to_seconds() {
@@ -96,7 +82,12 @@ etime_to_seconds() {
 
 heavy_release() {
   local ticket="${HEAVY_TICKET:-}"
+  local slotdir="${HEAVY_SLOT_DIR:-}"
   HEAVY_TICKET=""
+  HEAVY_SLOT_DIR=""
+  if [ -n "$slotdir" ]; then
+    rm -rf "$slotdir"
+  fi
   if [ -n "$ticket" ]; then
     rm -f "$ticket"
   fi
@@ -127,9 +118,17 @@ heavy_finish_signal() {
 }
 
 heavy_arm_traps() {
-  HEAVY_SAVED_EXIT=$(trap -p EXIT || true)
-  HEAVY_SAVED_INT=$(trap -p INT || true)
-  HEAVY_SAVED_TERM=$(trap -p TERM || true)
+  HEAVY_SAVED_EXIT=""
+  HEAVY_SAVED_INT=""
+  HEAVY_SAVED_TERM=""
+  # In bash 4+, `trap -p` inside a subshell prints the parent shell's traps
+  # even though the subshell cleared them; re-evaluating them on disarm would
+  # fire the parent's EXIT trap inside a background job.
+  if [ "${BASH_SUBSHELL:-0}" -eq 0 ]; then
+    HEAVY_SAVED_EXIT=$(trap -p EXIT || true)
+    HEAVY_SAVED_INT=$(trap -p INT || true)
+    HEAVY_SAVED_TERM=$(trap -p TERM || true)
+  fi
   trap 'heavy_finish_exit' EXIT
   trap 'heavy_finish_signal INT' INT
   trap 'heavy_finish_signal TERM' TERM
@@ -151,31 +150,79 @@ heavy_disarm_traps() {
   HEAVY_SAVED_TERM=""
 }
 
+heavy_issue_body() {
+  local seqfile="$1" qdir="$2" pid="$3" n=0 tmp name
+  if [ -f "$seqfile" ]; then
+    n=$(tr -cd '0-9' < "$seqfile" || true)
+  fi
+  [ -n "$n" ] || n=0
+  n=$((n + 1))
+  tmp=$(mktemp "${seqfile}.XXXXXX")
+  printf '%s\n' "$n" > "$tmp"
+  mv "$tmp" "$seqfile"
+  name=$(printf '%020d' "$n")
+  printf '%s %s\n' "$pid" "$(date +%s)" > "$qdir/${name}.ticket"
+  printf '%s\n' "$n"
+}
+
 heavy_issue() {
   local class="$1"
   local self_pid="$2"
   local qdir="$HEAVY_LOCK_DIR/${class}.q"
   local seqfile="$HEAVY_LOCK_DIR/${class}.seq"
   local issue="$HEAVY_LOCK_DIR/${class}.issue.lock"
+  local backend lockdir owner_pid owner_epoch missing_waits=0
+  backend=$(heavy_lock_backend) || return 1
   mkdir -p "$qdir"
-  lockf -k "$issue" bash -c '
-    set -euo pipefail
-    seqfile="$1"
-    qdir="$2"
-    pid="$3"
-    n=0
-    if [ -f "$seqfile" ]; then
-      n=$(tr -cd "0-9" < "$seqfile" || true)
+
+  if [ "$backend" = flock ]; then
+    flock "$issue" bash -c '
+      set -euo pipefail
+      seqfile="$1"
+      qdir="$2"
+      pid="$3"
+      n=0
+      if [ -f "$seqfile" ]; then
+        n=$(tr -cd "0-9" < "$seqfile" || true)
+      fi
+      [ -n "$n" ] || n=0
+      n=$((n + 1))
+      tmp=$(mktemp "${seqfile}.XXXXXX")
+      printf "%s\n" "$n" > "$tmp"
+      mv "$tmp" "$seqfile"
+      name=$(printf "%020d" "$n")
+      printf "%s %s\n" "$pid" "$(date +%s)" > "$qdir/${name}.ticket"
+      printf "%s\n" "$n"
+    ' _ "$seqfile" "$qdir" "$self_pid"
+    return $?
+  fi
+
+  lockdir="${issue}.d"
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    if [ -f "$lockdir/owner" ]; then
+      missing_waits=0
+      owner_pid=""
+      owner_epoch=""
+      read -r owner_pid owner_epoch < "$lockdir/owner" 2>/dev/null || true
+      if [ -n "$owner_pid" ] && heavy_pid_dead "$owner_pid" "$owner_epoch"; then
+        rm -rf "$lockdir" 2>/dev/null || true
+        continue
+      fi
+    else
+      missing_waits=$((missing_waits + 1))
+      if [ "$missing_waits" -ge 40 ]; then
+        rm -rf "$lockdir" 2>/dev/null || true
+        missing_waits=0
+        continue
+      fi
     fi
-    [ -n "$n" ] || n=0
-    n=$((n + 1))
-    tmp=$(mktemp "${seqfile}.XXXXXX")
-    printf "%s\n" "$n" > "$tmp"
-    mv "$tmp" "$seqfile"
-    name=$(printf "%020d" "$n")
-    printf "%s %s\n" "$pid" "$(date +%s)" > "$qdir/${name}.ticket"
-    printf "%s\n" "$n"
-  ' _ "$seqfile" "$qdir" "$self_pid"
+    sleep 0.05
+  done
+  printf '%s %s\n' "$self_pid" "$(date +%s)" > "$lockdir/owner"
+  local issue_status=0
+  heavy_issue_body "$seqfile" "$qdir" "$self_pid" || issue_status=$?
+  rm -rf "$lockdir"
+  return "$issue_status"
 }
 
 # 0 when the ticket must be removed: empty PID, dead PID, zombie, or a reused
@@ -244,26 +291,61 @@ heavy_ahead() {
 # and the command did not start. Otherwise returns the command status.
 heavy_run_in_slot() {
   local slotfile="$1"
-  local marker hold_msg slot_status=0
+  local marker hold_msg slot_status=0 backend lockdir owner_pid owner_epoch
   shift
   hold_msg="$1"
   shift
-  marker=$(mktemp "${HEAVY_LOCK_DIR}/ran.XXXXXX")
-  : > "$marker"
-  # `||` keeps a non-zero status under set -e. A bare assignment from $? after
-  # `if` is wrong on bash 3.2: a failed if with no else reports status 0.
-  lockf -k -s -t 0 "$slotfile" bash -c '
-    printf 1 > "$1"
-    shift
-    printf "%s\n" "$1" >&2
-    shift
-    "$@"
-  ' _ "$marker" "$hold_msg" "$@" || slot_status=$?
-  if [ ! -s "$marker" ]; then
+  backend=$(heavy_lock_backend) || return 1
+
+  if [ "$backend" = flock ]; then
+    marker=$(mktemp "${HEAVY_LOCK_DIR}/ran.XXXXXX")
+    : > "$marker"
+    # `||` keeps a non-zero status under set -e. A bare assignment from $? after
+    # `if` is wrong on bash 3.2: a failed if with no else reports status 0.
+    flock -n "$slotfile" bash -c '
+      printf 1 > "$1"
+      shift
+      printf "%s\n" "$1" >&2
+      shift
+      "$@"
+    ' _ "$marker" "$hold_msg" "$@" || slot_status=$?
+    if [ ! -s "$marker" ]; then
+      rm -f "$marker"
+      return 75
+    fi
     rm -f "$marker"
-    return 75
+    return "$slot_status"
   fi
-  rm -f "$marker"
+
+  lockdir="${slotfile}.d"
+  if ! mkdir "$lockdir" 2>/dev/null; then
+    if [ -f "$lockdir/owner" ]; then
+      owner_pid=""
+      owner_epoch=""
+      read -r owner_pid owner_epoch < "$lockdir/owner" 2>/dev/null || true
+      if [ -n "$owner_pid" ] && heavy_pid_dead "$owner_pid" "$owner_epoch"; then
+        rm -rf "$lockdir" 2>/dev/null || true
+        mkdir "$lockdir" 2>/dev/null || return 75
+      else
+        return 75
+      fi
+    else
+      # Give a concurrent acquirer a brief moment to write owner before reaping.
+      sleep 0.1
+      if [ ! -f "$lockdir/owner" ]; then
+        rm -rf "$lockdir" 2>/dev/null || true
+        mkdir "$lockdir" 2>/dev/null || return 75
+      else
+        return 75
+      fi
+    fi
+  fi
+  printf '%s %s\n' "${HEAVY_SELF:-$$}" "$(date +%s)" > "$lockdir/owner"
+  HEAVY_SLOT_DIR="$lockdir"
+  printf '%s\n' "$hold_msg" >&2
+  "$@" || slot_status=$?
+  rm -rf "$lockdir"
+  HEAVY_SLOT_DIR=""
   return "$slot_status"
 }
 
@@ -273,7 +355,7 @@ run_heavy() {
   local slots seq ahead last i st
   local self_pid pidfile
   slots=$(heavy_slots "$class") || return 1
-  heavy_disk_ok "$class" || return 1
+  heavy_lock_backend >/dev/null || return 1
   mkdir -p "$HEAVY_LOCK_DIR"
   # heavy_issue runs inside a command substitution, and that subshell exits
   # as soon as the ticket number is printed. Record this shell, not that
@@ -307,12 +389,6 @@ run_heavy() {
     fi
     sleep 0.25
   done
-  # The wait can be long; recheck just before the slot is taken.
-  if ! heavy_disk_ok "$class"; then
-    heavy_release
-    heavy_disarm_traps
-    return 1
-  fi
   while true; do
     i=1
     while [ "$i" -le "$slots" ]; do

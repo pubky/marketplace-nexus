@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
-# Pre-push gate. Last line on success: PREPUSH OK <sha> <seconds> <mode>
+# Portable pre-push gate (Linux and macOS).
+# Last line on success: PREPUSH OK <sha> <seconds> <mode>
 #
-# fast (default): cargo fmt, then clippy and tests for the packages the
-#   change touches since the merge base (scripts/prepush-packages.sh). A
-#   change to a workspace-wide file runs the whole workspace; a change to
-#   no package (docs, CI, scripts) runs fmt only.
-# full (PREPUSH_FULL=1, releases): fmt, clippy and every test in the
-#   workspace. CI runs the same on every pull request; fast relies on that.
+# fast (default): cargo fmt --check, then cargo check --all-targets for the
+#   packages the change touches since the merge base (scripts/prepush-packages.sh).
+#   A change to a workspace-wide file checks the whole workspace; a change to
+#   no package (docs, CI, scripts) runs fmt only. Requires no Docker, Redis,
+#   Neo4j, or machine-specific paths.
+# full (PREPUSH_FULL=1): cargo fmt --check, cargo clippy --workspace --all-targets,
+#   mock DB load, and the full parallel cargo nextest suite matching
+#   .github/workflows/test.yml.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 start=$(date +%s)
-# shellcheck source=heavy-lock.sh
-source "$ROOT/scripts/heavy-lock.sh"
 # shellcheck source=prepush-stamp.sh
 source "$ROOT/scripts/prepush-stamp.sh"
 prepush_mode_init || exit 1
@@ -52,147 +53,89 @@ if prepush_reuse "$sha"; then
   exit 0
 fi
 
-packages=()
-if [ "$PREPUSH_MODE" = full ]; then
-  packages=(--workspace)
-else
+if [ -n "${PREPUSH_CARGO_TARGET:-}" ]; then
+  export CARGO_TARGET_DIR="$PREPUSH_CARGO_TARGET"
+fi
+
+if [ "$PREPUSH_MODE" = fast ]; then
+  packages=()
+  base=""
   if [ -n "${PREPUSH_BASE:-}" ]; then
     base="$PREPUSH_BASE"
   elif git rev-parse --verify --quiet origin/main >/dev/null; then
     base="$(git merge-base HEAD origin/main)"
-  else
-    echo "prepush: set PREPUSH_BASE to the merge base" >&2
-    exit 1
+  elif git rev-parse --verify --quiet main >/dev/null; then
+    base="$(git merge-base HEAD main)"
   fi
-  # shellcheck source=prepush-packages.sh
-  source "$ROOT/scripts/prepush-packages.sh"
-  # docker/ holds the test env (.env-sample) and the graph `db mock` loads.
-  selected="$(prepush_changed_packages "$base" \
-    Cargo.toml Cargo.lock rust-toolchain rust-toolchain.toml '.cargo/*' \
-    clippy.toml .clippy.toml rustfmt.toml .rustfmt.toml \
-    'docker/*')" || {
-    echo "prepush: cannot diff against base ${base}" >&2
-    exit 1
-  }
-  while IFS= read -r line; do
-    [ -n "$line" ] && packages+=("$line")
-  done <<< "$selected"
-fi
-if [ "${#packages[@]}" -eq 0 ]; then
-  echo "prepush: packages (none changed)"
-else
-  echo "prepush: packages ${packages[*]}"
-fi
 
-if [ "${#packages[@]}" -eq 0 ]; then
+  if [ -z "$base" ]; then
+    packages=(--workspace)
+  else
+    # shellcheck source=prepush-packages.sh
+    source "$ROOT/scripts/prepush-packages.sh"
+    # docker/ holds the test env (.env-sample) and the graph `db mock` loads.
+    selected="$(prepush_changed_packages "$base" \
+      Cargo.toml Cargo.lock rust-toolchain rust-toolchain.toml '.cargo/*' \
+      clippy.toml .clippy.toml rustfmt.toml .rustfmt.toml \
+      'docker/*')" || {
+      echo "prepush: cannot diff against base ${base}" >&2
+      exit 1
+    }
+    while IFS= read -r line; do
+      [ -n "$line" ] && packages+=("$line")
+    done <<< "$selected"
+  fi
+
+  if [ "${#packages[@]}" -eq 0 ]; then
+    echo "prepush: packages (none changed)"
+  else
+    echo "prepush: packages ${packages[*]}"
+  fi
+
   echo "prepush: cargo fmt"
   cargo fmt --check
-  echo "prepush: clippy and tests skipped (no package changed)"
+
+  if [ "${#packages[@]}" -eq 0 ]; then
+    echo "prepush: cargo check skipped (no package changed)"
+  else
+    check_scope=()
+    if [ "${packages[0]}" = --workspace ]; then
+      check_scope=(--workspace)
+    else
+      for pkg in "${packages[@]}"; do
+        check_scope+=(-p "$pkg")
+      done
+    fi
+    echo "prepush: cargo check"
+    cargo check "${check_scope[@]}" --all-targets
+  fi
+
   prepush_stamp "$sha"
   seconds="$(( $(date +%s) - start ))"
   echo "PREPUSH OK ${sha} ${seconds} ${PREPUSH_MODE}"
   exit 0
 fi
 
-prepush_clean_workspace_members() {
-  local target="$1" metadata names member
-  local members=() clean_args=()
-  metadata="$(CARGO_TARGET_DIR="$target" cargo metadata --no-deps --format-version 1 --locked)" || return 1
-  names="$(printf '%s' "$metadata" | jq -r '
-    .workspace_members as $members
-    | .packages[]
-    | select(.id as $id | $members | index($id))
-    | .name
-  ')" || return 1
-  while IFS= read -r member; do
-    [ -n "$member" ] && members+=("$member")
-  done <<< "$names"
-  [ "${#members[@]}" -gt 0 ] || return 1
-  for member in "${members[@]}"; do
-    clean_args+=(-p "$member")
-  done
-  CARGO_TARGET_DIR="$target" cargo clean "${clean_args[@]}" >/dev/null || return 1
-  printf '%s\n' "$ROOT" > "$target/.prepush-members-clean" || return 1
-  echo "prepush: cleaned ${#members[@]} workspace members from ${target}"
+# Full mode (PREPUSH_FULL=1): clippy and full parallel nextest suite like CI.
+# shellcheck source=heavy-lock.sh
+source "$ROOT/scripts/heavy-lock.sh"
+
+port_open() {
+  local port="$1"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/${port}") >/dev/null 2>&1
+  fi
 }
 
-# Sibling worktrees share one Cargo target unless this gate overrides it.
-# Workspace artifacts copied from a shared target name another tree's sources,
-# so only dependency artifacts are reused. Clean every workspace member in a
-# seeded, unmarked or differently-owned target, and mark empty targets to avoid
-# a later clean. PREPUSH_CARGO_TARGET overrides the private target location; a
-# new private target is seeded from CARGO_TARGET_DIR only when the paths differ.
-shared_target="${CARGO_TARGET_DIR:-}"
-private_target="${PREPUSH_CARGO_TARGET:-/Volumes/t7/vibes-dev/.cargo-target/pubky-nexus/$(basename "$ROOT")}"
-origin=existing
-if [ ! -d "$private_target" ]; then
-  origin=new
-fi
-if [ "$origin" = new ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
-  seed="${private_target}.partial"
-  rm -rf "$seed"
-  mkdir -p "$(dirname "$private_target")"
-  if cp -cRH "$shared_target" "$seed" 2>/dev/null || cp -RH "$shared_target" "$seed"; then
-    mv "$seed" "$private_target"
-    rm -f "$private_target/.prepush-members-clean"
-    origin=seeded
-  else
-    rm -rf "$seed"
-    mkdir -p "$private_target"
-  fi
-fi
-mkdir -p "$private_target"
-export CARGO_TARGET_DIR="$private_target"
-marker="$private_target/.prepush-members-clean"
-if [ "$origin" = new ]; then
-  printf '%s\n' "$ROOT" > "$marker"
-elif [ "$origin" = seeded ] || [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$ROOT" ]; then
-  if ! prepush_clean_workspace_members "$private_target"; then
-    if [ "$origin" = seeded ]; then
-      rm -rf "$private_target"
-      mkdir -p "$private_target"
-      printf '%s\n' "$ROOT" > "$marker"
-      echo "prepush: could not clean workspace members; using an empty target"
-    else
-      echo "prepush: cannot clean workspace members in ${private_target}; delete it or set PREPUSH_CARGO_TARGET to a new path" >&2
-      exit 1
-    fi
-  fi
-fi
-
+echo "prepush: packages --workspace"
 echo "prepush: cargo fmt"
 cargo fmt --check
 
-# One Redis and one Neo4j. --lib --bins --tests skips doctests; two examples
-# on main do not compile, and CI runs nextest, which does not compile them.
-# Watcher tests each install a testnet client with PubkyConnector::init_from,
-# and that client stays for the life of the process. cargo test shares one
-# process, so later homeservers are not on the first client's DHT. CI runs
-# nextest, one process per test. -j 1 keeps that isolation on the shared
-# Redis and Neo4j.
-clippy_scope=()
-cargo_test_scope=()
-watcher=0
-if [ "${packages[0]}" = --workspace ]; then
-  clippy_scope=(--workspace)
-  cargo_test_scope=(--workspace --exclude nexus-watcher)
-  watcher=1
-else
-  for pkg in "${packages[@]}"; do
-    clippy_scope+=(-p "$pkg")
-    if [ "$pkg" = nexus-watcher ]; then
-      watcher=1
-    else
-      cargo_test_scope+=(-p "$pkg")
-    fi
-  done
-fi
-test_cmd="cargo run -p nexusd -- db mock"
-if [ "${#cargo_test_scope[@]}" -gt 0 ]; then
-  test_cmd+=" && cargo test ${cargo_test_scope[*]} --lib --bins --tests --no-fail-fast -- --test-threads=1"
-fi
-if [ "$watcher" = 1 ]; then
-  test_cmd+=" && cargo nextest run -p nexus-watcher --no-fail-fast -j 1"
+if ! cargo nextest --version >/dev/null 2>&1; then
+  echo "prepush: cargo-nextest is required for PREPUSH_FULL=1" >&2
+  exit 1
 fi
 
 if ! docker info >/dev/null 2>&1; then
@@ -237,14 +180,14 @@ if [ "$encryption" != "scram-sha-256" ] || [ "$host_all" != "scram-sha-256" ]; t
   exit 1
 fi
 
-if ! nc -z 127.0.0.1 6379 >/dev/null 2>&1; then
+if ! port_open 6379; then
   echo "prepush: Redis is not accepting connections on 127.0.0.1:6379" >&2
   exit 1
 fi
 
 # db mock runs /test-graph/run-queries.sh via `docker exec neo4j`.
 neo_name="${PREPUSH_NEO4J_CONTAINER:-neo4j}"
-if ! nc -z 127.0.0.1 7687 >/dev/null 2>&1; then
+if ! port_open 7687; then
   if docker ps -a --format '{{.Names}}' | grep -qx "$neo_name"; then
     echo "prepush: Neo4j port 7687 is closed and container name ${neo_name} is already taken" >&2
     exit 1
@@ -275,11 +218,17 @@ if [ "$neo_ready" != 1 ]; then
   exit 1
 fi
 
+test_cmd="cargo run -p nexusd -- db mock"
+test_cmd+=" && cargo nextest run -p nexus-common --no-fail-fast"
+test_cmd+=" && cargo nextest run -p nexus-webapi --no-fail-fast"
+test_cmd+=" && cargo nextest run -p nexusd --no-fail-fast"
+test_cmd+=" && cargo nextest run -p nexus-watcher --no-fail-fast"
+
 echo "prepush: cargo clippy"
 # Same lint set as .github/workflows/lint.yml.
-run_heavy cargo cargo clippy "${clippy_scope[@]}" --all-targets -- -D warnings -A clippy::double_must_use
+run_heavy cargo cargo clippy --workspace --all-targets -- -D warnings -A clippy::double_must_use
 
-echo "prepush: cargo test"
+echo "prepush: cargo nextest"
 echo "  ${test_cmd}"
 run_heavy cargo bash -c "$test_cmd"
 
