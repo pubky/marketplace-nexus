@@ -2,25 +2,26 @@
 # Fair slots for optional full pre-push runs (PREPUSH_FULL=1).
 #
 # Each class has its own FIFO ticket queue. A process may run only when fewer
-# than SLOTS older live tickets exist, then it holds one slot lock while the
-# command runs. Each scan drops a ticket whose PID is dead, a zombie, or
-# reused. EXIT, INT, and TERM remove the current ticket immediately. SIGKILL
-# cannot be caught; the next scan expires that ticket so it cannot block the
-# queue.
+# than SLOTS older live tickets exist, then it holds one kernel-released slot
+# lock while the command runs. Each scan drops a ticket whose PID is dead, a
+# zombie, reused, or malformed. EXIT, INT, and TERM remove the current ticket
+# immediately. SIGKILL cannot be caught; the kernel releases the slot lock
+# immediately and the next scan expires the dead ticket.
 #
-# Locking uses `flock` when available (Linux and macOS with flock) and falls
-# back to POSIX atomic `mkdir` directories with PID liveness reaping on systems
-# without `flock` (such as stock macOS).
+# Locking uses kernel flock(2) via the `flock` binary when available, falling
+# back to inline `python3` (fcntl.flock) or `perl` (Fcntl::flock) so both
+# Linux and stock macOS use kernel-released locks with no directory reaping.
 #
 #   vrt    1 slot   Browser/container runs.
 #   cargo  2 slots  Rust clippy and tests.
 #   node   1 slot   Host Node checks.
 #
 # Classes do not exclude each other.
-# HEAVY_LOCK_DIR overrides the lock directory (defaults to a per-user TMPDIR).
-# HEAVY_LOCK_BACKEND overrides lock backend selection (`flock` or `mkdir`).
+# HEAVY_LOCK_DIR overrides the lock directory (defaults to a user-owned dir
+# under XDG_RUNTIME_DIR or TMPDIR).
+# HEAVY_LOCK_BACKEND overrides lock backend selection (flock, python3, perl).
 
-HEAVY_LOCK_DIR="${HEAVY_LOCK_DIR:-${TMPDIR:-/tmp}/marketplace-nexus-locks-$(id -u)}"
+HEAVY_LOCK_DIR="${HEAVY_LOCK_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/marketplace-nexus-locks-$(id -u)}"
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   echo "source scripts/heavy-lock.sh" >&2
@@ -41,19 +42,132 @@ heavy_slots() {
 
 heavy_lock_backend() {
   case "${HEAVY_LOCK_BACKEND:-}" in
-    flock|mkdir)
+    flock|python3|perl)
       printf '%s\n' "$HEAVY_LOCK_BACKEND"
       ;;
     "")
       if command -v flock >/dev/null 2>&1; then
         echo flock
+      elif command -v python3 >/dev/null 2>&1; then
+        echo python3
+      elif command -v perl >/dev/null 2>&1; then
+        echo perl
       else
-        echo mkdir
+        echo "heavy-lock: requires flock, python3, or perl for kernel file locking" >&2
+        return 1
       fi
       ;;
     *)
       echo "heavy-lock: unknown HEAVY_LOCK_BACKEND: ${HEAVY_LOCK_BACKEND}" >&2
       return 1
+      ;;
+  esac
+}
+
+heavy_dir_mode() {
+  local dir="$1" mode=""
+  if mode=$(stat -c '%a' "$dir" 2>/dev/null) && [[ "$mode" =~ ^[0-7]+$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  if mode=$(stat -f '%Lp' "$dir" 2>/dev/null) && [[ "$mode" =~ ^[0-7]+$ ]]; then
+    printf '%s\n' "$mode"
+    return 0
+  fi
+  return 1
+}
+
+# Ensures a lock directory is a real, user-owned directory with no group or
+# other write bits. Refuses symlinks, foreign owners, and shared-writable dirs.
+heavy_verify_dir() {
+  local dir="$1" mode perm
+  if [ -L "$dir" ]; then
+    echo "heavy-lock: refusing symlink lock directory: ${dir}" >&2
+    return 1
+  fi
+  if [ ! -e "$dir" ]; then
+    (umask 077 && mkdir -p "$dir") || return 1
+  fi
+  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    echo "heavy-lock: lock path is not a real directory: ${dir}" >&2
+    return 1
+  fi
+  if [ ! -O "$dir" ]; then
+    echo "heavy-lock: lock directory is not owned by current user: ${dir}" >&2
+    return 1
+  fi
+  mode=$(heavy_dir_mode "$dir") || {
+    echo "heavy-lock: could not inspect permissions of ${dir}" >&2
+    return 1
+  }
+  perm=$((8#$mode))
+  if [ $((perm & 0022)) -ne 0 ]; then
+    echo "heavy-lock: refusing group/other-writable lock directory (mode ${mode}): ${dir}" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Executes a command while holding an exclusive kernel flock(2) on lockfile.
+# nonblock=1 returns 75 on lock contention without starting the command.
+heavy_flock_exec() {
+  local nonblock="$1" lockfile="$2" backend
+  shift 2
+  backend=$(heavy_lock_backend) || return 1
+  if [ -L "$lockfile" ]; then
+    echo "heavy-lock: refusing symlink lock file: ${lockfile}" >&2
+    return 1
+  fi
+
+  case "$backend" in
+    flock)
+      if [ "$nonblock" = 1 ]; then
+        (umask 077 && exec flock -n "$lockfile" "$@")
+      else
+        (umask 077 && exec flock "$lockfile" "$@")
+      fi
+      ;;
+    python3)
+      python3 -c '
+import errno, fcntl, os, sys
+nonblock = sys.argv[1] == "1"
+path = sys.argv[2]
+cmd = sys.argv[3:]
+flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+fd = os.open(path, flags, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblock else 0))
+except OSError as exc:
+    if nonblock and exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+        sys.exit(75)
+    raise
+os.set_inheritable(fd, True)
+os.execvp(cmd[0], cmd)
+' "$nonblock" "$lockfile" "$@"
+      ;;
+    perl)
+      perl -e '
+use strict;
+use warnings;
+use Errno qw(EAGAIN EWOULDBLOCK);
+use Fcntl qw(:flock O_CREAT O_RDWR F_GETFD F_SETFD FD_CLOEXEC);
+my $nonblock = shift @ARGV;
+my $path = shift @ARGV;
+my $flags = O_CREAT | O_RDWR;
+my $nofollow = eval { Fcntl::O_NOFOLLOW() };
+$flags |= $nofollow if defined $nofollow;
+sysopen(my $fh, $path, $flags, 0600) or die "heavy-lock: open $path: $!\n";
+my $op = $nonblock ? (LOCK_EX | LOCK_NB) : LOCK_EX;
+if (!flock($fh, $op)) {
+    exit 75 if $nonblock && ($! == EAGAIN || $! == EWOULDBLOCK);
+    die "heavy-lock: flock $path: $!\n";
+}
+my $fd_flags = fcntl($fh, F_GETFD, 0);
+if (defined $fd_flags) {
+    fcntl($fh, F_SETFD, $fd_flags & ~FD_CLOEXEC) or die "heavy-lock: fcntl $path: $!\n";
+}
+exec { $ARGV[0] } @ARGV or die "heavy-lock: exec $ARGV[0]: $!\n";
+' "$nonblock" "$lockfile" "$@"
       ;;
   esac
 }
@@ -67,10 +181,18 @@ etime_to_seconds() {
   fi
   n=$(printf '%s\n' "$t" | awk -F: '{print NF}')
   IFS=: read -r a b c <<< "$t"
-  a=$((10#${a:-0}))
-  b=$((10#${b:-0}))
-  c=$((10#${c:-0}))
-  days=$((10#${days:-0}))
+  a="${a:-0}"
+  b="${b:-0}"
+  c="${c:-0}"
+  days="${days:-0}"
+  if ! [[ "$a" =~ ^[0-9]+$ ]] || ! [[ "$b" =~ ^[0-9]+$ ]] || ! [[ "$c" =~ ^[0-9]+$ ]] || ! [[ "$days" =~ ^[0-9]+$ ]]; then
+    echo 0
+    return 1
+  fi
+  a=$((10#$a))
+  b=$((10#$b))
+  c=$((10#$c))
+  days=$((10#$days))
   if [ "$n" -le 1 ]; then
     echo "$a"
   elif [ "$n" -eq 2 ]; then
@@ -82,12 +204,7 @@ etime_to_seconds() {
 
 heavy_release() {
   local ticket="${HEAVY_TICKET:-}"
-  local slotdir="${HEAVY_SLOT_DIR:-}"
   HEAVY_TICKET=""
-  HEAVY_SLOT_DIR=""
-  if [ -n "$slotdir" ]; then
-    rm -rf "$slotdir"
-  fi
   if [ -n "$ticket" ]; then
     rm -f "$ticket"
   fi
@@ -150,86 +267,50 @@ heavy_disarm_traps() {
   HEAVY_SAVED_TERM=""
 }
 
-heavy_issue_body() {
-  local seqfile="$1" qdir="$2" pid="$3" n=0 tmp name
-  if [ -f "$seqfile" ]; then
-    n=$(tr -cd '0-9' < "$seqfile" || true)
-  fi
-  [ -n "$n" ] || n=0
-  n=$((n + 1))
-  tmp=$(mktemp "${seqfile}.XXXXXX")
-  printf '%s\n' "$n" > "$tmp"
-  mv "$tmp" "$seqfile"
-  name=$(printf '%020d' "$n")
-  printf '%s %s\n' "$pid" "$(date +%s)" > "$qdir/${name}.ticket"
-  printf '%s\n' "$n"
-}
-
 heavy_issue() {
   local class="$1"
   local self_pid="$2"
   local qdir="$HEAVY_LOCK_DIR/${class}.q"
   local seqfile="$HEAVY_LOCK_DIR/${class}.seq"
   local issue="$HEAVY_LOCK_DIR/${class}.issue.lock"
-  local backend lockdir owner_pid owner_epoch missing_waits=0
-  backend=$(heavy_lock_backend) || return 1
-  mkdir -p "$qdir"
-
-  if [ "$backend" = flock ]; then
-    flock "$issue" bash -c '
-      set -euo pipefail
-      seqfile="$1"
-      qdir="$2"
-      pid="$3"
-      n=0
-      if [ -f "$seqfile" ]; then
-        n=$(tr -cd "0-9" < "$seqfile" || true)
-      fi
-      [ -n "$n" ] || n=0
-      n=$((n + 1))
-      tmp=$(mktemp "${seqfile}.XXXXXX")
-      printf "%s\n" "$n" > "$tmp"
-      mv "$tmp" "$seqfile"
-      name=$(printf "%020d" "$n")
-      printf "%s %s\n" "$pid" "$(date +%s)" > "$qdir/${name}.ticket"
-      printf "%s\n" "$n"
-    ' _ "$seqfile" "$qdir" "$self_pid"
-    return $?
+  heavy_verify_dir "$qdir" || return 1
+  if [ -L "$seqfile" ]; then
+    echo "heavy-lock: refusing symlink sequence file: ${seqfile}" >&2
+    return 1
   fi
 
-  lockdir="${issue}.d"
-  while ! mkdir "$lockdir" 2>/dev/null; do
-    if [ -f "$lockdir/owner" ]; then
-      missing_waits=0
-      owner_pid=""
-      owner_epoch=""
-      read -r owner_pid owner_epoch < "$lockdir/owner" 2>/dev/null || true
-      if [ -n "$owner_pid" ] && heavy_pid_dead "$owner_pid" "$owner_epoch"; then
-        rm -rf "$lockdir" 2>/dev/null || true
-        continue
-      fi
-    else
-      missing_waits=$((missing_waits + 1))
-      if [ "$missing_waits" -ge 40 ]; then
-        rm -rf "$lockdir" 2>/dev/null || true
-        missing_waits=0
-        continue
-      fi
+  # shellcheck disable=SC2016
+  heavy_flock_exec 0 "$issue" bash -c '
+    set -euo pipefail
+    umask 077
+    seqfile="$1"
+    qdir="$2"
+    pid="$3"
+    n=0
+    if [ -f "$seqfile" ] && [ ! -L "$seqfile" ]; then
+      n=$(tr -cd "0-9" < "$seqfile" || true)
     fi
-    sleep 0.05
-  done
-  printf '%s %s\n' "$self_pid" "$(date +%s)" > "$lockdir/owner"
-  local issue_status=0
-  heavy_issue_body "$seqfile" "$qdir" "$self_pid" || issue_status=$?
-  rm -rf "$lockdir"
-  return "$issue_status"
+    [ -n "$n" ] || n=0
+    n=$((n + 1))
+    tmp=$(mktemp "${seqfile}.XXXXXX")
+    printf "%s\n" "$n" > "$tmp"
+    mv -f "$tmp" "$seqfile"
+    name=$(printf "%020d" "$n")
+    ticket_tmp=$(mktemp "${qdir}/.ticket.XXXXXX")
+    printf "%s %s\n" "$pid" "$(date +%s)" > "$ticket_tmp"
+    mv -f "$ticket_tmp" "$qdir/${name}.ticket"
+    printf "%s\n" "$n"
+  ' _ "$seqfile" "$qdir" "$self_pid"
 }
 
-# 0 when the ticket must be removed: empty PID, dead PID, zombie, or a reused
-# PID whose process started after the ticket was written.
+# 0 when the ticket must be removed: non-numeric PID or epoch, dead PID,
+# zombie, or a reused PID whose process started after the ticket was written.
 heavy_pid_dead() {
   local pid="$1" epoch="$2" state etime es now age
-  if [ -z "$pid" ]; then
+  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+  if [ -n "$epoch" ] && ! [[ "$epoch" =~ ^[0-9]+$ ]]; then
     return 0
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
@@ -246,9 +327,9 @@ heavy_pid_dead() {
   if [ -z "$etime" ]; then
     return 1
   fi
-  es=$(etime_to_seconds "$etime")
+  es=$(etime_to_seconds "$etime") || return 1
   now=$(date +%s)
-  age=$((now - epoch))
+  age=$((now - 10#$epoch))
   if [ "$age" -gt 3 ] && [ "$es" -lt $((age - 3)) ]; then
     return 0
   fi
@@ -258,14 +339,20 @@ heavy_pid_dead() {
 heavy_sweep() {
   local class="$1"
   local dir="$HEAVY_LOCK_DIR/${class}.q"
-  local f pid epoch
-  [ -d "$dir" ] || return 0
+  local f base pid epoch extra
+  [ -d "$dir" ] && [ ! -L "$dir" ] || return 0
   for f in "$dir"/*.ticket; do
-    [ -e "$f" ] || continue
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    base=$(basename "$f")
+    if [ -L "$f" ] || [ ! -f "$f" ] || ! [[ "$base" =~ ^[0-9]+\.ticket$ ]]; then
+      rm -f "$f"
+      continue
+    fi
     pid=""
     epoch=""
-    read -r pid epoch < "$f" || true
-    if heavy_pid_dead "$pid" "$epoch"; then
+    extra=""
+    read -r pid epoch extra < "$f" || true
+    if [ -n "$extra" ] || heavy_pid_dead "$pid" "$epoch"; then
       rm -f "$f"
     fi
   done
@@ -275,10 +362,15 @@ heavy_ahead() {
   local class="$1" myseq="$2"
   local dir="$HEAVY_LOCK_DIR/${class}.q"
   local ahead=0 f base seq
+  [[ "$myseq" =~ ^[0-9]+$ ]] || return 1
   heavy_sweep "$class"
   for f in "$dir"/*.ticket; do
     [ -e "$f" ] || continue
+    if [ ! -f "$f" ] || [ -L "$f" ]; then
+      continue
+    fi
     base=$(basename "$f")
+    [[ "$base" =~ ^[0-9]+\.ticket$ ]] || continue
     seq=$((10#${base%.ticket}))
     if [ "$seq" -lt "$myseq" ]; then
       ahead=$((ahead + 1))
@@ -287,65 +379,31 @@ heavy_ahead() {
   echo "$ahead"
 }
 
-# Run the command inside one slot. Returns 75 when every try lost the race
+# Run the command inside one slot. Returns 75 when the slot lock is busy
 # and the command did not start. Otherwise returns the command status.
 heavy_run_in_slot() {
   local slotfile="$1"
-  local marker hold_msg slot_status=0 backend lockdir owner_pid owner_epoch
+  local marker hold_msg slot_status=0
   shift
   hold_msg="$1"
   shift
-  backend=$(heavy_lock_backend) || return 1
-
-  if [ "$backend" = flock ]; then
-    marker=$(mktemp "${HEAVY_LOCK_DIR}/ran.XXXXXX")
-    : > "$marker"
-    # `||` keeps a non-zero status under set -e. A bare assignment from $? after
-    # `if` is wrong on bash 3.2: a failed if with no else reports status 0.
-    flock -n "$slotfile" bash -c '
-      printf 1 > "$1"
-      shift
-      printf "%s\n" "$1" >&2
-      shift
-      "$@"
-    ' _ "$marker" "$hold_msg" "$@" || slot_status=$?
-    if [ ! -s "$marker" ]; then
-      rm -f "$marker"
-      return 75
-    fi
+  marker=$(umask 077 && mktemp "${HEAVY_LOCK_DIR}/ran.XXXXXX")
+  : > "$marker"
+  # `||` keeps a non-zero status under set -e. A bare assignment from $? after
+  # `if` is wrong on bash 3.2: a failed if with no else reports status 0.
+  # shellcheck disable=SC2016
+  heavy_flock_exec 1 "$slotfile" bash -c '
+    printf 1 > "$1"
+    shift
+    printf "%s\n" "$1" >&2
+    shift
+    "$@"
+  ' _ "$marker" "$hold_msg" "$@" || slot_status=$?
+  if [ ! -s "$marker" ]; then
     rm -f "$marker"
-    return "$slot_status"
+    return 75
   fi
-
-  lockdir="${slotfile}.d"
-  if ! mkdir "$lockdir" 2>/dev/null; then
-    if [ -f "$lockdir/owner" ]; then
-      owner_pid=""
-      owner_epoch=""
-      read -r owner_pid owner_epoch < "$lockdir/owner" 2>/dev/null || true
-      if [ -n "$owner_pid" ] && heavy_pid_dead "$owner_pid" "$owner_epoch"; then
-        rm -rf "$lockdir" 2>/dev/null || true
-        mkdir "$lockdir" 2>/dev/null || return 75
-      else
-        return 75
-      fi
-    else
-      # Give a concurrent acquirer a brief moment to write owner before reaping.
-      sleep 0.1
-      if [ ! -f "$lockdir/owner" ]; then
-        rm -rf "$lockdir" 2>/dev/null || true
-        mkdir "$lockdir" 2>/dev/null || return 75
-      else
-        return 75
-      fi
-    fi
-  fi
-  printf '%s %s\n' "${HEAVY_SELF:-$$}" "$(date +%s)" > "$lockdir/owner"
-  HEAVY_SLOT_DIR="$lockdir"
-  printf '%s\n' "$hold_msg" >&2
-  "$@" || slot_status=$?
-  rm -rf "$lockdir"
-  HEAVY_SLOT_DIR=""
+  rm -f "$marker"
   return "$slot_status"
 }
 
@@ -356,12 +414,12 @@ run_heavy() {
   local self_pid pidfile
   slots=$(heavy_slots "$class") || return 1
   heavy_lock_backend >/dev/null || return 1
-  mkdir -p "$HEAVY_LOCK_DIR"
+  heavy_verify_dir "$HEAVY_LOCK_DIR" || return 1
   # heavy_issue runs inside a command substitution, and that subshell exits
   # as soon as the ticket number is printed. Record this shell, not that
   # subshell. $$ is the outermost shell even inside a background job, and
   # bash 3.2 has no BASHPID, so a direct child reports this process.
-  pidfile="$(mktemp "${HEAVY_LOCK_DIR}/self.XXXXXX")"
+  pidfile="$(umask 077 && mktemp "${HEAVY_LOCK_DIR}/self.XXXXXX")"
   sh -c 'echo $PPID' > "$pidfile"
   self_pid="$(tr -cd '0-9' < "$pidfile")"
   rm -f "$pidfile"

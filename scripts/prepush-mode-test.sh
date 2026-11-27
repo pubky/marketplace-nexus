@@ -43,6 +43,7 @@ esac
 exit 0
 EOF
 for tool in nc curl; do
+  # shellcheck disable=SC2016
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$FAKE_LOG/%s"\n' "$tool" > "$WORK/bin/$tool"
 done
 printf '#!/usr/bin/env bash\nexit 101\n' > "$WORK/broken/cargo"
