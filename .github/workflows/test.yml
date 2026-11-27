@@ -45,7 +45,7 @@ jobs:
           # Cache workspace crates (members), as they are time-consuming to re-build on each PR
           cache-workspace-crates: true
 
-      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+      - uses: taiki-e/install-action@25f51f6b1bf4e18876107cece836f4f77ac17c8c # v2
         with:
           tool: cargo-nextest
 
