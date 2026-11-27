@@ -8,9 +8,9 @@ use anyhow::Result;
 use axum::http::StatusCode;
 use nexus_common::db::{exec_single_row, get_redis_conn, queries, OperationOutcome};
 use nexus_common::models::marketplace::{
-    listing_moderation_cache_key, populate_listing_cache_if_gen_matches, user_moderation_cache_key,
-    ListingDetails, ListingSaleFormat, ModeratedListing, ModeratedUser, ShopDetails,
-    MODERATION_CACHE_TTL_SECS,
+    acquire_listing_lease_for_test, listing_moderation_cache_key, listing_moderation_lease_key,
+    populate_listing_cache_if_lease_matches, user_moderation_cache_key, ListingDetails,
+    ListingSaleFormat, ModeratedListing, ModeratedUser, ShopDetails, MODERATION_CACHE_TTL_SECS,
 };
 use nexus_common::models::traits::Collection;
 use nexus_common::models::user::UserDetails;
@@ -730,10 +730,15 @@ async fn test_listing_moderation_cache_serves_hits_and_invalidates_immediately()
     assert_eq!(body["moderated"], false);
     assert_eq!(conn.get::<_, Option<String>>(&huge_key).await?, None);
 
-    // Generation-counter race guard: a slow cache-miss read that began before
-    // a concurrent takedown must not write stale Clear back into Redis.
+    // (a) Non-empty lease token invalidation: a real lease seeded before
+    // ModeratedListing::put must be deleted by invalidation so a stale miss
+    // fill cannot write Clear back into Redis.
     let racing_listing = &listing_ids[2];
     let racing_key = listing_moderation_cache_key(&seller_id, racing_listing);
+    let racing_lease_key = listing_moderation_lease_key(&seller_id, racing_listing);
+    let _: () = conn.del(&[&racing_key, &racing_lease_key]).await?;
+    let lease_before_takedown = acquire_listing_lease_for_test(&seller_id, racing_listing).await?;
+    assert!(!lease_before_takedown.is_empty());
     ModeratedListing::put(
         &seller_id,
         racing_listing,
@@ -744,11 +749,21 @@ async fn test_listing_moderation_cache_serves_hits_and_invalidates_immediately()
         chrono::Utc::now().timestamp_millis(),
     )
     .await?;
-    let wrote_stale =
-        populate_listing_cache_if_gen_matches(&seller_id, racing_listing, false, "").await?;
+    assert_eq!(
+        conn.get::<_, Option<String>>(&racing_lease_key).await?,
+        None,
+        "invalidation must delete the live lease token"
+    );
+    let wrote_stale = populate_listing_cache_if_lease_matches(
+        &seller_id,
+        racing_listing,
+        false,
+        &lease_before_takedown,
+    )
+    .await?;
     assert!(
         !wrote_stale,
-        "stale fill with pre-invalidation generation must be rejected"
+        "stale fill with pre-invalidation lease must be rejected"
     );
     assert_eq!(conn.get::<_, Option<String>>(&racing_key).await?, None);
     let body = get_request(&format!(
@@ -758,6 +773,166 @@ async fn test_listing_moderation_cache_serves_hits_and_invalidates_immediately()
     assert_eq!(body["moderated"], true);
     assert_eq!(body["listing_moderated"], true);
     ModeratedListing::delete(&moderator_id, "race-tag").await?;
+
+    // (b) Eviction/expiry and anti-ABA proof: deleting the lease key rejects
+    // both the prior token and an empty sentinel, and a newly acquired lease
+    // receives a distinct token that also rejects the prior token.
+    let _: () = conn.del(&[&racing_key, &racing_lease_key]).await?;
+    let lease_one = acquire_listing_lease_for_test(&seller_id, racing_listing).await?;
+    let _: () = conn.del(&racing_lease_key).await?;
+    assert!(
+        !populate_listing_cache_if_lease_matches(&seller_id, racing_listing, false, &lease_one)
+            .await?,
+        "evicted or expired lease must reject cache fill"
+    );
+    assert!(
+        !populate_listing_cache_if_lease_matches(&seller_id, racing_listing, false, "").await?,
+        "empty lease sentinel must never populate cache"
+    );
+    let lease_two = acquire_listing_lease_for_test(&seller_id, racing_listing).await?;
+    assert_ne!(
+        lease_one, lease_two,
+        "re-acquired lease after expiry or eviction must never reuse an old token"
+    );
+    assert!(
+        !populate_listing_cache_if_lease_matches(&seller_id, racing_listing, false, &lease_one)
+            .await?,
+        "old lease token must not match a newly acquired lease"
+    );
+    assert_eq!(conn.get::<_, Option<String>>(&racing_key).await?, None);
+
+    // (c) Partial-pair cache misses in both directions:
+    // 1. listing cold + seller warm: refills listing without re-querying seller.
+    let body = get_request(&route_a).await?;
+    assert_eq!(body["moderated"], false);
+    let _: () = conn.del(&listing_a_key).await?;
+    let raw_user_tag = "raw-partial-user-tag";
+    exec_single_row(queries::put::put_moderated_user(
+        &seller_id,
+        &format!("pubky://{seller_id}/pub/pubky.app/profile.json"),
+        &moderator_id,
+        raw_user_tag,
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    ))
+    .await?;
+    let body = get_request(&route_a).await?;
+    assert_eq!(
+        body["seller_moderated"], false,
+        "warm seller cache entry must be reused on listing-only miss"
+    );
+    assert_eq!(
+        conn.get::<_, Option<String>>(&listing_a_key)
+            .await?
+            .as_deref(),
+        Some("0"),
+        "listing-only miss must repopulate listing cache"
+    );
+    ModeratedUser::delete(&moderator_id, raw_user_tag).await?;
+
+    // 2. listing warm + seller cold: refills seller without re-querying listing.
+    let body = get_request(&route_a).await?;
+    assert_eq!(body["moderated"], false);
+    let _: () = conn.del(&user_key).await?;
+    let raw_listing_tag = "raw-partial-listing-tag";
+    exec_single_row(queries::put::put_moderated_listing(
+        &seller_id,
+        listing_a,
+        &listing_uri_builder(seller_id.clone(), listing_a.clone()),
+        &moderator_id,
+        raw_listing_tag,
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    ))
+    .await?;
+    let body = get_request(&route_a).await?;
+    assert_eq!(
+        body["listing_moderated"], false,
+        "warm listing cache entry must be reused on seller-only miss"
+    );
+    assert_eq!(
+        conn.get::<_, Option<String>>(&user_key).await?.as_deref(),
+        Some("0"),
+        "seller-only miss must repopulate seller cache"
+    );
+    ModeratedListing::delete(&moderator_id, raw_listing_tag).await?;
+
+    // (d) Retargeting an existing (moderator_id, tag_id) marker invalidates
+    // both the prior target and the new target immediately.
+    let retarget_listing_tag = "retarget-listing-tag";
+    ModeratedListing::put(
+        &seller_id,
+        listing_a,
+        &listing_uri_builder(seller_id.clone(), listing_a.clone()),
+        &moderator_id,
+        retarget_listing_tag,
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    assert_eq!(get_request(&route_a).await?["listing_moderated"], true);
+    assert_eq!(get_request(&route_b).await?["listing_moderated"], false);
+
+    ModeratedListing::put(
+        &seller_id,
+        listing_b,
+        &listing_uri_builder(seller_id.clone(), listing_b.clone()),
+        &moderator_id,
+        retarget_listing_tag,
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    assert_eq!(
+        get_request(&route_a).await?["listing_moderated"],
+        false,
+        "retargeting listing marker must invalidate old listing cache"
+    );
+    assert_eq!(
+        get_request(&route_b).await?["listing_moderated"],
+        true,
+        "retargeting listing marker must invalidate new listing cache"
+    );
+    ModeratedListing::delete(&moderator_id, retarget_listing_tag).await?;
+
+    let (seller_other, _, other_listings) = seed_marketplace().await?;
+    let route_other = format!(
+        "/v0/listing/{seller_other}/{}/moderation",
+        other_listings[0]
+    );
+    let retarget_user_tag = "retarget-user-tag";
+    ModeratedUser::put(
+        &seller_id,
+        &format!("pubky://{seller_id}/pub/pubky.app/profile.json"),
+        &moderator_id,
+        retarget_user_tag,
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    assert_eq!(get_request(&route_a).await?["seller_moderated"], true);
+    assert_eq!(get_request(&route_other).await?["seller_moderated"], false);
+
+    ModeratedUser::put(
+        &seller_other,
+        &format!("pubky://{seller_other}/pub/pubky.app/profile.json"),
+        &moderator_id,
+        retarget_user_tag,
+        "moderated",
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await?;
+    assert_eq!(
+        get_request(&route_a).await?["seller_moderated"],
+        false,
+        "retargeting seller marker must invalidate old seller cache"
+    );
+    assert_eq!(
+        get_request(&route_other).await?["seller_moderated"],
+        true,
+        "retargeting seller marker must invalidate new seller cache"
+    );
+    ModeratedUser::delete(&moderator_id, retarget_user_tag).await?;
 
     Ok(())
 }
